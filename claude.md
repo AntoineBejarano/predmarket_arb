@@ -62,6 +62,8 @@ AUTO_START=false PORT=8080 python scripts/api.py
 
 - Los JSON de **flujos TCP** (netflow) en la consola **no** son logs de la app: no indican si Gamma/Binance fallan.
 - Mira **Deploy Logs** del servicio: ahí debe salir Uvicorn y, tras el cambio de supervisor, **`validate_edge`** (prefijo `[validate_edge]`, líneas tipo `Gamma: N mercados…`, `Iteración OK`, warnings de Binance).
+- El API escribe con prefijo **`[api]`**: arranque (`DATA_DIR`, `AUTO_START`), `POST /api/start` / `stop`, y apagado.
+- Cada iteración del validador (~30s) loguea **`Iteración #N`**: mercados Gamma tras filtro, observaciones totales, señales, resueltos, pendientes, **nº de velas 5m por activo** y **último precio spot** por activo (visibilidad Binance).
 - Si **`csv_rows`** en `GET /api/status` (o el pie del dashboard) **sube** cada ~30s con el worker en marcha, se están escribiendo observaciones (Gamma + filtros + precio); si se queda en **0** durante mucho tiempo, o no hay mercados que pasen el filtro o el worker no está arrancado (`AUTO_START` / botón START).
 
 ## Límites conocidos

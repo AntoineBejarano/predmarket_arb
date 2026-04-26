@@ -740,6 +740,12 @@ def run_main(hours: float | None, threshold: float) -> None:
             "Ningún modelo cargado desde models/saved — se omiten predicciones ML. "
             "Ejecuta `python models/train.py` para generar los .pkl. NearRes y logging siguen activos."
         )
+    else:
+        log.info(
+            "Modelos ML listos (%s activos): %s",
+            len(models),
+            ", ".join(sorted(models.keys())),
+        )
 
     port = int(os.getenv("PORT", "8080"))
     start_health_server(port)
@@ -777,6 +783,13 @@ def run_main(hours: float | None, threshold: float) -> None:
         t.start()
         threads.append(t)
 
+    log.info(
+        "Precio Binance: hilos=%s (poll cada %ss símbolos %s)",
+        len(threads),
+        int(BINANCE_POLL_SEC),
+        ", ".join(price_symbols),
+    )
+
     gamma_cache = GammaCache()
     stats = SessionStats()
     window_open: dict[str, float] = {}
@@ -785,6 +798,8 @@ def run_main(hours: float | None, threshold: float) -> None:
     deadline: float | None = None
     if hours is not None:
         deadline = time.monotonic() + hours * 3600.0
+
+    loop_i = 0
 
     def shutdown(_sig: int | None = None, _frame: Any = None) -> None:
         stop_event.set()
@@ -804,6 +819,7 @@ def run_main(hours: float | None, threshold: float) -> None:
             redirect_stderr=False,
         ) as live:
             while not stop_event.is_set():
+                loop_i += 1
                 try:
                     now = datetime.now(timezone.utc)
                     if deadline is not None and time.monotonic() >= deadline:
@@ -968,10 +984,23 @@ def run_main(hours: float | None, threshold: float) -> None:
                             border_style="cyan",
                         )
                     )
+                    with tick_lock:
+                        n5 = {s: len(closes_5m[s]) for s in price_symbols}
+                        pri = {
+                            s: (round(float(last_price[s]), 4) if s in last_price else None)
+                            for s in price_symbols
+                        }
                     log.info(
-                        "Iteración OK: mercados=%s observaciones_tot=%s",
+                        "Iteración #%s: gamma_mercados_filtrados=%s obs_total=%s señales=%s "
+                        "resueltos=%s pendientes_csv=%s velas_5m_por_activo=%s precio_spot=%s",
+                        loop_i,
                         len(markets),
                         stats.observations,
+                        stats.signals_fired,
+                        stats.markets_resolved,
+                        len(pending_end),
+                        n5,
+                        pri,
                     )
                 except Exception as e:
                     log.exception("Error en bucle principal (continuando): %s", e)

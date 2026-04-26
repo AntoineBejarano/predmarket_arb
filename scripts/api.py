@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -28,6 +29,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 load_dotenv(REPO_ROOT / ".env")
+
+log = logging.getLogger("api")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [api] %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ")
+    )
+    logging.Formatter.converter = time.gmtime
+    log.addHandler(_h)
+log.propagate = False
 
 DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
 SIGNALS_CSV = DATA_DIR / "logs" / "signals.csv"
@@ -237,15 +249,28 @@ def build_status_payload() -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     auto = os.getenv("AUTO_START", "").lower() in ("true", "1", "yes")
+    log.info(
+        "API arrancando: DATA_DIR=%s PORT=%s AUTO_START=%s VALIDATOR_HEALTH_PORT=%s",
+        DATA_DIR,
+        os.getenv("PORT", "8080"),
+        auto,
+        os.getenv("VALIDATOR_HEALTH_PORT", "18088"),
+    )
     if auto:
         ok, pid, err = supervisor.start()
         if ok:
-            print(f"[api] AUTO_START: validate_edge pid={pid}", file=sys.stderr)
-        elif err and err != "already_running":
-            print(f"[api] AUTO_START failed: {err}", file=sys.stderr)
+            log.info("AUTO_START: validate_edge en marcha pid=%s (logs mezclados en stderr)", pid)
+        elif err == "already_running":
+            log.info("AUTO_START omitido: validate_edge ya estaba en marcha pid=%s", pid)
+        elif err:
+            log.error("AUTO_START falló: %s", err)
+    else:
+        log.info("AUTO_START desactivado: pulsa START en el dashboard o llama POST /api/start")
     yield
     if supervisor.is_running():
+        log.info("Apagado API: deteniendo validate_edge…")
         supervisor.stop()
+        log.info("validate_edge detenido")
 
 
 app = FastAPI(title="PredMarket Arb API", lifespan=lifespan)
@@ -280,9 +305,12 @@ async def api_status() -> dict[str, Any]:
 async def api_start() -> dict[str, Any]:
     started, pid, err = supervisor.start()
     if started:
+        log.info("POST /api/start -> validate_edge pid=%s", pid)
         return {"started": True, "pid": pid}
     if err == "already_running":
+        log.info("POST /api/start rechazado: ya en marcha pid=%s", pid)
         return JSONResponse({"started": False, "pid": pid, "error": err}, status_code=409)
+    log.error("POST /api/start error: %s", err)
     return JSONResponse({"started": False, "pid": None, "error": err or "unknown"}, status_code=500)
 
 
@@ -290,7 +318,9 @@ async def api_start() -> dict[str, Any]:
 async def api_stop() -> dict[str, Any]:
     stopped, err = supervisor.stop()
     if stopped:
+        log.info("POST /api/stop -> validate_edge detenido")
         return {"stopped": True}
+    log.warning("POST /api/stop: %s", err)
     return JSONResponse({"stopped": False, "error": err or "not_running"}, status_code=400)
 
 
