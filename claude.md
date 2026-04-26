@@ -26,6 +26,8 @@ Sistema de **paper trading / validación de edge** sobre mercados Polymarket tip
 
 En **`python:3.11-slim`** hace falta el paquete **`libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
 
+Los **`.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma familia de `scikit-learn`** que al entrenar; en `pyproject.toml` está acotado a **1.6.x** para evitar `InconsistentVersionWarning` y resultados raros si Docker instala 1.8+.
+
 ## Entorno y variables
 
 - Copiar `.env.example` → `.env`. Relevantes: `DATA_DIR`, `PORT`, `AUTO_START`, `SIGNAL_THRESHOLD`, `LOG_LEVEL`, `GAMMA_MAX_PAGES`, `VALIDATOR_HEALTH_PORT`, `DASHBOARD_PASSWORD` (reservado; auth no implementada).

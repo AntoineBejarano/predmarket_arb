@@ -12,7 +12,7 @@ COPY pyproject.toml .
 
 RUN uv pip install --system --no-cache \
     pandas pyarrow tqdm requests python-dotenv \
-    lightgbm scikit-learn scipy numpy rich joblib \
+    lightgbm "scikit-learn>=1.6.1,<1.7" scipy numpy rich joblib \
     fastapi uvicorn
 
 COPY . .
