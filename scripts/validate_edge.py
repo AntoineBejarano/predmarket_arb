@@ -109,7 +109,6 @@ POLYMARKET_WS_URL = os.getenv("POLYMARKET_WS_URL", "wss://ws-live-data.polymarke
 PRICE_FEED = os.getenv("PRICE_FEED", "polymarket").strip().lower()
 # Ventana 5m: no procesar mercado fuera de [0, WINDOW_DURATION_MIN) minutos.
 WINDOW_DURATION_MIN = float(os.getenv("WINDOW_DURATION_MIN", "5"))
-CLOB_API_URL = os.getenv("CLOB_API_URL", "https://clob.polymarket.com").rstrip("/")
 CSV_WRITE_RETRIES = 3
 
 log = logging.getLogger("validate_edge")
@@ -310,43 +309,6 @@ def get_condition_id(m: dict[str, Any]) -> str | None:
     if cid is None:
         return None
     return str(cid)
-
-
-def fetch_p_mercado_clob_up(session: requests.Session, condition_id: str) -> float | None:
-    """Precio CLOB del outcome Up (más vivo que outcomePrices de Gamma)."""
-    cid = str(condition_id).strip()
-    if not cid:
-        return None
-    url = f"{CLOB_API_URL}/markets/{cid}"
-    try:
-        r = session.get(url, timeout=8)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not isinstance(data, dict):
-            return None
-        for token in data.get("tokens") or []:
-            if not isinstance(token, dict):
-                continue
-            if str(token.get("outcome", "")).strip() != "Up":
-                continue
-            raw = token.get("price")
-            if raw is None or raw == "":
-                return None
-            p = float(raw)
-            if 0.0 <= p <= 1.0:
-                return p
-            return None
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError, requests.RequestException) as e:
-        log.debug("CLOB p_mercado %s…: %s", cid[:22], e)
-    return None
-
-
-def resolve_p_mercado(session: requests.Session, condition_id: str, gamma_price: float) -> float:
-    clob = fetch_p_mercado_clob_up(session, condition_id)
-    if clob is not None:
-        return clob
-    return gamma_price
 
 
 def fetch_binance_price(symbol: str, session: requests.Session, last_good: dict[str, float]) -> float | None:
@@ -1020,8 +982,7 @@ def run_main(hours: float | None, threshold: float) -> None:
                             prices = parse_outcome_prices(m)
                             if not prices:
                                 continue
-                            p_gamma = float(prices[0])
-                            p_mercado = resolve_p_mercado(session, cid, p_gamma)
+                            p_mercado = float(prices[0])
                             vol_usd = m.get("volume") or m.get("volumeNum") or ""
                             with tick_lock:
                                 px = last_price.get(asset)
