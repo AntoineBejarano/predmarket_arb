@@ -63,6 +63,10 @@
       </div>
     </section>
 
+    <p id="diagFooter" class="text-xs text-slate-500 font-mono break-all px-1">
+      CSV: — · Deploy Logs: busca líneas <code class="text-slate-400">validate_edge</code> (Gamma, Binance, iteración).
+    </p>
+
     <!-- ACTIVE MARKETS -->
     <section>
       <h2 class="text-lg font-semibold text-white mb-3">Active markets</h2>
@@ -194,6 +198,13 @@
       $('valNr').textContent = s.nearres_accuracy != null ? nr + '%' : '—';
       flashEl($('cardMl'));
       flashEl($('cardNr'));
+      const df = $('diagFooter');
+      if (df) {
+        const rows = s.csv_rows ?? 0;
+        const last = s.last_csv_timestamp || '—';
+        const path = s.signals_csv || '';
+        df.textContent = `CSV ${rows} filas · última obs ${last} · ${path}`;
+      }
     }
 
     function activeRows(rows) {

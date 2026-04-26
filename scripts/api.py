@@ -157,12 +157,14 @@ class ValidatorSupervisor:
                 child_env = os.environ.copy()
                 # validate_edge también abre /health; evitar colisión con el PORT del API
                 child_env["PORT"] = str(int(os.getenv("VALIDATOR_HEALTH_PORT", "18088")))
+                # Heredar stdout/stderr del API para que los logs de validate_edge
+                # (logging + Rich) salgan en los Deploy Logs de Railway.
                 self._proc = subprocess.Popen(
                     cmd,
                     cwd=str(REPO_ROOT),
                     env=child_env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=None,
+                    stderr=None,
                     start_new_session=True,
                 )
                 self._started_monotonic = time.monotonic()
@@ -210,6 +212,11 @@ def build_status_payload() -> dict[str, Any]:
     if not df.empty and "result" in df.columns:
         resolved_today = int(((df["result"].isin(("Up", "Down"))) & today).sum())
     ml_acc, nr_acc = accuracies(df)
+    p_csv = signals_path()
+    csv_rows = int(len(df))
+    last_ts: Optional[str] = None
+    if csv_rows and "timestamp" in df.columns:
+        last_ts = str(df["timestamp"].iloc[-1])
     return {
         "running": supervisor.is_running(),
         "uptime_seconds": int(supervisor.uptime_seconds()),
@@ -219,6 +226,11 @@ def build_status_payload() -> dict[str, Any]:
         "ml_accuracy": round(ml_acc, 4),
         "nearres_accuracy": round(nr_acc, 4),
         "last_signal": last_signal_dict(df),
+        # Diagnóstico: si csv_rows sube con el tiempo, el worker está escribiendo
+        # (normalmente tras leer Gamma + mercados filtrados y precios).
+        "signals_csv": str(p_csv),
+        "csv_rows": csv_rows,
+        "last_csv_timestamp": last_ts,
     }
 
 
