@@ -35,6 +35,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.healthcheck import start_health_server  # noqa: E402
+from scripts import polymarket_feed  # noqa: E402
 
 load_dotenv(REPO_ROOT / ".env")
 
@@ -100,6 +101,12 @@ MAIN_LOOP_SEC = 30.0
 GAMMA_CACHE_SEC = 60.0
 GAMMA_PAGE_SLEEP = 1.0
 GAMMA_MAX_PAGES = int(os.getenv("GAMMA_MAX_PAGES", "120"))
+# slug: GET /markets/slug/{btc|eth|...}-updown-5m-{unix_5m_utc} (recomendado). scan: paginación legacy.
+GAMMA_FETCH_MODE = os.getenv("GAMMA_FETCH_MODE", "slug").strip().lower()
+GAMMA_SLUG_CACHE_SEC = float(os.getenv("GAMMA_SLUG_CACHE_SEC", "15"))
+POLYMARKET_WS_URL = os.getenv("POLYMARKET_WS_URL", "wss://ws-live-data.polymarket.com").strip()
+# polymarket: RTDS crypto_prices (btc/eth/sol/xrp) + Binance REST solo BNB. binance: los 5 por REST.
+PRICE_FEED = os.getenv("PRICE_FEED", "polymarket").strip().lower()
 CSV_WRITE_RETRIES = 3
 
 log = logging.getLogger("validate_edge")
@@ -348,9 +355,39 @@ def price_worker(
 class GammaCache:
     fetched_at: float = 0.0
     markets: list[dict[str, Any]] = field(default_factory=list)
+    slug_window_ts: int | None = None
 
 
 def fetch_gamma_markets(session: requests.Session, cache: GammaCache) -> list[dict[str, Any]]:
+    if GAMMA_FETCH_MODE == "scan":
+        return fetch_gamma_markets_scan(session, cache)
+    return fetch_gamma_markets_slug(session, cache)
+
+
+def fetch_gamma_markets_slug(session: requests.Session, cache: GammaCache) -> list[dict[str, Any]]:
+    now_dt = datetime.now(timezone.utc)
+    win_ts = polymarket_feed.floor_5m_window_ts_utc(now_dt)
+    now_m = time.monotonic()
+    if (
+        cache.markets
+        and cache.slug_window_ts == win_ts
+        and (now_m - cache.fetched_at) < GAMMA_SLUG_CACHE_SEC
+    ):
+        log.debug("Gamma slug: caché (%s mercados ventana=%s)", len(cache.markets), win_ts)
+        return cache.markets
+    markets, wts = polymarket_feed.fetch_5m_markets_by_slug(
+        session, GAMMA_API_URL, list(ASSET_MAP.keys()), now_dt
+    )
+    cache.markets = markets
+    cache.slug_window_ts = wts
+    cache.fetched_at = now_m
+    log.info("Gamma slug: %s mercados (ventana UTC ts=%s)", len(markets), wts)
+    if not markets:
+        log.warning("Gamma slug: 0 mercados — red, convención de slug o ventana sin mercado aún.")
+    return markets
+
+
+def fetch_gamma_markets_scan(session: requests.Session, cache: GammaCache) -> list[dict[str, Any]]:
     now = time.monotonic()
     if cache.markets and (now - cache.fetched_at) < GAMMA_CACHE_SEC:
         log.debug("Gamma: usando caché (%s mercados)", len(cache.markets))
@@ -394,8 +431,9 @@ def fetch_gamma_markets(session: requests.Session, cache: GammaCache) -> list[di
         )
     filtered = [m for m in all_rows if passes_market_filter(m)]
     cache.markets = filtered
+    cache.slug_window_ts = None
     cache.fetched_at = time.monotonic()
-    log.info("Gamma: %s mercados activos tras filtro 5m crypto Up/Down", len(filtered))
+    log.info("Gamma scan: %s mercados activos tras filtro 5m crypto Up/Down", len(filtered))
     if not filtered:
         if all_rows:
             samples = [str(m.get("question", ""))[:120] for m in all_rows[:3]]
@@ -779,32 +817,91 @@ def run_main(hours: float | None, threshold: float) -> None:
     session.headers.update({"User-Agent": "predmarket-arb-validate-edge/0.1"})
 
     threads: list[threading.Thread] = []
-    for sym in price_symbols:
-        t = threading.Thread(
-            target=price_worker,
-            args=(
-                sym,
-                ASSET_MAP[sym]["binance"],
+    feed = PRICE_FEED
+    if feed == "both":
+        log.info("PRICE_FEED=both: se usa solo Binance para no duplicar ticks en velas 5m.")
+        feed = "binance"
+    if feed not in ("binance", "polymarket"):
+        log.warning("PRICE_FEED=%s no reconocido; uso polymarket", PRICE_FEED)
+        feed = "polymarket"
+
+    log.info(
+        "Arranque validate_edge: GAMMA_FETCH_MODE=%s PRICE_FEED=%s GAMMA_API=%s%s",
+        GAMMA_FETCH_MODE,
+        feed,
+        GAMMA_API_URL,
+        f" POLYMARKET_WS={POLYMARKET_WS_URL}" if feed == "polymarket" else "",
+    )
+
+    if feed == "binance":
+        for sym in price_symbols:
+            t = threading.Thread(
+                target=price_worker,
+                args=(
+                    sym,
+                    ASSET_MAP[sym]["binance"],
+                    stop_event,
+                    raw_ticks,
+                    tick_lock,
+                    tick_counters,
+                    closes_5m,
+                    last_price,
+                    session,
+                ),
+                name=f"price-{sym}",
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        log.info(
+            "Precio Binance: hilos=%s (poll cada %ss símbolos %s)",
+            len(threads),
+            int(BINANCE_POLL_SEC),
+            ", ".join(price_symbols),
+        )
+    elif feed == "polymarket":
+        poly_syms = [s for s in price_symbols if s in polymarket_feed.POLY_BINANCE_SYMBOL]
+        try:
+            poly_ts = polymarket_feed.polymarket_crypto_ws_bundle(
+                POLYMARKET_WS_URL,
                 stop_event,
-                raw_ticks,
                 tick_lock,
+                raw_ticks,
                 tick_counters,
                 closes_5m,
                 last_price,
-                session,
-            ),
-            name=f"price-{sym}",
-            daemon=True,
+                poly_syms,
+                BINANCE_POLL_SEC,
+                AGGREGATE_EVERY_N_TICKS,
+            )
+            threads.extend(poly_ts)
+        except RuntimeError as e:
+            log.error("%s — instala websocket-client o usa PRICE_FEED=binance", e)
+            raise
+        if "BNB" in price_symbols:
+            t_bnb = threading.Thread(
+                target=price_worker,
+                args=(
+                    "BNB",
+                    ASSET_MAP["BNB"]["binance"],
+                    stop_event,
+                    raw_ticks,
+                    tick_lock,
+                    tick_counters,
+                    closes_5m,
+                    last_price,
+                    session,
+                ),
+                name="price-BNB",
+                daemon=True,
+            )
+            t_bnb.start()
+            threads.append(t_bnb)
+        log.info(
+            "Precio Polymarket RTDS (%s) + Binance REST solo BNB; muestreo velas cada %ss",
+            ",".join(poly_syms),
+            int(BINANCE_POLL_SEC),
         )
-        t.start()
-        threads.append(t)
-
-    log.info(
-        "Precio Binance: hilos=%s (poll cada %ss símbolos %s)",
-        len(threads),
-        int(BINANCE_POLL_SEC),
-        ", ".join(price_symbols),
-    )
 
     gamma_cache = GammaCache()
     stats = SessionStats()
@@ -856,7 +953,8 @@ def run_main(hours: float | None, threshold: float) -> None:
                             if not cid:
                                 continue
                             q = str(m.get("question", ""))
-                            asset = parse_asset_from_question(q)
+                            va = m.get("_validator_asset")
+                            asset = va if isinstance(va, str) and va in ASSET_MAP else parse_asset_from_question(q)
                             if asset is None or asset not in ASSET_MAP:
                                 continue
                             prices = parse_outcome_prices(m)
