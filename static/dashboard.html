@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PredMarket Arb — Edge Validator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'] }
+        }
+      }
+    };
+  </script>
+  <style>
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .pulse-dot { animation: pulse-dot 1.2s ease-in-out infinite; }
+    @keyframes flash { 0% { background-color: rgba(234, 179, 8, 0.35); } 100% { background-color: transparent; } }
+    .flash-update { animation: flash 0.6s ease-out; }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
+  <div class="max-w-6xl mx-auto px-4 py-6 space-y-8">
+    <!-- HEADER -->
+    <header class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 border-b border-slate-700 pb-6">
+      <div>
+        <h1 class="text-2xl font-bold text-white tracking-tight">PredMarket Arb</h1>
+        <p class="text-slate-400 text-sm mt-1">Edge Validator Dashboard</p>
+      </div>
+      <div class="flex flex-wrap items-center gap-3">
+        <div class="flex items-center gap-2 text-sm">
+          <span id="statusDot" class="w-3 h-3 rounded-full bg-slate-500"></span>
+          <span id="runLabel" class="text-slate-400">STOPPED</span>
+        </div>
+        <button id="btnStart" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm">
+          START
+        </button>
+        <button id="btnStop" class="px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-medium text-sm">
+          STOP
+        </button>
+      </div>
+    </header>
+
+    <!-- STATUS CARDS -->
+    <section class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div id="cardUptime" class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">Uptime</div>
+        <div id="valUptime" class="font-mono text-xl text-white mt-1">—</div>
+      </div>
+      <div id="cardSignals" class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">Signals Today</div>
+        <div id="valSignals" class="font-mono text-xl text-emerald-400 mt-1">0</div>
+      </div>
+      <div id="cardMl" class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">ML Accuracy</div>
+        <div id="valMl" class="font-mono text-xl text-white mt-1">—</div>
+      </div>
+      <div id="cardNr" class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+        <div class="text-xs text-slate-500 uppercase tracking-wide">NR Accuracy</div>
+        <div id="valNr" class="font-mono text-xl text-white mt-1">—</div>
+      </div>
+    </section>
+
+    <!-- ACTIVE MARKETS -->
+    <section>
+      <h2 class="text-lg font-semibold text-white mb-3">Active markets</h2>
+      <div class="overflow-x-auto rounded-xl border border-slate-700">
+        <table class="w-full text-sm text-left">
+          <thead class="bg-slate-800 text-slate-400 text-xs uppercase">
+            <tr>
+              <th class="px-3 py-2">Asset</th>
+              <th class="px-3 py-2">Minute</th>
+              <th class="px-3 py-2">p_market</th>
+              <th class="px-3 py-2">p_model</th>
+              <th class="px-3 py-2">gap_ml</th>
+              <th class="px-3 py-2">gap_nr</th>
+              <th class="px-3 py-2">Signal</th>
+            </tr>
+          </thead>
+          <tbody id="tblActive" class="divide-y divide-slate-700 font-mono"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- RECENT SIGNALS -->
+    <section>
+      <h2 class="text-lg font-semibold text-white mb-3">Recent signals</h2>
+      <div class="overflow-x-auto rounded-xl border border-slate-700">
+        <table class="w-full text-sm text-left">
+          <thead class="bg-slate-800 text-slate-400 text-xs uppercase">
+            <tr>
+              <th class="px-3 py-2">Time</th>
+              <th class="px-3 py-2">Asset</th>
+              <th class="px-3 py-2">Type</th>
+              <th class="px-3 py-2">Dir</th>
+              <th class="px-3 py-2">Gap</th>
+              <th class="px-3 py-2">Result</th>
+              <th class="px-3 py-2">✓/✗</th>
+            </tr>
+          </thead>
+          <tbody id="tblRecent" class="divide-y divide-slate-700 font-mono"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ACCURACY CHART -->
+    <section>
+      <h2 class="text-lg font-semibold text-white mb-3">Last 50 resolved signals</h2>
+      <div id="accChart" class="flex flex-wrap gap-0.5 p-4 rounded-xl border border-slate-700 bg-slate-800/30 min-h-[3rem]"></div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function fmtPct(x) {
+      if (x === '' || x === undefined || x === null) return '—';
+      const n = parseFloat(x);
+      if (Number.isNaN(n)) return '—';
+      return (n * 100).toFixed(0) + '%';
+    }
+
+    function fmtGapCell(v) {
+      if (v === '' || v === undefined || v === null) return '—';
+      const n = parseFloat(v);
+      if (Number.isNaN(n)) return '—';
+      const p = (n * 100).toFixed(0);
+      const abs = Math.abs(n);
+      let cls = 'text-slate-400';
+      if (abs > 0.10) cls = 'text-red-400 font-semibold';
+      else if (abs >= 0.08) cls = 'text-yellow-400';
+      return `<span class="${cls}">${n >= 0 ? '+' : ''}${p}%</span>`;
+    }
+
+    function signalIcon(gapMl, gapNr, sig) {
+      const gM = parseFloat(gapMl);
+      const gN = parseFloat(gapNr);
+      const use = sig === 'NEARRES' && !Number.isNaN(gN) ? Math.abs(gN) : Math.abs(gM);
+      if (Number.isNaN(use)) return '·';
+      if (use > 0.10) return '🚨' + (sig === 'NEARRES' ? ' NR' : '');
+      if (use >= 0.08) return '⚠️';
+      return '·';
+    }
+
+    function flashEl(el) {
+      if (!el) return;
+      el.classList.remove('flash-update');
+      void el.offsetWidth;
+      el.classList.add('flash-update');
+    }
+
+    function formatUptime(sec) {
+      if (!sec) return '—';
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      return `${h}h ${String(m).padStart(2, '0')}m`;
+    }
+
+    function timeShort(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return ts.slice(11, 16) || ts;
+      return d.toISOString().slice(11, 16) + 'Z';
+    }
+
+    async function fetchStatus() {
+      const r = await fetch('/api/status');
+      if (!r.ok) throw new Error('status');
+      return r.json();
+    }
+
+    async function fetchSignals(limit = 100) {
+      const r = await fetch('/api/signals?limit=' + limit);
+      if (!r.ok) return [];
+      return r.json();
+    }
+
+    function renderStatus(s) {
+      const running = !!s.running;
+      const dot = $('statusDot');
+      $('runLabel').textContent = running ? 'RUNNING' : 'STOPPED';
+      if (dot) {
+        dot.className = 'w-3 h-3 rounded-full ' + (running ? 'bg-emerald-400 pulse-dot' : 'bg-slate-500');
+      }
+      $('valUptime').textContent = running ? formatUptime(s.uptime_seconds) : '—';
+      flashEl($('cardUptime'));
+      $('valSignals').textContent = String(s.signals_today ?? 0);
+      flashEl($('cardSignals'));
+      const ml = (s.ml_accuracy * 100).toFixed(1);
+      const nr = (s.nearres_accuracy * 100).toFixed(1);
+      $('valMl').textContent = s.ml_accuracy != null ? ml + '%' : '—';
+      $('valNr').textContent = s.nearres_accuracy != null ? nr + '%' : '—';
+      flashEl($('cardMl'));
+      flashEl($('cardNr'));
+    }
+
+    function activeRows(rows) {
+      const open = rows.filter((r) => !r.result || r.result === '');
+      const byC = {};
+      for (const r of open) {
+        const id = r.condition_id || '';
+        if (!id) continue;
+        const t = r.timestamp || '';
+        if (!byC[id] || t > byC[id].timestamp) byC[id] = r;
+      }
+      return Object.values(byC).sort((a, b) => (a.asset || '').localeCompare(b.asset || ''));
+    }
+
+    function renderActive(rows) {
+      const act = activeRows(rows);
+      const tb = $('tblActive');
+      tb.innerHTML = act.length
+        ? act.map((r) => {
+            const sig = r.signal || '';
+            const icon = signalIcon(r.gap_ml, r.gap_nearres, sig);
+            return `<tr class="hover:bg-slate-800/80">
+              <td class="px-3 py-2 text-white">${r.asset || ''}</td>
+              <td class="px-3 py-2">${(parseFloat(r.minutes_elapsed) || 0).toFixed(1)}</td>
+              <td class="px-3 py-2">${fmtPct(r.p_mercado)}</td>
+              <td class="px-3 py-2">${r.p_modelo !== '' && r.p_modelo != null ? fmtPct(r.p_modelo) : '—'}</td>
+              <td class="px-3 py-2">${fmtGapCell(r.gap_ml)}</td>
+              <td class="px-3 py-2">${fmtGapCell(r.gap_nearres)}</td>
+              <td class="px-3 py-2">${icon}</td>
+            </tr>`;
+          }).join('')
+        : `<tr><td colspan="7" class="px-3 py-6 text-center text-slate-500">No open windows in sample</td></tr>`;
+    }
+
+    function renderRecent(rows) {
+      const sigRows = rows.filter((r) => r.signal === 'ML' || r.signal === 'NEARRES').slice(-20).reverse();
+      const tb = $('tblRecent');
+      tb.innerHTML = sigRows.length
+        ? sigRows.map((r) => {
+            const gap = r.signal === 'NEARRES' ? r.gap_nearres : r.gap_ml;
+            const g = parseFloat(gap);
+            const gapStr = Number.isNaN(g) ? '—' : (g >= 0 ? '+' : '') + (g * 100).toFixed(0) + '%';
+            const res = r.result || '';
+            const ok = res && r.direction === res;
+            const mark = res ? (ok ? '✅' : '❌') : '—';
+            const rowCls = res ? (ok ? 'bg-green-900/20' : 'bg-red-900/20') : '';
+            const resCls = res === 'Up' ? 'text-green-400' : res === 'Down' ? 'text-red-400' : 'text-slate-500';
+            return `<tr class="${rowCls} hover:bg-slate-800/60">
+              <td class="px-3 py-2 text-slate-300">${timeShort(r.timestamp)}</td>
+              <td class="px-3 py-2 text-white">${r.asset || ''}</td>
+              <td class="px-3 py-2">${r.signal || ''}</td>
+              <td class="px-3 py-2">${r.direction || ''}</td>
+              <td class="px-3 py-2">${gapStr}</td>
+              <td class="px-3 py-2 ${resCls}">${res || '—'}</td>
+              <td class="px-3 py-2">${mark}</td>
+            </tr>`;
+          }).join('')
+        : `<tr><td colspan="7" class="px-3 py-6 text-center text-slate-500">No signals yet</td></tr>`;
+    }
+
+    function renderChart(rows) {
+      const resolved = rows.filter((r) =>
+        (r.signal === 'ML' || r.signal === 'NEARRES') &&
+        (r.result === 'Up' || r.result === 'Down')
+      );
+      const last50 = resolved.slice(-50);
+      const el = $('accChart');
+      el.innerHTML = last50.length
+        ? last50.map((r) => {
+            const ok = r.direction === r.result;
+            return `<span title="${r.asset} ${r.signal}" class="inline-block w-3 h-3 rounded-sm ${ok ? 'bg-emerald-500' : 'bg-red-500'}"></span>`;
+          }).join('')
+        : '<span class="text-slate-500 text-sm">Not enough resolved signals</span>';
+    }
+
+    async function refreshAll() {
+      try {
+        const s = await fetchStatus();
+        renderStatus(s);
+        const rows = await fetchSignals(200);
+        renderActive(rows);
+        renderRecent(rows);
+        renderChart(rows);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    $('btnStart').onclick = async () => {
+      try {
+        const r = await fetch('/api/start', { method: 'POST' });
+        const j = await r.json();
+        if (!r.ok) alert(j.error || 'Start failed');
+        await refreshAll();
+      } catch (e) {
+        alert('Start failed');
+      }
+    };
+
+    $('btnStop').onclick = async () => {
+      if (!confirm('Stop the validator?')) return;
+      try {
+        const r = await fetch('/api/stop', { method: 'POST' });
+        const j = await r.json();
+        if (!r.ok) alert(j.error || 'Stop failed');
+        await refreshAll();
+      } catch (e) {
+        alert('Stop failed');
+      }
+    };
+
+    let es;
+    function connectSSE() {
+      if (es) es.close();
+      es = new EventSource('/api/signals/live');
+      es.onmessage = () => {
+        refreshAll();
+      };
+      es.onerror = () => {
+        es.close();
+        setTimeout(connectSSE, 8000);
+      };
+    }
+
+    refreshAll();
+    connectSSE();
+    setInterval(refreshAll, 10000);
+  </script>
+</body>
+</html>

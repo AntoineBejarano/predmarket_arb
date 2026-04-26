@@ -1,0 +1,23 @@
+# Data (too large for git)
+data/raw/
+data/zips/
+data/features/
+
+# Models (small enough — keep in git for Railway)
+# models/saved/ ← DO NOT ignore
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs (Railway generates these)
+logs/
+reports/
+
+# Secrets
+.env

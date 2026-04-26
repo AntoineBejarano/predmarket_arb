@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.git/
+data/zips/
+data/raw/
+*.ipynb
+notebooks/
+.DS_Store

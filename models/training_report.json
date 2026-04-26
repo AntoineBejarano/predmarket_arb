@@ -1,0 +1,65 @@
+{
+  "trained_at": "2026-04-26T21:32:04.194439+00:00",
+  "assets": {
+    "BTCUSDT": {
+      "wf_accuracy_mean": 0.5285870584015387,
+      "wf_accuracy_std": 0.00779390628039233,
+      "edge": 0.02858705840153868,
+      "brier_score": 0.24888741016316024,
+      "ece": 2.4041004694243795e-19,
+      "best_features": [
+        "ret_48",
+        "atr_5",
+        "hour"
+      ]
+    },
+    "ETHUSDT": {
+      "wf_accuracy_mean": 0.5288813574305922,
+      "wf_accuracy_std": 0.005558416884833988,
+      "edge": 0.02888135743059206,
+      "brier_score": 0.2489159156883852,
+      "ece": 6.336035594472051e-17,
+      "best_features": [
+        "ret_48",
+        "atr_5",
+        "vol_10"
+      ]
+    },
+    "SOLUSDT": {
+      "wf_accuracy_mean": 0.5185448694944355,
+      "wf_accuracy_std": 0.010147556539037065,
+      "edge": 0.0185448694944355,
+      "brier_score": 0.2496343403821022,
+      "ece": 6.80962767387369e-17,
+      "best_features": [
+        "atr_5",
+        "vol_10",
+        "ret_48"
+      ]
+    },
+    "XRPUSDT": {
+      "wf_accuracy_mean": 0.534880592732233,
+      "wf_accuracy_std": 0.008959490158068512,
+      "edge": 0.03488059273223294,
+      "brier_score": 0.24841081533732812,
+      "ece": 1.466354630982545e-16,
+      "best_features": [
+        "hour",
+        "vol_10",
+        "atr_5"
+      ]
+    },
+    "BNBUSDT": {
+      "wf_accuracy_mean": 0.5381823392413941,
+      "wf_accuracy_std": 0.013046896331419389,
+      "edge": 0.038182339241394116,
+      "brier_score": 0.24796611251854106,
+      "ece": 1.0795092007630551e-16,
+      "best_features": [
+        "atr_5",
+        "vol_10",
+        "ret_48"
+      ]
+    }
+  }
+}
