@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -15,8 +16,9 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional, Union
+from typing import Any, AsyncIterator, Optional, Tuple, Union
 
+import numpy as np
 import pandas as pd
 import uvicorn
 from dotenv import load_dotenv
@@ -61,6 +63,83 @@ def read_signals_df() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _float_opt(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none", "nat", "<na>"):
+        return None
+    try:
+        v = float(s)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except ValueError:
+        return None
+
+
+def _json_cell(x: Any) -> Any:
+    """Valor serializable a JSON (sin numpy NaN sueltos)."""
+    try:
+        if pd.isna(x):
+            return None
+    except TypeError:
+        pass
+    if x is None:
+        return None
+    if isinstance(x, (bool, np.bool_)):  # type: ignore[arg-type]
+        return bool(x)
+    if isinstance(x, (int, np.integer)):  # type: ignore[arg-type]
+        return int(x)
+    if isinstance(x, (float, np.floating)):  # type: ignore[arg-type]
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none", "nat", "<na>"):
+        return None
+    return s
+
+
+def _debug_row_dict(row: pd.Series) -> dict[str, Any]:
+    rec: dict[str, Any] = {str(c): _json_cell(row[c]) for c in row.index}
+    gap_nr = _float_opt(row.get("gap_nearres"))
+    wr = _float_opt(row.get("window_return"))
+    mins = _float_opt(row.get("minutes_elapsed"))
+    pnr = _float_opt(row.get("p_nearres"))
+    pmc = _float_opt(row.get("p_mercado"))
+    rec["gap_nr_pct"] = (gap_nr * 100.0) if gap_nr is not None else None
+    rec["window_return_pct"] = (wr * 100.0) if wr is not None else None
+    rec["minutes_at_signal"] = mins
+    rec["p_nearres_raw"] = pnr
+    rec["p_mercado_raw"] = pmc
+    return rec
+
+
+def build_debug_signals_rows(last_n: int = 20) -> list[dict[str, Any]]:
+    """
+    Últimas N filas del CSV con columnas extra para diagnosticar NearRes / ventana / mercado.
+    """
+    df = read_signals_df()
+    if df.empty:
+        return []
+    return [_debug_row_dict(r) for _, r in df.tail(int(last_n)).iterrows()]
+
+
+def build_debug_last_ml_nearres_rows(signal_n: int = 10) -> list[dict[str, Any]]:
+    """Últimas N filas con signal ML o NEARRES en todo el CSV (mismas columnas calculadas)."""
+    df = read_signals_df()
+    if df.empty or "signal" not in df.columns:
+        return []
+    sub = df[df["signal"].isin(("ML", "NEARRES"))]
+    if sub.empty:
+        return []
+    return [_debug_row_dict(r) for _, r in sub.tail(int(signal_n)).iterrows()]
+
+
 def _parse_ts(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce")
 
@@ -73,31 +152,49 @@ def today_mask_utc(df: pd.DataFrame) -> pd.Series:
     return ts.dt.date == today
 
 
-def _dedupe_signal_first(df: pd.DataFrame, sig: str) -> pd.DataFrame:
-    sub = df[(df["signal"] == sig) & (df["result"].isin(("Up", "Down")))].copy()
-    if sub.empty:
+def _mask_result_resolved_for_accuracy(result: pd.Series) -> pd.Series:
+    """Fila usable para accuracy: result es Up/Down real, no vacío ni literal 'None'."""
+    r = result.astype(str).str.strip()
+    bad = r.isin(("", "none", "None", "NaT", "nan", "NaN", "<NA>"))
+    return ~bad & r.isin(("Up", "Down"))
+
+
+def _dedupe_by_condition_first(sub: pd.DataFrame) -> pd.DataFrame:
+    if sub.empty or "condition_id" not in sub.columns:
         return sub
-    sub["_ts"] = _parse_ts(sub["timestamp"])
-    sub = sub.sort_values("_ts")
-    return sub.groupby("condition_id", as_index=False).first()
+    out = sub.copy()
+    if "timestamp" in out.columns:
+        out["_ts"] = _parse_ts(out["timestamp"])
+        out = out.sort_values("_ts")
+    return out.groupby("condition_id", as_index=False).first()
 
 
-def accuracies(df: pd.DataFrame) -> tuple[float, float]:
-    if df.empty or not {"signal", "direction", "result"}.issubset(df.columns):
-        return 0.0, 0.0
-    resolved = df[df["result"].isin(("Up", "Down"))]
-    if resolved.empty:
-        return 0.0, 0.0
+def _accuracy_for_signal(df: pd.DataFrame, sig: str) -> Tuple[Optional[float], int]:
+    """
+    Precisión = aciertos / N con result resuelto (Up/Down), tras deduplicar por condition_id.
+    Si N == 0 → (None, 0) para mostrar '—' en UI, no 0%% por artefacto.
+    """
+    need = {"signal", "direction", "result"}
+    if df.empty or not need.issubset(df.columns):
+        return None, 0
+    m = (df["signal"] == sig) & _mask_result_resolved_for_accuracy(df["result"])
+    sub = df.loc[m].copy()
+    if sub.empty:
+        return None, 0
+    sub = _dedupe_by_condition_first(sub)
+    n = len(sub)
+    if n == 0:
+        return None, 0
+    d = sub["direction"].astype(str).str.strip()
+    res = sub["result"].astype(str).str.strip()
+    correct = int((d == res).sum())
+    return float(correct) / float(n), n
 
-    def acc(sub: pd.DataFrame) -> float:
-        if sub.empty:
-            return 0.0
-        ok = (sub["direction"] == sub["result"]).sum()
-        return float(ok) / float(len(sub))
 
-    ml = _dedupe_signal_first(resolved, "ML")
-    nr = _dedupe_signal_first(resolved, "NEARRES")
-    return acc(ml), acc(nr)
+def accuracies(df: pd.DataFrame) -> tuple[Optional[float], Optional[float], int, int]:
+    ml_acc, ml_n = _accuracy_for_signal(df, "ML")
+    nr_acc, nr_n = _accuracy_for_signal(df, "NEARRES")
+    return ml_acc, nr_acc, ml_n, nr_n
 
 
 def last_signal_dict(df: pd.DataFrame) -> Optional[dict[str, Any]]:
@@ -223,7 +320,7 @@ def build_status_payload() -> dict[str, Any]:
     resolved_today = 0
     if not df.empty and "result" in df.columns:
         resolved_today = int(((df["result"].isin(("Up", "Down"))) & today).sum())
-    ml_acc, nr_acc = accuracies(df)
+    ml_acc, nr_acc, ml_resolved_n, nr_resolved_n = accuracies(df)
     p_csv = signals_path()
     csv_rows = int(len(df))
     last_ts: Optional[str] = None
@@ -235,8 +332,10 @@ def build_status_payload() -> dict[str, Any]:
         "pid": supervisor.pid(),
         "signals_today": signals_today,
         "resolved_today": resolved_today,
-        "ml_accuracy": round(ml_acc, 4),
-        "nearres_accuracy": round(nr_acc, 4),
+        "ml_accuracy": round(ml_acc, 4) if ml_acc is not None else None,
+        "nearres_accuracy": round(nr_acc, 4) if nr_acc is not None else None,
+        "ml_resolved_count": int(ml_resolved_n),
+        "nearres_resolved_count": int(nr_resolved_n),
         "last_signal": last_signal_dict(df),
         # Diagnóstico: si csv_rows sube con el tiempo, el worker está escribiendo
         # (normalmente tras leer Gamma + mercados filtrados y precios).
@@ -336,6 +435,28 @@ async def api_signals(
         df = df[df["asset"].astype(str).str.upper() == asset.strip().upper()]
     df = df.tail(int(limit))
     return df.to_dict(orient="records")
+
+
+@app.get("/api/debug/signals")
+async def api_debug_signals() -> dict[str, Any]:
+    """
+    Últimas 20 filas de signals.csv con columnas calculadas para diagnosticar:
+    window_return ~ 0 → Bug 2; p_nearres ~ 0.5 → Bug 1; resultados vs gaps → Bug 3.
+
+    Incluye last_signals: últimas 10 filas ML/NEARRES de todo el CSV (para el dashboard).
+    """
+    rows, last_sig = await asyncio.gather(
+        asyncio.to_thread(build_debug_signals_rows, 20),
+        asyncio.to_thread(build_debug_last_ml_nearres_rows, 10),
+    )
+    return {
+        "source": str(signals_path()),
+        "tail": 20,
+        "row_count": len(rows),
+        "rows": rows,
+        "last_signals": last_sig,
+        "last_signals_count": len(last_sig),
+    }
 
 
 async def _signals_sse_gen() -> AsyncIterator[str]:

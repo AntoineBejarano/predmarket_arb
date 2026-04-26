@@ -111,6 +111,35 @@
       </div>
     </section>
 
+    <!-- DEBUG: NearRes / window / market -->
+    <section>
+      <h2 class="text-lg font-semibold text-white mb-1">Signal debug</h2>
+      <p class="text-xs text-slate-500 mb-3 max-w-3xl">
+        Last 10 ML / NEARRES rows from <code class="text-slate-400">/api/debug/signals</code>
+        (<code class="text-slate-400">last_signals</code>). Hints:
+        <span class="text-amber-400/90">window_return ≈ 0 → Bug 2</span>;
+        <span class="text-amber-400/90">p_nearres ≈ 0.5 → Bug 1</span>;
+        <span class="text-amber-400/90">results vs gaps random → Bug 3</span>.
+      </p>
+      <div class="overflow-x-auto rounded-xl border border-slate-700">
+        <table class="w-full text-sm text-left">
+          <thead class="bg-slate-800 text-slate-400 text-xs uppercase">
+            <tr>
+              <th class="px-3 py-2">Time</th>
+              <th class="px-3 py-2">Asset</th>
+              <th class="px-3 py-2">Type</th>
+              <th class="px-3 py-2">gap_nr %</th>
+              <th class="px-3 py-2">win_ret %</th>
+              <th class="px-3 py-2">min@sig</th>
+              <th class="px-3 py-2">p_nearres</th>
+              <th class="px-3 py-2">p_mercado</th>
+            </tr>
+          </thead>
+          <tbody id="tblDebug" class="divide-y divide-slate-700 font-mono"></tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- ACCURACY CHART -->
     <section>
       <h2 class="text-lg font-semibold text-white mb-3">Last 50 resolved signals</h2>
@@ -134,6 +163,13 @@
       const n = Number(acc);
       if (Number.isNaN(n)) return '—';
       return (n * 100).toFixed(1) + '%';
+    }
+
+    function fmtDbg(v, decimals) {
+      if (v === null || v === undefined) return '—';
+      const n = Number(v);
+      if (Number.isNaN(n)) return '—';
+      return n.toFixed(decimals);
     }
 
     function fmtGapCell(v) {
@@ -189,6 +225,33 @@
       const r = await fetch('/api/signals?limit=' + limit);
       if (!r.ok) return [];
       return r.json();
+    }
+
+    async function fetchDebugSignals() {
+      const r = await fetch('/api/debug/signals');
+      if (!r.ok) return { last_signals: [] };
+      return r.json();
+    }
+
+    function renderDebug(payload) {
+      const raw = (payload && payload.last_signals) || [];
+      const rows = [...raw].reverse();
+      const tb = $('tblDebug');
+      if (!tb) return;
+      tb.innerHTML = rows.length
+        ? rows.map((r) => {
+            return `<tr class="hover:bg-slate-800/80">
+              <td class="px-3 py-2 text-slate-300">${timeShort(r.timestamp)}</td>
+              <td class="px-3 py-2 text-white">${r.asset || ''}</td>
+              <td class="px-3 py-2">${r.signal || ''}</td>
+              <td class="px-3 py-2">${fmtDbg(r.gap_nr_pct, 1)}</td>
+              <td class="px-3 py-2">${fmtDbg(r.window_return_pct, 2)}</td>
+              <td class="px-3 py-2">${fmtDbg(r.minutes_at_signal, 2)}</td>
+              <td class="px-3 py-2">${fmtDbg(r.p_nearres_raw, 4)}</td>
+              <td class="px-3 py-2">${fmtDbg(r.p_mercado_raw, 4)}</td>
+            </tr>`;
+          }).join('')
+        : '<tr><td colspan="8" class="px-3 py-6 text-center text-slate-500">No ML/NEARRES rows yet (see GET /api/debug/signals)</td></tr>';
     }
 
     function renderStatus(s) {
@@ -329,6 +392,8 @@
         renderActive(rows);
         renderRecent(rows);
         renderChart(rows);
+        const dbg = await fetchDebugSignals();
+        renderDebug(dbg);
       } catch (e) {
         console.error(e);
       }
