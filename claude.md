@@ -24,6 +24,8 @@ Sistema de **paper trading / validación de edge** sobre mercados Polymarket tip
 - `static/dashboard.html` — UI vanilla + Tailwind CDN; sin build npm.
 - `Dockerfile` / `railway.toml` — arranque con `python scripts/api.py`; healthcheck Railway en `/health` del API.
 
+En **`python:3.11-slim`** hace falta el paquete **`libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
+
 ## Entorno y variables
 
 - Copiar `.env.example` → `.env`. Relevantes: `DATA_DIR`, `PORT`, `AUTO_START`, `SIGNAL_THRESHOLD`, `LOG_LEVEL`, `GAMMA_MAX_PAGES`, `VALIDATOR_HEALTH_PORT`, `DASHBOARD_PASSWORD` (reservado; auth no implementada).
