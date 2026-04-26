@@ -386,11 +386,27 @@ def fetch_gamma_markets(session: requests.Session, cache: GammaCache) -> list[di
         offset += limit
         time.sleep(GAMMA_PAGE_SLEEP)
     else:
-        log.warning("Gamma: paginación truncada tras %s páginas (offset=%s)", GAMMA_MAX_PAGES, offset)
+        log.warning(
+            "Gamma: paginación truncada tras %s páginas (offset=%s). "
+            "Si siempre ves 0 mercados filtrados, sube GAMMA_MAX_PAGES en .env o revisa el filtro.",
+            GAMMA_MAX_PAGES,
+            offset,
+        )
     filtered = [m for m in all_rows if passes_market_filter(m)]
     cache.markets = filtered
     cache.fetched_at = time.monotonic()
     log.info("Gamma: %s mercados activos tras filtro 5m crypto Up/Down", len(filtered))
+    if not filtered:
+        if all_rows:
+            samples = [str(m.get("question", ""))[:120] for m in all_rows[:3]]
+            log.warning(
+                "Gamma: ningún mercado pasó el filtro entre %s descargados (no es fallo de Binance). "
+                "Ejemplos de preguntas en ese bloque: %s",
+                len(all_rows),
+                samples,
+            )
+        else:
+            log.warning("Gamma: la API devolvió 0 mercados en las páginas consultadas.")
     return filtered
 
 
