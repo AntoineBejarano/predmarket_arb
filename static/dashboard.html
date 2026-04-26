@@ -56,10 +56,12 @@
       <div id="cardMl" class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
         <div class="text-xs text-slate-500 uppercase tracking-wide">ML Accuracy</div>
         <div id="valMl" class="font-mono text-xl text-white mt-1">—</div>
+        <div id="subMl" class="text-xs text-slate-500 mt-1 normal-case tracking-normal">—</div>
       </div>
       <div id="cardNr" class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
         <div class="text-xs text-slate-500 uppercase tracking-wide">NR Accuracy</div>
         <div id="valNr" class="font-mono text-xl text-white mt-1">—</div>
+        <div id="subNr" class="text-xs text-slate-500 mt-1 normal-case tracking-normal">—</div>
       </div>
     </section>
 
@@ -124,6 +126,14 @@
       const n = parseFloat(x);
       if (Number.isNaN(n)) return '—';
       return (n * 100).toFixed(0) + '%';
+    }
+
+    /** API puede enviar ml_accuracy / nearres_accuracy como null (sin datos resueltos). */
+    function fmtAccuracyPct(acc) {
+      if (acc === null || acc === undefined) return '—';
+      const n = Number(acc);
+      if (Number.isNaN(n)) return '—';
+      return (n * 100).toFixed(1) + '%';
     }
 
     function fmtGapCell(v) {
@@ -192,10 +202,20 @@
       flashEl($('cardUptime'));
       $('valSignals').textContent = String(s.signals_today ?? 0);
       flashEl($('cardSignals'));
-      const ml = (s.ml_accuracy * 100).toFixed(1);
-      const nr = (s.nearres_accuracy * 100).toFixed(1);
-      $('valMl').textContent = s.ml_accuracy != null ? ml + '%' : '—';
-      $('valNr').textContent = s.nearres_accuracy != null ? nr + '%' : '—';
+      $('valMl').textContent = fmtAccuracyPct(s.ml_accuracy);
+      $('valNr').textContent = fmtAccuracyPct(s.nearres_accuracy);
+      const mlN = s.ml_resolved_count;
+      const nrN = s.nearres_resolved_count;
+      const subMl = $('subMl');
+      const subNr = $('subNr');
+      if (subMl) {
+        subMl.textContent =
+          mlN != null && mlN !== undefined ? `(${Number(mlN)} resolved)` : '—';
+      }
+      if (subNr) {
+        subNr.textContent =
+          nrN != null && nrN !== undefined ? `(${Number(nrN)} resolved)` : '—';
+      }
       flashEl($('cardMl'));
       flashEl($('cardNr'));
       const df = $('diagFooter');
@@ -207,16 +227,37 @@
       }
     }
 
+    function isUnsettledResult(res) {
+      if (res === null || res === undefined) return true;
+      const s = String(res).trim();
+      const low = s.toLowerCase();
+      if (low === '' || low === 'nan' || low === 'none' || low === 'null' || low === 'nat') return true;
+      return s !== 'Up' && s !== 'Down';
+    }
+
+    /**
+     * Mercados aún en ventana 5m: última fila por activo (más reciente por timestamp).
+     * No usar solo result=='' : al resolverse, el CSV actualiza TODAS las filas de ese
+     * condition_id a Up/Down, así que la última observación ya no tiene result vacío.
+     */
     function activeRows(rows) {
-      const open = rows.filter((r) => !r.result || r.result === '');
-      const byC = {};
-      for (const r of open) {
-        const id = r.condition_id || '';
-        if (!id) continue;
+      if (!rows || !rows.length) return [];
+      const byAsset = {};
+      for (const r of rows) {
+        const a = (r.asset || '').toString().trim();
+        if (!a) continue;
         const t = r.timestamp || '';
-        if (!byC[id] || t > byC[id].timestamp) byC[id] = r;
+        if (!byAsset[a] || t > byAsset[a].timestamp) byAsset[a] = r;
       }
-      return Object.values(byC).sort((a, b) => (a.asset || '').localeCompare(b.asset || ''));
+      return Object.values(byAsset)
+        .filter((r) => {
+          const mins = parseFloat(r.minutes_elapsed);
+          const in5mWindow = Number.isFinite(mins) && mins >= 0 && mins < 5;
+          if (in5mWindow) return true;
+          const unsettled = isUnsettledResult(r.result);
+          return unsettled && !Number.isFinite(mins);
+        })
+        .sort((a, b) => (a.asset || '').localeCompare(b.asset || ''));
     }
 
     function renderActive(rows) {
@@ -236,7 +277,7 @@
               <td class="px-3 py-2">${icon}</td>
             </tr>`;
           }).join('')
-        : `<tr><td colspan="7" class="px-3 py-6 text-center text-slate-500">No open windows in sample</td></tr>`;
+        : `<tr><td colspan="7" class="px-3 py-6 text-center text-slate-500">No active 5m windows in sample (last row per asset needs minutes_elapsed &lt; 5)</td></tr>`;
     }
 
     function renderRecent(rows) {
