@@ -249,6 +249,106 @@ class PolyCLOBClient:
                 return {"error": f"HTTP {resp.status}", "raw": text[:500], "data": []}
             return out if isinstance(out, dict) else {"data": []}
 
+    async def _l2_get_json(self, request_path: str, params: Optional[dict[str, str]] = None) -> Any:
+        """GET firmado L2 bajo ``/data/...`` (mismo patrón que ``get_open_orders``)."""
+        secret, passphrase = self._live_secrets()
+        if not self.private_key or not self.api_key or not secret or not passphrase:
+            raise RuntimeError("Credenciales incompletas para _l2_get_json")
+        from eth_account import Account
+
+        signer_addr = Account.from_key(self.private_key).address
+        headers = build_l2_headers(
+            signer_addr,
+            self.api_key,
+            secret,
+            passphrase,
+            "GET",
+            request_path,
+            None,
+        )
+        req_headers = {**_DEFAULT_HEADERS, **headers}
+        sess = self._require_session()
+        url = f"{CLOB_REST}{request_path}"
+        await self._clob_throttle()
+        async with sess.get(url, headers=req_headers, params=params or None) as resp:
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"error": "json_decode", "raw": text[:500], "http_status": resp.status}
+
+    async def get_order(self, order_id: str) -> dict[str, Any]:
+        """GET /data/order — detalle de orden (p. ej. ``size_matched``, ``original_size``). Requiere L2."""
+        oid = order_id.strip()
+        if not oid:
+            return {"error": "empty_order_id"}
+        data = await self._l2_get_json("/data/order", {"id": oid})
+        return data if isinstance(data, dict) else {"error": "invalid_response"}
+
+    async def get_trades(
+        self,
+        *,
+        asset_id: str = "",
+        market: str = "",
+        after: str = "",
+        next_cursor: str = "",
+    ) -> dict[str, Any]:
+        """
+        GET /data/trades — historial de trades (fills). Requiere L2.
+        Filtros opcionales según API CLOB (``asset_id``, ``market``, ``after``, ``next_cursor``).
+        """
+        params: dict[str, str] = {}
+        if asset_id:
+            params["asset_id"] = asset_id
+        if market:
+            params["market"] = market
+        if after:
+            params["after"] = after
+        if next_cursor:
+            params["next_cursor"] = next_cursor
+        data = await self._l2_get_json("/data/trades", params or None)
+        return data if isinstance(data, dict) else {"error": "invalid_response", "data": []}
+
+    async def post_orders_batch(self, orders_payload: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        POST /orders — hasta 15 órdenes por request (si el endpoint existe en el CLOB).
+        ``orders_payload`` debe ser la lista de cuerpos ya firmados o el formato que exija la API.
+        Si HTTP != 200, devuelve dict con error. Respuesta 200 puede contener fallos **por orden**.
+        """
+        if self.dry_run:
+            raise RuntimeError("DRY_RUN=true")
+        secret, passphrase = self._live_secrets()
+        if not self.private_key or not self.api_key or not secret or not passphrase:
+            raise RuntimeError("Credenciales incompletas para post_orders_batch")
+        from eth_account import Account
+
+        signer_addr = Account.from_key(self.private_key).address
+        body_obj = orders_payload
+        serialized = json.dumps(body_obj, separators=(",", ":"), ensure_ascii=False)
+        headers = build_l2_headers(
+            signer_addr,
+            self.api_key,
+            secret,
+            passphrase,
+            "POST",
+            "/orders",
+            serialized,
+        )
+        req_headers = {**_DEFAULT_HEADERS, **headers, "Content-Type": "application/json"}
+        sess = self._require_session()
+        url = f"{CLOB_REST}/orders"
+        await self._clob_throttle()
+        async with sess.post(url, data=serialized.encode("utf-8"), headers=req_headers) as resp:
+            text = await resp.text()
+            try:
+                out = json.loads(text)
+            except json.JSONDecodeError:
+                out = {"raw": text[:1000], "http_status": resp.status}
+            if not isinstance(out, dict):
+                out = {"response": out, "http_status": resp.status}
+            out["http_status"] = resp.status
+            return out
+
     async def get_market(self, market_id: str) -> dict[str, Any]:
         """GET /markets/{condition_id} — metadata de un mercado."""
         mid = market_id.strip()
@@ -297,7 +397,17 @@ class PolyCLOBClient:
         self._fee_cache[token_id] = (now + self._meta_ttl_sec, bps)
         return bps
 
-    async def place_order(self, token_id: str, side: str, price: float, size_usdc: float) -> dict[str, Any]:
+    async def place_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size_usdc: float,
+        *,
+        order_type: str = "GTC",
+        post_only: bool = False,
+        order_expiration_unix: int = 0,
+    ) -> dict[str, Any]:
         """POST /order — firma EIP-712 vía py-order-utils + cabeceras L2. Requiere DRY_RUN=false y credenciales."""
         if self.dry_run:
             raise RuntimeError("DRY_RUN=true — orden simulada, no enviada")
@@ -322,6 +432,11 @@ class PolyCLOBClient:
         neg = await self.get_neg_risk(token_id)
         fee_bps = await self.get_fee_rate_bps(token_id)
 
+        exp = int(order_expiration_unix)
+        if (order_type or "GTC").strip().upper() == "GTD" and exp <= 0:
+            ttl = max(120, int(os.getenv("BUNDLE_ORDER_TTL_SECONDS", "180")))
+            exp = int(time.time()) + ttl
+
         def _build() -> tuple[str, dict[str, Any]]:
             return build_post_order_body(
                 private_key=self.private_key,
@@ -334,6 +449,9 @@ class PolyCLOBClient:
                 tick_size=tick,
                 neg_risk=neg,
                 fee_rate_bps=fee_bps,
+                expiration=exp,
+                order_type=order_type,
+                post_only=post_only,
             )
 
         serialized, body = await asyncio.to_thread(_build)

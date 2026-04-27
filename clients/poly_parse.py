@@ -62,6 +62,52 @@ def clob_market_tradeable(m: dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
+def parse_outcomes_list(m: dict[str, Any]) -> list[str]:
+    """Lista de etiquetas de outcome (Gamma), p. ej. ``[\"Yes\", \"No\"]``."""
+    raw = m.get("outcomes")
+    parsed = parse_json_maybe(raw)
+    if not isinstance(parsed, (list, tuple)):
+        return []
+    return [str(x).strip() for x in parsed]
+
+
+def gamma_yes_token_id(m: dict[str, Any]) -> Optional[str]:
+    """
+    Token CLOB del lado **Yes** para un market binario Gamma.
+    Alinea ``outcomes[i]`` con ``clobTokenIds[i]`` (misma longitud).
+    """
+    outcomes = parse_outcomes_list(m)
+    raw_tok = m.get("clobTokenIds") or m.get("clob_token_ids")
+    tokens = parse_json_maybe(raw_tok)
+    if not isinstance(tokens, (list, tuple)) or len(outcomes) != len(tokens):
+        return None
+    for i, lab in enumerate(outcomes):
+        if str(lab).strip().lower() == "yes":
+            tid = str(tokens[i]).strip()
+            return tid or None
+    return None
+
+
+def gamma_market_child_eligible(m: dict[str, Any]) -> Tuple[bool, str]:
+    """Child market dentro de un event Gamma: activo, tradable CLOB, con token YES."""
+    if not api_bool_true(m.get("active")):
+        return False, "inactive"
+    if api_bool_true(m.get("closed")) or api_bool_true(m.get("isClosed")):
+        return False, "closed"
+    if api_bool_true(m.get("archived")):
+        return False, "archived"
+    if api_bool_true(m.get("restricted")):
+        return False, "restricted"
+    ok, reason = clob_market_tradeable(m)
+    if not ok:
+        return False, reason
+    if not gamma_market_token_ids(m):
+        return False, "no_clob_tokens"
+    if gamma_yes_token_id(m) is None:
+        return False, "no_yes_token"
+    return True, ""
+
+
 def gamma_market_token_ids(m: dict[str, Any]) -> list[str]:
     """Token IDs CLOB desde payload Gamma (``clobTokenIds`` JSON o lista)."""
     raw = m.get("clobTokenIds") or m.get("clob_token_ids")

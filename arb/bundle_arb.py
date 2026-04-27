@@ -1,13 +1,15 @@
-"""Bundle arbitrage: ∑ best_ask < 1 (menos buffer y fees CLOB).
+"""Bundle arbitrage: ∑ precio_pierna < 1 (menos buffer y fees CLOB).
 
 Estrategia 1 del RUNBOOK strategies/bundle_arb/RUNBOOK.md:
-- Descubrimiento: Gamma (``active``/``closed``) o CLOB ``/simplified-markets`` (default: Gamma).
+- Descubrimiento: Gamma ``/markets``, Gamma ``/events/keyset`` (``gamma_events``, negRisk YES-only),
+  CLOB ``/simplified-markets`` o ``/markets`` paginado (``clob_full``).
 - Validación operable: GET ``/markets/{condition_id}`` + flags robustos.
-- Precios: GET ``/book`` por token (opcional caché WS ``BUNDLE_USE_WS``).
-- ``sum_ask`` = suma de best_ask; ``execution_buffer_est`` = heurística por pierna (no es API Polymarket).
-- ``fees_est`` = comisión CLOB estimada sobre el nocional por pierna (GET /fee-rate).
+- Precios: GET ``/book`` por token; opcional VWAP hasta ``BUNDLE_TARGET_SIZE_USDC`` (``BUNDLE_USE_VWAP``);
+  caché WS ``BUNDLE_USE_WS`` solo en modo best-ask (no VWAP).
+- ``sum_ask`` = suma de precios efectivos por pierna; ``execution_buffer_est`` = buffer configurable + heurística gas.
+- ``fees_est`` = comisión CLOB estimada (GET /fee-rate).
 - ``edge_gross`` = 1 - sum_ask - execution_buffer_est; ``edge`` (neto) = edge_gross - fees_est.
-- Señal si ``edge`` > BUNDLE_MIN_EDGE, hay liquidez al mejor ask >= per_leg y checks opcionales de midpoint.
+- Señal si ``edge`` > BUNDLE_MIN_EDGE y checks de profundidad / midpoint.
 """
 
 from __future__ import annotations
@@ -21,11 +23,22 @@ from pathlib import Path
 from typing import Any, Optional
 
 from clients.poly_clob import PolyCLOBClient
-from clients.poly_markets import BundleCandidate, MarketsRegistry
+from clients.poly_markets import MarketsRegistry, NegRiskBundleCandidate
 from clients.poly_parse import api_bool_true, clob_market_tradeable
 from clients.poly_ws_books import WSBookStore
 
 from arb.base import ArbStrategy
+from arb.bundle_maker_quote import LegBook, compute_maker_quotes
+from arb.bundle_pricing import vwap_buy_avg_price
+from arb.negrisk_execution_policy import build_execution_policy_for_candidate, execution_policy_unknown_conservative
+from arb.negrisk_maker_runtime import (
+    MakerKillSwitch,
+    load_all_states,
+    negrisk_maker_paths,
+    reconcile_event,
+    save_all_states,
+    EventRuntimeState,
+)
 
 
 def _market_token_ids(m: dict[str, Any]) -> list[str]:
@@ -68,7 +81,7 @@ def _bundle_scan_path() -> Path:
 
 class BundleArbStrategy(ArbStrategy):
     slug = "bundle_arb"
-    name = "Bundle Arbitrage"
+    name = "NegRisk Maker Bundle"
 
     @property
     def csv_columns(self) -> list[str]:
@@ -94,7 +107,26 @@ class BundleArbStrategy(ArbStrategy):
         super().__init__(config, dry_run=dry_run)
         self.min_edge = float(config.get("min_edge", os.getenv("BUNDLE_MIN_EDGE", "0.025")))
         self.max_size = float(config.get("max_size_usdc", os.getenv("BUNDLE_MAX_SIZE_USDC", "300")))
-        self.max_outcomes = int(config.get("max_outcomes", os.getenv("BUNDLE_MAX_OUTCOMES", "5")))
+        self.max_outcomes = int(config.get("max_outcomes", os.getenv("BUNDLE_MAX_OUTCOMES", "8")))
+        self.bundle_mode = str(config.get("bundle_mode", os.getenv("BUNDLE_MODE", "taker_scan"))).strip().lower()
+        self.target_bundle_usdc = float(
+            config.get("target_bundle_usdc", os.getenv("BUNDLE_TARGET_BUNDLE_USDC", "50"))
+        )
+        self.max_outcomes_live = int(
+            config.get("max_outcomes_live", os.getenv("BUNDLE_MAX_OUTCOMES_LIVE", "4"))
+        )
+        self.maker_live_enabled = str(
+            config.get("maker_live_enabled", os.getenv("BUNDLE_MAKER_LIVE", "false"))
+        ).lower() in ("1", "true", "yes")
+        self.maker_post_only = str(config.get("maker_post_only", os.getenv("BUNDLE_POST_ONLY", "true"))).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.maker_order_type = str(
+            config.get("maker_order_type", os.getenv("BUNDLE_ORDER_TYPE", "GTD"))
+        ).strip().upper() or "GTD"
+        self._maker_kill = MakerKillSwitch()
         self.min_outcomes = int(config.get("min_outcomes", os.getenv("BUNDLE_MIN_OUTCOMES", "2")))
         self.max_pages = int(config.get("max_pages", os.getenv("BUNDLE_MAX_PAGES", "5")))
         self.gas_per_leg = float(config.get("gas_per_leg", os.getenv("BUNDLE_GAS_PER_LEG", "0.012")))
@@ -104,12 +136,29 @@ class BundleArbStrategy(ArbStrategy):
         self._start_capital = float(config.get("start_capital", os.getenv("ARB_START_CAPITAL", "10000")))
         self._current_capital = float(config.get("current_capital", os.getenv("ARB_CURRENT_CAPITAL", "10000")))
         self.discovery = str(
-            config.get("discovery", os.getenv("BUNDLE_DISCOVERY", "gamma"))
+            config.get("discovery", os.getenv("BUNDLE_DISCOVERY", "gamma_events"))
         ).strip().lower()
         self.use_ws = str(config.get("use_ws", os.getenv("BUNDLE_USE_WS", "false"))).lower() in (
             "1",
             "true",
             "yes",
+        )
+        self.use_vwap = str(config.get("use_vwap", os.getenv("BUNDLE_USE_VWAP", "false"))).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.target_vwap_usdc = float(
+            config.get("target_vwap_usdc", os.getenv("BUNDLE_TARGET_SIZE_USDC", "50"))
+        )
+        self.exec_buffer_per_leg = float(
+            config.get("exec_buffer_per_leg", os.getenv("BUNDLE_EXEC_BUFFER_PER_LEG", "0.0025"))
+        )
+        self.min_depth_per_leg_usdc = float(
+            config.get(
+                "min_depth_per_leg_usdc",
+                os.getenv("BUNDLE_MIN_DEPTH_PER_LEG_USDC", "0"),
+            )
         )
         self.max_candidates = int(
             config.get("max_candidates_per_cycle", os.getenv("BUNDLE_MAX_CANDIDATES_PER_CYCLE", "120"))
@@ -128,7 +177,26 @@ class BundleArbStrategy(ArbStrategy):
     ) -> tuple[Optional[list[float]], Optional[list[float]], Optional[str]]:
         """Paraleliza GET /book (o snapshot WS si disponible); devuelve (asks, notionals, error)."""
 
+        async def one_leg_vwap(tid: str) -> tuple[str, Optional[float], Optional[float], Optional[str]]:
+            try:
+                ob = await asyncio.wait_for(poly.get_orderbook(tid), timeout=8.0)
+            except asyncio.TimeoutError:
+                return tid, None, None, "timeout"
+            if isinstance(ob, dict) and ob.get("error"):
+                return tid, None, None, str(ob.get("error", "book_error"))[:80]
+            asks = ob.get("asks") or []
+            vwap_px, _spent, best_nom = vwap_buy_avg_price(asks, float(self.target_vwap_usdc))
+            if vwap_px is None:
+                return tid, None, best_nom, "vwap_shallow"
+            try:
+                nom_f = float(best_nom) if best_nom is not None else float("nan")
+            except (TypeError, ValueError):
+                nom_f = float("nan")
+            return tid, float(vwap_px), nom_f, None
+
         async def one_leg(tid: str) -> tuple[str, Optional[float], Optional[float], Optional[str]]:
+            if self.use_vwap:
+                return await one_leg_vwap(tid)
             if book_store is not None:
                 snap = book_store.snapshot(tid)
                 if snap is not None:
@@ -223,6 +291,149 @@ class BundleArbStrategy(ArbStrategy):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(diag, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    async def _run_maker_first_once(
+        self,
+        poly: PolyCLOBClient,
+        _diag_merge: Any,
+        empty: dict[str, str],
+    ) -> None:
+        """Modo ``maker_first``: policy + quoter + persist + reconcile (sin POST salvo ``BUNDLE_MAKER_LIVE``)."""
+        paths = negrisk_maker_paths()
+        max_fail = max(1, int(os.getenv("BUNDLE_RECONCILE_FAIL_MAX_CYCLES", "3")))
+        events_out: list[dict[str, Any]] = []
+        rt_states = load_all_states()
+
+        reg_mode = "gamma_events"
+        if self.discovery not in ("gamma_events",):
+            reg_mode = "gamma_events"
+        candidates, reg_diag = await self._registry.get_candidates(reg_mode, poly, force_refresh=False)
+
+        async def leg_book_for(tid: str) -> LegBook:
+            ob = await poly.get_orderbook(tid)
+            bb = ob.get("best_bid")
+            ba = ob.get("best_ask")
+            try:
+                bb_f = float(bb) if bb is not None else None
+            except (TypeError, ValueError):
+                bb_f = None
+            try:
+                ba_f = float(ba) if ba is not None else None
+            except (TypeError, ValueError):
+                ba_f = None
+            mid = await poly.get_midpoint(tid)
+            tick = await poly.get_tick_size(tid)
+            return LegBook(token_id=tid, best_bid=bb_f, best_ask=ba_f, midpoint=mid, tick_size=tick)
+
+        for cand in candidates[: min(len(candidates), self.max_candidates)]:
+            if not isinstance(cand, NegRiskBundleCandidate):
+                continue
+            eid = cand.event_id
+            token_ids = [lg.yes_token_id for lg in cand.legs]
+            ev_diag: dict[str, Any] = {
+                "event_id": eid,
+                "slug": cand.slug,
+                "n_legs": len(cand.legs),
+                "skipped_live_outcome_cap": len(cand.legs) > self.max_outcomes_live,
+            }
+            base_pol = execution_policy_unknown_conservative()
+            try:
+                policy = await build_execution_policy_for_candidate(cand, poly, base=base_pol)
+            except Exception as ex:
+                policy = base_pol
+                ev_diag["policy_error"] = str(ex)[:120]
+
+            books = await asyncio.gather(*[leg_book_for(t) for t in token_ids])
+            qb, qreason = compute_maker_quotes(
+                books,
+                policy,
+                target_bundle_usdc=self.target_bundle_usdc,
+            )
+            ev_diag["quote_reason"] = qreason
+            if qb is not None:
+                ev_diag["bundle_share_qty"] = qb.bundle_share_qty
+                ev_diag["sum_bids"] = qb.sum_bids
+                ev_diag["fee_class"] = policy.fee_class
+                ev_diag["legs"] = [
+                    {"token": lg.token_id[:16], "bid": lg.bid_price, "q": lg.size_shares, "usdc": lg.size_usdc}
+                    for lg in qb.legs
+                ]
+            st = rt_states.get(eid) or EventRuntimeState(event_id=eid, tokens=token_ids)
+            st.tokens = token_ids
+            if qb is not None:
+                st.target_q = qb.bundle_share_qty
+            rec = await reconcile_event(poly, token_ids=token_ids, open_order_ids=st.open_order_ids)
+            ev_diag["reconcile_ok"] = rec.get("ok")
+            ev_diag["reconcile_reason"] = rec.get("reason", "")
+            if not self.dry_run:
+                self._maker_kill.record_reconcile(bool(rec.get("ok")), max_fail)
+            else:
+                self._maker_kill.record_reconcile(True, max_fail)
+
+            if not rec.get("ok") and st.state == "PARTIAL":
+                st.state = "NEEDS_MANUAL_REVIEW"
+            st.last_reconcile_ts = datetime.now(timezone.utc).isoformat()
+            rt_states[eid] = st
+            events_out.append(ev_diag)
+
+        save_all_states(rt_states)
+        paths["events"].parent.mkdir(parents=True, exist_ok=True)
+        paths["events"].write_text(
+            json.dumps(
+                {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "bundle_mode": "maker_first",
+                    "events": events_out,
+                    "kill_live_posting": self._maker_kill.live_posting_disabled,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        await self.log_signal_async(
+            {
+                "action": "MAKER_FIRST:CYCLE",
+                "reason": (
+                    f"bundle_arb/maker_first: quoted {len(events_out)} events; "
+                    f"live={self.maker_live_enabled} postOnly={self.maker_post_only}; "
+                    f"kill_switch={self._maker_kill.live_posting_disabled}"
+                ),
+                "market_id": "",
+                "n_outcomes": str(len(events_out)),
+                "sum_ask": "",
+                "execution_buffer_est": "",
+                "fees_est": "",
+                "edge_gross": "",
+                "edge": "",
+                "size_usdc": "0",
+                "order_ids": "",
+                "mid_dev_max": "",
+            }
+        )
+        self._persist_scan_diag(
+            _diag_merge(
+                {
+                    "outcome": "MAKER_FIRST:CYCLE",
+                    "bundle_mode": self.bundle_mode,
+                    "maker_live_enabled": self.maker_live_enabled,
+                    "maker_post_only": self.maker_post_only,
+                    "maker_order_type": self.maker_order_type,
+                    "target_bundle_usdc": self.target_bundle_usdc,
+                    "max_outcomes_live": self.max_outcomes_live,
+                    "negrisk_maker_events_path": str(paths["events"]),
+                    "negrisk_maker_state_path": str(paths["state"]),
+                    "kill_live_posting": self._maker_kill.live_posting_disabled,
+                    "reconcile_fail_cycles": self._maker_kill.reconcile_fail_cycles,
+                    "help": (
+                        "Modo maker_first: ExecutionPolicy + quoter (misma q) + reconcile 3 fuentes. "
+                        "POST órdenes solo con BUNDLE_MAKER_LIVE=true y credenciales; batch no atómico — "
+                        "inspeccionar cada orden en HTTP 200. postOnly cross book → refrescar libro y recotizar."
+                    ),
+                }
+            )
+        )
+
     async def run_once(self) -> None:
         empty = self._empty_row()
         best: Optional[dict[str, Any]] = None
@@ -247,15 +458,17 @@ class BundleArbStrategy(ArbStrategy):
         clob_validate_ok = 0
         clob_validate_fail = 0
         clob_flags_ok = 0
-        candidates: list[BundleCandidate] = []
+        candidates: list[Any] = []
         discovery_mode = self.discovery
-        if discovery_mode not in ("gamma", "clob_simplified", "clob_full"):
-            discovery_mode = "gamma"
+        if discovery_mode not in ("gamma", "gamma_events", "clob_simplified", "clob_full"):
+            discovery_mode = "gamma_events"
 
         def _diag_merge(extra: dict[str, Any]) -> dict[str, Any]:
             base = {
+                "bundle_mode": self.bundle_mode,
                 "discovery_mode": discovery_mode,
                 "use_ws": self.use_ws,
+                "use_vwap": self.use_vwap,
                 "pages_fetched": pages_fetched,
                 "markets_raw_total": markets_raw_total,
                 "scanned_books": scanned_books,
@@ -280,6 +493,19 @@ class BundleArbStrategy(ArbStrategy):
                 "simplified_rows_total": reg_diag.get("simplified_rows_total"),
                 "simplified_candidates": reg_diag.get("simplified_candidates"),
                 "registry_cache_hit": reg_diag.get("cache_hit"),
+                "events_pages": reg_diag.get("events_pages"),
+                "events_raw": reg_diag.get("events_raw"),
+                "skip_not_negrisk": reg_diag.get("skip_not_negrisk"),
+                "skip_augmented": reg_diag.get("skip_augmented"),
+                "skip_date": reg_diag.get("skip_date"),
+                "skip_child_tradability": reg_diag.get("skip_child_tradability"),
+                "skip_yes_token": reg_diag.get("skip_yes_token"),
+                "skip_outcomes_range": reg_diag.get("skip_outcomes_range"),
+                "skip_no_event_id": reg_diag.get("skip_no_event_id"),
+                "skip_event_liquidity": reg_diag.get("skip_event_liquidity"),
+                "skip_event_volume": reg_diag.get("skip_event_volume"),
+                "candidates_built": reg_diag.get("candidates_built"),
+                "candidates_after_cap": reg_diag.get("candidates_after_cap"),
             }
             return {**base, **extra}
 
@@ -309,18 +535,21 @@ class BundleArbStrategy(ArbStrategy):
             ) as poly:
                 ws_store: Optional[WSBookStore] = self._ws_store if self.use_ws else None
 
-                async def evaluate_after_tokens(vm: dict[str, Any], token_ids: list[str]) -> None:
+                if self.bundle_mode == "maker_first":
+                    await self._run_maker_first_once(poly, _diag_merge, empty)
+                    return
+
+                async def evaluate_after_tokens(token_ids: list[str], *, market_id: str) -> None:
                     nonlocal best, best_edge_net, best_meta, scanned_books, skipped_gas, skipped_depth, skipped_mid, skip_bad_book
                     n = len(token_ids)
-                    asks, noms, _book_err = await self._legs_snapshot(
-                        poly, token_ids, ws_store if self.use_ws else None
-                    )
+                    ws_for_leg = None if self.use_vwap else (ws_store if self.use_ws else None)
+                    asks, noms, _book_err = await self._legs_snapshot(poly, token_ids, ws_for_leg)
                     scanned_books += 1
                     if asks is None:
                         skip_bad_book += 1
                         return
 
-                    execution_buffer_est = self.gas_per_leg * n
+                    execution_buffer_est = max(self.exec_buffer_per_leg * n, self.gas_per_leg * n)
                     if execution_buffer_est > self.max_gas_per_tx:
                         skipped_gas += 1
                         return
@@ -329,9 +558,14 @@ class BundleArbStrategy(ArbStrategy):
                     per_leg = size_target / max(n, 1)
                     depth_ok = True
                     for nom in noms:
-                        if nom is None or math.isnan(nom) or nom < per_leg - 1e-6:
-                            depth_ok = False
-                            break
+                        if self.min_depth_per_leg_usdc > 0:
+                            if nom is None or math.isnan(nom) or nom < self.min_depth_per_leg_usdc - 1e-6:
+                                depth_ok = False
+                                break
+                        elif not self.use_vwap:
+                            if nom is None or math.isnan(nom) or nom < per_leg - 1e-6:
+                                depth_ok = False
+                                break
                     if not depth_ok:
                         skipped_depth += 1
                         return
@@ -354,9 +588,8 @@ class BundleArbStrategy(ArbStrategy):
                     else:
                         mid_label = ""
 
-                    cid = str(vm.get("condition_id") or vm.get("conditionId") or "")
                     row_base = {
-                        "market_id": cid,
+                        "market_id": market_id,
                         "n_outcomes": str(n),
                         "sum_ask": f"{total:.6f}",
                         "execution_buffer_est": f"{execution_buffer_est:.6f}",
@@ -369,6 +602,7 @@ class BundleArbStrategy(ArbStrategy):
                     if edge_net > best_edge_net:
                         best_edge_net = edge_net
                         best_meta = {
+                            "market_id": market_id,
                             "token_ids": token_ids,
                             "asks": asks,
                             "noms": noms,
@@ -389,17 +623,33 @@ class BundleArbStrategy(ArbStrategy):
                                 "order_ids": "",
                             }
 
-                if discovery_mode in ("gamma", "clob_simplified"):
-                    reg_mode = "gamma" if discovery_mode == "gamma" else "clob_simplified"
+                if discovery_mode in ("gamma", "clob_simplified", "gamma_events"):
+                    reg_mode = (
+                        "gamma_events"
+                        if discovery_mode == "gamma_events"
+                        else ("gamma" if discovery_mode == "gamma" else "clob_simplified")
+                    )
                     candidates, reg_diag = await self._registry.get_candidates(reg_mode, poly, force_refresh=False)
                     if discovery_mode == "gamma":
                         markets_raw_total = int(reg_diag.get("gamma_rows_total") or 0)
                         pages_fetched = int(reg_diag.get("gamma_pages") or 0)
+                    elif discovery_mode == "gamma_events":
+                        markets_raw_total = int(reg_diag.get("events_raw") or 0)
+                        pages_fetched = int(reg_diag.get("events_pages") or 0)
                     else:
                         markets_raw_total = int(reg_diag.get("simplified_rows_total") or 0)
                         pages_fetched = int(reg_diag.get("simplified_pages") or 0)
 
                     if not candidates:
+                        help_txt = (
+                            "Gamma eventos keyset: revisa BUNDLE_MIN_DAYS_TO_EXPIRY, BUNDLE_MAX_DAYS_TO_EXPIRY, "
+                            "BUNDLE_REQUIRE_NEGRISK, BUNDLE_GAMMA_EVENTS_MAX_PAGES."
+                            if discovery_mode == "gamma_events"
+                            else (
+                                "Gamma/simplified no devolvió mercados que pasen filtros de outcomes/liquidez. "
+                                "Revisa BUNDLE_MIN_LIQUIDITY_USD, BUNDLE_MIN_VOLUME_24H, BUNDLE_GAMMA_MAX_PAGES."
+                            )
+                        )
                         await self.log_signal_async(
                             {
                                 "action": "SKIP:NO_ELIGIBLE_DISCOVERY",
@@ -415,18 +665,16 @@ class BundleArbStrategy(ArbStrategy):
                                 {
                                     "outcome": "SKIP:NO_ELIGIBLE_DISCOVERY",
                                     "eligible_sample": eligible_samples,
-                                    "help": (
-                                        "Gamma/simplified no devolvió mercados que pasen filtros de outcomes/liquidez. "
-                                        "Revisa BUNDLE_MIN_LIQUIDITY_USD, BUNDLE_MIN_VOLUME_24H, BUNDLE_GAMMA_MAX_PAGES."
-                                    ),
+                                    "help": help_txt,
                                 }
                             )
                         )
                         return
 
-                    candidates.sort(
-                        key=lambda c: (_outcome_priority(len(c.token_ids)), c.condition_id)
-                    )
+                    if discovery_mode != "gamma_events":
+                        candidates.sort(
+                            key=lambda c: (_outcome_priority(len(c.token_ids)), c.condition_id)
+                        )
                     candidates = candidates[: self.max_candidates]
 
                     if self.use_ws:
@@ -434,12 +682,63 @@ class BundleArbStrategy(ArbStrategy):
                             self._ws_store = WSBookStore(poly)
                         ws_flat: list[str] = []
                         for c in candidates[:50]:
-                            ws_flat.extend(c.token_ids)
+                            if isinstance(c, NegRiskBundleCandidate):
+                                for lg in c.legs:
+                                    ws_flat.append(lg.yes_token_id)
+                            else:
+                                ws_flat.extend(c.token_ids)
                         await self._ws_store.ensure_subscription(ws_flat)
                         ws_store = self._ws_store
                         await asyncio.sleep(min(float(os.getenv("BUNDLE_WS_WARMUP_SEC", "0.35")), 2.0))
 
                     for cand in candidates:
+                        if isinstance(cand, NegRiskBundleCandidate):
+                            token_ids_ev: list[str] = []
+                            legs_ok = True
+                            for leg in cand.legs:
+                                clob_validate_calls += 1
+                                vm_leg = await poly.get_market(leg.condition_id)
+                                if not isinstance(vm_leg, dict) or vm_leg.get("error"):
+                                    clob_validate_fail += 1
+                                    legs_ok = False
+                                    break
+                                ok_flags, reason = clob_market_tradeable(vm_leg)
+                                if not ok_flags:
+                                    clob_validate_fail += 1
+                                    if reason == "not_accepting":
+                                        skip_not_accepting += 1
+                                    elif reason == "closed":
+                                        skip_closed += 1
+                                    elif reason == "no_orderbook":
+                                        skip_no_orderbook += 1
+                                    legs_ok = False
+                                    break
+                                clob_toks = _market_token_ids(vm_leg)
+                                if leg.yes_token_id not in clob_toks:
+                                    skip_outcomes += 1
+                                    legs_ok = False
+                                    break
+                                token_ids_ev.append(leg.yes_token_id)
+                            if not legs_ok or len(token_ids_ev) != len(cand.legs):
+                                continue
+                            n_ev = len(token_ids_ev)
+                            if n_ev < self.min_outcomes or n_ev > self.max_outcomes:
+                                skip_outcomes += 1
+                                continue
+                            clob_flags_ok += 1
+                            clob_validate_ok += 1
+                            if len(eligible_samples) < _MAX_ELIGIBLE_SAMPLE:
+                                eligible_samples.append(
+                                    {
+                                        "event_id": cand.event_id,
+                                        "slug": cand.slug,
+                                        "n_legs": len(cand.legs),
+                                    }
+                                )
+                            mid_ev = cand.event_id if not cand.slug else f"{cand.event_id}|{cand.slug}"
+                            await evaluate_after_tokens(token_ids_ev, market_id=mid_ev)
+                            continue
+
                         clob_validate_calls += 1
                         vm = await poly.get_market(cand.condition_id)
                         if not isinstance(vm, dict) or vm.get("error"):
@@ -475,7 +774,8 @@ class BundleArbStrategy(ArbStrategy):
                         if len(eligible_samples) < _MAX_ELIGIBLE_SAMPLE:
                             eligible_samples.append(_market_mini(vm))
 
-                        await evaluate_after_tokens(vm, token_ids)
+                        cid = str(vm.get("condition_id") or vm.get("conditionId") or "")
+                        await evaluate_after_tokens(token_ids, market_id=cid)
 
                 else:
                     cursor = ""
@@ -542,14 +842,15 @@ class BundleArbStrategy(ArbStrategy):
                             if len(eligible_samples) < _MAX_ELIGIBLE_SAMPLE:
                                 eligible_samples.append(_market_mini(m))
 
-                            await evaluate_after_tokens(m, token_ids)
+                            cid_cf = str(m.get("condition_id") or m.get("conditionId") or "")
+                            await evaluate_after_tokens(token_ids, market_id=cid_cf)
 
                         cursor = page.get("next_cursor") or ""
                         if not cursor:
                             break
 
                 if (
-                    discovery_mode in ("gamma", "clob_simplified")
+                    discovery_mode in ("gamma", "clob_simplified", "gamma_events")
                     and candidates
                     and clob_validate_calls > 0
                     and clob_flags_ok == 0
@@ -725,6 +1026,7 @@ class BundleArbStrategy(ArbStrategy):
                             },
                             "help": (
                                 "Descubrimiento vía BUNDLE_DISCOVERY (gamma=servidor Gamma activos; "
+                                "gamma_events=Gamma /events/keyset negRisk; "
                                 "clob_simplified=/simplified-markets; clob_full=GET /markets paginado). "
                                 "Validación operable con GET /markets/{condition_id}. "
                                 f"Luego GET /book por token; profundidad ≥ {self.max_size} USDC / n piernas. "

@@ -89,8 +89,11 @@
         <div>
           <h2 class="text-sm font-medium text-indigo-200">Último escaneo CLOB (bundle arb)</h2>
           <p class="text-xs text-slate-500 mt-1">
-            Origen según <code class="text-slate-400">BUNDLE_DISCOVERY</code>: por defecto Gamma
-            <code class="text-slate-400">GET gamma-api…/markets</code> + validación
+            <code class="text-slate-400">BUNDLE_MODE</code>: por defecto <code class="text-slate-400">taker_scan</code>;
+            <code class="text-slate-400">maker_first</code> cotiza bundle maker (ver RUNBOOK). Origen
+            <code class="text-slate-400">BUNDLE_DISCOVERY</code>: típico
+            <code class="text-slate-400">gamma_events</code> (<code class="text-slate-400">GET …/events/keyset</code>) o
+            <code class="text-slate-400">gamma</code> (<code class="text-slate-400">/markets</code>) + validación
             <code class="text-slate-400">GET clob…/markets/{condition_id}</code> + <code class="text-slate-400">/book</code> por token.
             Los contadores explican <code class="text-slate-400">SKIP:*</code> y errores de API.
           </p>
@@ -318,14 +321,37 @@
       const s = j.scan || {};
       st.textContent = "Actualizado: " + (s.updated_at || "—") + " · resultado: " + (s.outcome || "—");
       const c = [
+        ["BUNDLE_MODE (taker_scan | maker_first)", s.bundle_mode],
         ["BUNDLE_DISCOVERY", s.discovery_mode],
+        ["Maker: negrisk_maker_events.json", s.negrisk_maker_events_path],
+        ["Maker: negrisk_maker_state.json", s.negrisk_maker_state_path],
+        ["Maker: kill_live_posting", s.kill_live_posting],
         ["WS libro (BUNDLE_USE_WS)", s.use_ws],
+        ["VWAP (BUNDLE_USE_VWAP)", s.use_vwap],
         ["Páginas descubrimiento (Gamma o simplified / pages CLOB full)", s.pages_fetched],
         ["Filas mercado en bucle (raw / filas Gamma)", s.markets_raw_total],
         ["Mercados con libro analizado (scanned_books)", s.scanned_books],
         ["Gamma: páginas / filas / tras outcomes", [s.gamma_pages, s.gamma_rows_total, s.gamma_after_outcomes].map((x) => (x != null ? x : "—")).join(" · ")],
         ["Gamma: skip filtros cliente", s.gamma_skip_filters],
         ["Simplified: páginas / filas / candidatos", [s.simplified_pages, s.simplified_rows_total, s.simplified_candidates].map((x) => (x != null ? x : "—")).join(" · ")],
+        [
+          "Gamma events: páginas / eventos raw / built / cap",
+          [s.events_pages, s.events_raw, s.candidates_built, s.candidates_after_cap].map((x) => (x != null ? x : "—")).join(" · "),
+        ],
+        [
+          "Gamma events: skip negrisk / augmented / fecha / child / yes / outcomes",
+          [
+            s.skip_not_negrisk,
+            s.skip_augmented,
+            s.skip_date,
+            s.skip_child_tradability,
+            s.skip_yes_token,
+            s.skip_outcomes_range,
+          ]
+            .map((x) => (x != null ? x : "—"))
+            .join(" · "),
+        ],
+        ["Gamma events: skip sin event id", s.skip_no_event_id],
         ["Registry cache hit", s.registry_cache_hit],
         ["CLOB validate calls / flags_ok / book_ok / fail", [s.clob_validate_calls, s.clob_flags_ok, s.clob_validate_ok, s.clob_validate_fail].map((x) => (x != null ? x : "—")).join(" / ")],
         ["skip: no accepting_orders", s.skip_not_accepting],
@@ -356,14 +382,25 @@
         samples =
           '<p class="text-slate-500 mt-2">Muestra de mercados que pasaron filtros básicos (question + condition_id):</p><ul class="list-disc pl-4 space-y-1 max-h-48 overflow-y-auto">';
         arr.forEach((m) => {
-          samples +=
-            "<li><span class=\"text-slate-500\">" +
-            esc(m.condition_id || "").slice(0, 18) +
-            "…</span> · " +
-            esc(m.question || "—") +
-            " <span class=\"text-slate-600\">(n=" +
-            esc(String(m.n_tokens)) +
-            ")</span></li>";
+          if (m.event_id) {
+            samples +=
+              "<li><span class=\"text-slate-500\">event " +
+              esc(String(m.event_id)).slice(0, 24) +
+              "</span> · " +
+              esc(m.slug || "—") +
+              " <span class=\"text-slate-600\">(n=" +
+              esc(String(m.n_legs != null ? m.n_legs : "—")) +
+              ")</span></li>";
+          } else {
+            samples +=
+              "<li><span class=\"text-slate-500\">" +
+              esc(m.condition_id || "").slice(0, 18) +
+              "…</span> · " +
+              esc(m.question || "—") +
+              " <span class=\"text-slate-600\">(n=" +
+              esc(String(m.n_tokens)) +
+              ")</span></li>";
+          }
         });
         samples += "</ul>";
       }

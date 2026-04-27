@@ -1,5 +1,5 @@
 """
-Construcción y firma de órdenes limit GTC para el CLOB Polymarket.
+Construcción y firma de órdenes limit GTC/GTD para el CLOB Polymarket.
 
 Usa `py-order-utils` + `eth-account` (no incluye el SDK `py_clob_client`).
 """
@@ -101,6 +101,9 @@ def build_post_order_body(
     funder: Optional[str] = None,
     nonce: int = 0,
     expiration: int = 0,
+    *,
+    order_type: str = "GTC",
+    post_only: bool = False,
 ) -> Tuple[str, dict[str, Any]]:
     """
     Construye el cuerpo POST /order y el JSON compacto para HMAC.
@@ -144,11 +147,14 @@ def build_post_order_body(
     ex = _exchange_address(chain_id, neg_risk)
     ub = OrderBuilder(ex, chain_id, UtilsSigner(key=private_key))
     signed = ub.build_signed_order(data)
+    ot = (order_type or "GTC").strip().upper()
+    if ot not in ("GTC", "GTD"):
+        ot = "GTC"
     body: dict[str, Any] = {
         "order": signed.dict(),
         "owner": api_key.strip(),
-        "orderType": "GTC",
-        "postOnly": False,
+        "orderType": ot,
+        "postOnly": bool(post_only),
     }
     serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     return serialized, body
