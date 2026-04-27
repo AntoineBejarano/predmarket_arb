@@ -999,6 +999,8 @@ def run_main(hours: float | None, threshold: float) -> None:
 
     gamma_cache = GammaCache()
     stats = SessionStats()
+    fired_signals: set[tuple[str, str, str]] = set()
+    # Format: (asset, window_timestamp_str, signal_type), e.g. ("BTC", "1777274700", "ML")
     market_prices = MARKET_PRICES
     market_prices.clear()
     clob_token_ids: list[str] = []
@@ -1105,6 +1107,7 @@ def run_main(hours: float | None, threshold: float) -> None:
                                 end_dt = end_dt.astimezone(timezone.utc)
 
                             # Siempre total_seconds (no .seconds): incluye días y fracción correcta.
+                            window_ts = int(start_dt.timestamp())
                             minutes_elapsed = (now - start_dt).total_seconds() / 60.0
                             if minutes_elapsed < 0 or minutes_elapsed >= WINDOW_DURATION_MIN:
                                 continue
@@ -1176,12 +1179,16 @@ def run_main(hours: float | None, threshold: float) -> None:
                             sig_label = ""
                             direction = ""
                             confidence = ""
+                            ml_key = (asset, str(window_ts), "ML")
+                            nr_key = (asset, str(window_ts), "NR")
                             if (
                                 p_modelo is not None
                                 and np.isfinite(gap_ml)
                                 and abs(gap_ml) > SIGNAL_THRESHOLD
                                 and minutes_elapsed <= 2
+                                and ml_key not in fired_signals
                             ):
+                                fired_signals.add(ml_key)
                                 sig_label = "ML"
                                 direction = "Up" if gap_ml > 0 else "Down"
                                 confidence = str(abs(gap_ml))
@@ -1191,11 +1198,13 @@ def run_main(hours: float | None, threshold: float) -> None:
                                     f"[bold red on black]SIGNAL ML[/] {asset} {direction} conf={float(confidence):.4f} "
                                     f"p_model={p_modelo:.4f} p_mkt={p_mercado:.4f}"
                                 )
-                            elif (
+                            if (
                                 np.isfinite(gap_nearres)
                                 and abs(gap_nearres) > SIGNAL_THRESHOLD
                                 and minutes_elapsed >= 3
+                                and nr_key not in fired_signals
                             ):
+                                fired_signals.add(nr_key)
                                 sig_label = "NEARRES"
                                 direction = "Up" if gap_nearres > 0 else "Down"
                                 confidence = str(abs(gap_nearres))
@@ -1275,6 +1284,13 @@ def run_main(hours: float | None, threshold: float) -> None:
                         n5,
                         pri,
                     )
+                    if len(fired_signals) > 100:
+                        fired_signals = set(
+                            sorted(
+                                fired_signals,
+                                key=lambda k: int(k[1]) if k[1].isdigit() else 0,
+                            )[-100:]
+                        )
                 except Exception as e:
                     log.exception("Error en bucle principal (continuando): %s", e)
 
