@@ -17,6 +17,7 @@ The repository is structured as a **strategy laboratory**: each hypothesis lives
 | `scripts/api.py` | FastAPI: `/`, `/api/status`, worker START/STOP, SSE `/api/signals/live`, `/health` |
 | `scripts/validate_edge.py` | Worker: Binance + Gamma → `logs/signals.csv` under `DATA_DIR` |
 | `static/dashboard.html` | Control panel |
+| `static/logo.png` | Lab logo (header + favicon via `/static/logo.png`) |
 | `models/train.py` | Training; PKL under `models/saved/` |
 | `models/saved/*.pkl` | Shipped for Railway/local without retraining |
 | `strategies/` | Strategy manifests + experiment evidence (RUNBOOK / LEARNINGS / metrics) |
