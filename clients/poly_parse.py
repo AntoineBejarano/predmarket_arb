@@ -88,8 +88,41 @@ def gamma_yes_token_id(m: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def gamma_market_child_discoverable(m: dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Hijo en ``event.markets`` (Gamma keyset) para **armar candidatos**.
+
+    Los objetos anidados a menudo **no** traen ``acceptingOrders`` / ``enableOrderBook``;
+    si faltan, no se rechaza aquí (la revalidación CLOB en ``get_market`` sigue siendo obligatoria).
+    Si vienen explícitamente en falso, sí se filtra.
+    """
+    if not api_bool_true(m.get("active")):
+        return False, "inactive"
+    if api_bool_true(m.get("closed")) or api_bool_true(m.get("isClosed")):
+        return False, "closed"
+    if api_bool_true(m.get("archived")):
+        return False, "archived"
+    if api_bool_true(m.get("restricted")):
+        return False, "restricted"
+    acc = m.get("acceptingOrders")
+    if acc is None:
+        acc = m.get("accepting_orders")
+    if acc is not None and not api_bool_true(acc):
+        return False, "not_accepting"
+    eob = m.get("enableOrderBook")
+    if eob is None:
+        eob = m.get("enable_order_book")
+    if eob is not None and not api_bool_true(eob):
+        return False, "no_orderbook"
+    if not gamma_market_token_ids(m):
+        return False, "no_clob_tokens"
+    if gamma_yes_token_id(m) is None:
+        return False, "no_yes_token"
+    return True, ""
+
+
 def gamma_market_child_eligible(m: dict[str, Any]) -> Tuple[bool, str]:
-    """Child market dentro de un event Gamma: activo, tradable CLOB, con token YES."""
+    """Child estricto: Gamma + flags CLOB (p. ej. tras ``get_market``)."""
     if not api_bool_true(m.get("active")):
         return False, "inactive"
     if api_bool_true(m.get("closed")) or api_bool_true(m.get("isClosed")):

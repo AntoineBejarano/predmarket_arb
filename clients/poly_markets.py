@@ -15,7 +15,7 @@ import aiohttp
 from clients.poly_parse import (
     api_bool_true,
     gamma_condition_id,
-    gamma_market_child_eligible,
+    gamma_market_child_discoverable,
     gamma_market_token_ids,
     gamma_yes_token_id,
 )
@@ -355,7 +355,7 @@ class MarketsRegistry:
                 for m in markets:
                     if not isinstance(m, dict):
                         continue
-                    ok_child, _reason = gamma_market_child_eligible(m)
+                    ok_child, _reason = gamma_market_child_discoverable(m)
                     if not ok_child:
                         diag["skip_child_tradability"] += 1
                         continue

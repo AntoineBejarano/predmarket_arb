@@ -16,6 +16,7 @@ from clients.poly_markets import (
 from clients.poly_parse import (
     api_bool_true,
     clob_market_tradeable,
+    gamma_market_child_discoverable,
     gamma_market_child_eligible,
     gamma_market_token_ids,
     gamma_yes_token_id,
@@ -80,6 +81,27 @@ class TestPolyParse(unittest.TestCase):
         self.assertTrue(gamma_market_child_eligible(good)[0])
         bad = {**good, "active": False}
         self.assertFalse(gamma_market_child_eligible(bad)[0])
+
+    def test_gamma_market_child_discoverable_allows_missing_clob_flags(self) -> None:
+        """Hijos en events keyset suelen omitir acceptingOrders / enableOrderBook."""
+        m = {
+            "active": True,
+            "closed": False,
+            "outcomes": '["Yes", "No"]',
+            "clobTokenIds": '["a", "b"]',
+        }
+        self.assertTrue(gamma_market_child_discoverable(m)[0])
+        self.assertFalse(gamma_market_child_eligible(m)[0])
+
+    def test_gamma_market_child_discoverable_rejects_explicit_not_accepting(self) -> None:
+        m = {
+            "active": True,
+            "closed": False,
+            "outcomes": '["Yes", "No"]',
+            "clobTokenIds": '["a", "b"]',
+            "acceptingOrders": False,
+        }
+        self.assertFalse(gamma_market_child_discoverable(m)[0])
 
 
 class TestVwapPricing(unittest.TestCase):
