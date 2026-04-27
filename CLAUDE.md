@@ -45,6 +45,7 @@ Los `**.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma
 - **Arb / CLOB:** `DRY_RUN` (default seguro `true`), `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY`; opcionales `POLY_FUNDER`, `POLY_SIGNATURE_TYPE`, `POLYGON_CHAIN_ID`. Sin secret L2, `place_order` en vivo falla con mensaje explícito.
 - Python del proyecto: **≥ 3.11** obligatorio (`python setup.py` sale con error si no). Docker `python:3.11-slim` cumple. En rutas FastAPI evitar anotaciones `X | Y` sin `from __future__ import annotations` donde haga falta compatibilidad con intérpretes viejos.
 - **Arb en Railway:** con `DRY_RUN=true` y estrategias **desactivadas** por defecto en `data/strategy_state.json`, el despliegue levanta la UI lista; el motor no llama al CLOB hasta que actives toggles y pulses Start.
+- **Capital ficticio (paper):** por estrategia en `data/strategy_state.json` (`fict_capital_eur`, default `ARB_FICT_CAPITAL_EUR=1000`). Cada `SIGNAL`/`EXECUTED` con `edge` y `size_usdc` acumula `fict_pnl_est ≈ stake×edge` y ROI en `/api/arb/status` y CSV (`fict_*` columnas).
 
 ## Comandos útiles
 

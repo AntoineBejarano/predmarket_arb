@@ -636,10 +636,20 @@ async def arb_status() -> dict[str, Any]:
     strategies: list[dict[str, Any]] = []
     for slug in STRATEGY_SLUGS:
         stats = _csv_stats_today(ARB_CSV_PATHS[slug])
+        st = state.get(slug, {}) or {}
+        cap = float(st.get("fict_capital_eur") or 1000)
+        cum = float(st.get("fict_pnl_cumulative_eur") or 0)
+        roi = cum / cap if cap > 0 else 0.0
         strategies.append(
             {
                 "slug": slug,
-                "enabled": state.get(slug, {}).get("enabled", False),
+                "enabled": st.get("enabled", False),
+                "fict_capital_eur": cap,
+                "fict_pnl_cumulative_eur": round(cum, 6),
+                "fict_trades": int(st.get("fict_trades") or 0),
+                "fict_roi": round(roi, 6),
+                "fict_last_stake_eur": st.get("fict_last_stake_eur"),
+                "fict_last_pnl_est_eur": st.get("fict_last_pnl_est_eur"),
                 **stats,
             }
         )

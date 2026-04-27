@@ -79,7 +79,7 @@ class CrossExchangeStrategy(ArbStrategy):
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:CIRCUIT_BREAKER",
                         "reason": "max_daily_drawdown exceeded",
@@ -97,7 +97,7 @@ class CrossExchangeStrategy(ArbStrategy):
 
         mapping = self._load_mapping()
         if not mapping:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "SKIP:NO_MARKETS",
                     "reason": "data/poly_kalshi_mapping.csv empty or missing",
@@ -132,7 +132,7 @@ class CrossExchangeStrategy(ArbStrategy):
                         exp = row.get("expires_at") or ""
                         lock_days = self._lockup_days(exp)
                         if lock_days is not None and lock_days > self.max_lockup:
-                            self.log_signal(
+                            await self.log_signal_async(
                                 {
                                     "action": "SKIP:LOCKUP",
                                     "reason": f"lockup_days {lock_days} > max {self.max_lockup}",
@@ -167,7 +167,7 @@ class CrossExchangeStrategy(ArbStrategy):
                             obp = await asyncio.wait_for(poly.get_orderbook(yes_tid), timeout=10.0)
                             obk = await asyncio.wait_for(kalshi.get_orderbook(kal_t), timeout=10.0)
                         except asyncio.TimeoutError:
-                            self.log_signal(
+                            await self.log_signal_async(
                                 {
                                     "action": "ERROR:API_TIMEOUT",
                                     "reason": "orderbook fetch timeout",
@@ -186,7 +186,7 @@ class CrossExchangeStrategy(ArbStrategy):
                         if isinstance(obp, dict) and obp.get("error"):
                             continue
                         if isinstance(obk, dict) and (obk.get("error") or obk.get("http_status", 200) != 200):
-                            self.log_signal(
+                            await self.log_signal_async(
                                 {
                                     "action": "ERROR:API_ERROR",
                                     "reason": str(obk.get("error", obk))[:200],
@@ -233,7 +233,7 @@ class CrossExchangeStrategy(ArbStrategy):
                                 except Exception as e:
                                     rec["action"] = "ERROR:ORDER_FAIL"
                                     rec["reason"] = str(e)[:200]
-                            self.log_signal(rec)
+                            await self.log_signal_async(rec)
                             return
 
                         low_row = {
@@ -245,10 +245,10 @@ class CrossExchangeStrategy(ArbStrategy):
                             best_low = (edge, low_row)
 
                     if best_low:
-                        self.log_signal(best_low[1])
+                        await self.log_signal_async(best_low[1])
                         return
 
-                    self.log_signal(
+                    await self.log_signal_async(
                         {
                             "action": "SKIP:NO_MARKETS",
                             "reason": "no valid prices for mapped rows",
@@ -263,7 +263,7 @@ class CrossExchangeStrategy(ArbStrategy):
                         }
                     )
         except Exception as e:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "ERROR:API_ERROR",
                     "reason": str(e)[:200],

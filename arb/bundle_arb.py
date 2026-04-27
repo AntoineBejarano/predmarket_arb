@@ -105,7 +105,7 @@ class BundleArbStrategy(ArbStrategy):
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:CIRCUIT_BREAKER",
                         "reason": "max_daily_drawdown exceeded",
@@ -139,7 +139,7 @@ class BundleArbStrategy(ArbStrategy):
                             timeout=12.0,
                         )
                     except asyncio.TimeoutError:
-                        self.log_signal(
+                        await self.log_signal_async(
                             {
                                 "action": "ERROR:API_TIMEOUT",
                                 "reason": "CLOB /markets timeout",
@@ -223,11 +223,11 @@ class BundleArbStrategy(ArbStrategy):
                         except Exception as e:
                             row["action"] = "ERROR:ORDER_FAIL"
                             row["reason"] = str(e)[:200]
-                    self.log_signal(row)
+                    await self.log_signal_async(row)
                     return
 
                 if best_edge > -1e8 and best_edge <= self.min_edge and best_meta is not None:
-                    self.log_signal(
+                    await self.log_signal_async(
                         {
                             "action": "SKIP:LOW_EDGE",
                             "reason": f"best edge {best_edge:.4f} <= min_edge {self.min_edge} (sum_ask={best_meta['sum_ask']} gas={best_meta['gas_est']})",
@@ -241,7 +241,7 @@ class BundleArbStrategy(ArbStrategy):
                     )
                     return
 
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:NO_MARKETS",
                         "reason": f"no bundle candidate in {self.max_pages} pages (book_ok={scanned_books}, skip_high_gas={skipped_gas})",
@@ -254,7 +254,7 @@ class BundleArbStrategy(ArbStrategy):
                     }
                 )
         except Exception as e:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "ERROR:API_ERROR",
                     "reason": str(e)[:200],

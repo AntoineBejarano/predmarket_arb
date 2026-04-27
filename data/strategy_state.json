@@ -1,8 +1,62 @@
 {
-  "bundle_arb": {"enabled": false, "enabled_at": null, "disabled_at": null},
-  "cross_exchange": {"enabled": false, "enabled_at": null, "disabled_at": null},
-  "market_maker": {"enabled": false, "enabled_at": null, "disabled_at": null},
-  "combinatorial_arb": {"enabled": false, "enabled_at": null, "disabled_at": null},
-  "term_structure": {"enabled": false, "enabled_at": null, "disabled_at": null},
-  "latency_arb": {"enabled": false, "enabled_at": null, "disabled_at": null}
+  "bundle_arb": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null,
+    "fict_capital_eur": 1000,
+    "fict_pnl_cumulative_eur": 0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
+  },
+  "cross_exchange": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null,
+    "fict_capital_eur": 1000,
+    "fict_pnl_cumulative_eur": 0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
+  },
+  "market_maker": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null,
+    "fict_capital_eur": 1000,
+    "fict_pnl_cumulative_eur": 0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
+  },
+  "combinatorial_arb": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null,
+    "fict_capital_eur": 1000,
+    "fict_pnl_cumulative_eur": 0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
+  },
+  "term_structure": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null,
+    "fict_capital_eur": 1000,
+    "fict_pnl_cumulative_eur": 0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
+  },
+  "latency_arb": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null,
+    "fict_capital_eur": 1000,
+    "fict_pnl_cumulative_eur": 0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
+  }
 }

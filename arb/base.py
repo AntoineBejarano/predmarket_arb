@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from risk.strategy_state import FICTIONAL_CSV_FIELDS
+
 log = logging.getLogger("arb.base")
 
 
@@ -27,14 +29,32 @@ class ArbStrategy(ABC):
         self.config = config
         self.dry_run = dry_run
         self.csv_path = logs_csv_path(self.slug)
+        self._state_manager: Any = None
         self._ensure_csv()
+
+    @property
+    def all_csv_columns(self) -> list[str]:
+        return list(self.csv_columns) + list(FICTIONAL_CSV_FIELDS)
 
     def _ensure_csv(self) -> None:
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.csv_path.exists():
             with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=self.csv_columns, extrasaction="ignore")
+                w = csv.DictWriter(f, fieldnames=self.all_csv_columns, extrasaction="ignore")
                 w.writeheader()
+            return
+        with open(self.csv_path, newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            old_fields = r.fieldnames or []
+            if all(c in old_fields for c in FICTIONAL_CSV_FIELDS):
+                return
+            rows = list(r)
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=self.all_csv_columns, extrasaction="ignore")
+            w.writeheader()
+            for row in rows:
+                out = {k: row.get(k, "") for k in self.all_csv_columns}
+                w.writerow(out)
 
     def log_signal(self, row: dict[str, Any]) -> None:
         """Escribe una fila; rellena ts, strategy, dry_run; action y reason obligatorios."""
@@ -46,8 +66,16 @@ class ArbStrategy(ABC):
             out["action"] = "ERROR:INTERNAL"
         if "reason" not in out:
             out["reason"] = "missing_reason"
+        for k in FICTIONAL_CSV_FIELDS:
+            out.setdefault(k, "")
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=self.csv_columns, extrasaction="ignore").writerow(out)
+            csv.DictWriter(f, fieldnames=self.all_csv_columns, extrasaction="ignore").writerow(out)
+
+    async def log_signal_async(self, row: dict[str, Any]) -> None:
+        """Igual que log_signal pero enriquece capital ficticio (paper) si hay state_manager."""
+        if self._state_manager is not None:
+            row = await self._state_manager.enrich_row_with_fictional(self.slug, row)
+        self.log_signal(row)
 
     @property
     @abstractmethod
@@ -61,6 +89,7 @@ class ArbStrategy(ABC):
 
     async def run_loop(self, state_manager: Any) -> None:
         """Loop infinito; respeta StrategyStateManager (sin spamear CSV si disabled)."""
+        self._state_manager = state_manager
         interval = float(self.config.get("poll_interval", 30))
         while True:
             try:
@@ -73,7 +102,7 @@ class ArbStrategy(ABC):
                 raise
             except Exception as e:
                 log.exception("[%s] run_once error", self.slug)
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "ERROR:INTERNAL",
                         "reason": str(e)[:200],

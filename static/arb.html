@@ -127,6 +127,7 @@
             ${def.label}
             ${def.experimental ? '<span class="ml-1 text-xs text-slate-500">(exp)</span>' : ""}
           </p>
+          <p class="text-[10px] text-slate-600 mt-1">Paper: PnL est. ≈ stake×edge por SIGNAL/EXECUTED; ROI = acum / capital (edita <code class="text-slate-500">data/strategy_state.json</code>).</p>
         </div>
         <button type="button"
           onclick="toggleStrategy('${def.slug}', ${enabled})"
@@ -149,6 +150,15 @@
         <span class="font-mono ${(s.best_edge_today || 0) > 0.03 ? "text-yellow-400" : "text-slate-200"}">
           ${s.best_edge_today != null ? (s.best_edge_today * 100).toFixed(2) + "%" : "—"}
         </span>
+        <span class="text-slate-500 col-span-2 mt-2 text-[10px] uppercase tracking-wide text-indigo-400/90">Capital ficticio (paper)</span>
+        <span class="text-slate-500">Capital</span>
+        <span class="font-mono text-indigo-200">${s.fict_capital_eur != null ? Number(s.fict_capital_eur).toFixed(0) + " u" : "—"}</span>
+        <span class="text-slate-500">PnL acum.</span>
+        <span class="font-mono ${(s.fict_pnl_cumulative_eur || 0) >= 0 ? "text-emerald-400" : "text-red-400"}">${s.fict_pnl_cumulative_eur != null ? Number(s.fict_pnl_cumulative_eur).toFixed(2) : "—"}</span>
+        <span class="text-slate-500">ROI</span>
+        <span class="font-mono text-slate-200">${s.fict_roi != null ? (Number(s.fict_roi) * 100).toFixed(2) + "%" : "—"}</span>
+        <span class="text-slate-500">Ops paper</span>
+        <span class="font-mono text-slate-200">${s.fict_trades != null ? s.fict_trades : "—"}</span>
       </div>
       <div class="text-xs border-t border-slate-700 pt-2 mb-3 truncate">
         <span class="${lastActionColor} font-mono">${s.last_action ?? "—"}</span>
@@ -179,11 +189,13 @@
                 <th class="pb-1 pr-3 font-medium">Action</th>
                 <th class="pb-1 pr-3 font-medium">Reason</th>
                 <th class="pb-1 pr-3 font-medium">Edge</th>
+                <th class="pb-1 pr-3 font-medium">ΔPnL</th>
+                <th class="pb-1 pr-3 font-medium">PnLΣ</th>
                 <th class="pb-1 font-medium">Dry</th>
               </tr>
             </thead>
             <tbody id="log-body-${def.slug}" class="divide-y divide-slate-800">
-              <tr><td colspan="5" class="text-slate-600 py-2">—</td></tr>
+              <tr><td colspan="7" class="text-slate-600 py-2">—</td></tr>
             </tbody>
           </table>
         </div>
@@ -215,7 +227,7 @@
       const tbody = document.getElementById("log-body-" + slug);
       if (!tbody) return;
       if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="text-slate-600 py-2 font-mono">sin datos</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="text-slate-600 py-2 font-mono">sin datos</td></tr>';
         return;
       }
       tbody.innerHTML = [...rows].reverse().map((row) => {
@@ -227,11 +239,15 @@
           if (!Number.isNaN(p)) edge = (p * 100).toFixed(2) + "%";
         }
         const dr = row.dry_run === "True" || row.dry_run === true;
+        const dpnl = row.fict_pnl_est_eur ? Number(row.fict_pnl_est_eur).toFixed(4) : "—";
+        const cpnl = row.fict_pnl_cum_eur ? Number(row.fict_pnl_cum_eur).toFixed(4) : "—";
         return `<tr class="hover:bg-slate-800/50">
           <td class="py-1 pr-3 font-mono text-slate-500">${hora}</td>
           <td class="py-1 pr-3 font-mono ${color}">${row.action || "—"}</td>
-          <td class="py-1 pr-3 text-slate-500 max-w-[140px] truncate" title="${String(row.reason || "").replace(/"/g, "'")}">${row.reason || "—"}</td>
+          <td class="py-1 pr-3 text-slate-500 max-w-[120px] truncate" title="${String(row.reason || "").replace(/"/g, "'")}">${row.reason || "—"}</td>
           <td class="py-1 pr-3 font-mono text-slate-300">${edge}</td>
+          <td class="py-1 pr-3 font-mono text-indigo-300">${dpnl}</td>
+          <td class="py-1 pr-3 font-mono text-slate-400">${cpnl}</td>
           <td class="py-1 font-mono ${dr ? "text-slate-500" : "text-orange-400"}">${dr ? "dry" : "REAL"}</td>
         </tr>`;
       }).join("");

@@ -65,7 +65,7 @@ class MarketMakerStrategy(ArbStrategy):
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:CIRCUIT_BREAKER",
                         "reason": "max_daily_drawdown exceeded",
@@ -84,7 +84,7 @@ class MarketMakerStrategy(ArbStrategy):
                 return
 
         if abs(self.q_inventory) >= self.max_inventory:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "SKIP:LOW_EDGE",
                     "reason": "inventory at MM_MAX_INVENTORY",
@@ -139,7 +139,7 @@ class MarketMakerStrategy(ArbStrategy):
                         break
 
                 if not picked:
-                    self.log_signal(
+                    await self.log_signal_async(
                         {
                             "action": "SKIP:NO_MARKETS",
                             "reason": "no market with book and spread >= MM_MIN_SPREAD",
@@ -205,9 +205,9 @@ class MarketMakerStrategy(ArbStrategy):
                     except Exception as e:
                         row["action"] = "ERROR:ORDER_FAIL"
                         row["reason"] = str(e)[:200]
-                self.log_signal(row)
+                await self.log_signal_async(row)
         except asyncio.TimeoutError:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "ERROR:API_TIMEOUT",
                     "reason": "CLOB timeout",
@@ -224,7 +224,7 @@ class MarketMakerStrategy(ArbStrategy):
                 }
             )
         except Exception as e:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "ERROR:API_ERROR",
                     "reason": str(e)[:200],

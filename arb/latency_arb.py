@@ -54,7 +54,7 @@ class LatencyArbStrategy(ArbStrategy):
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:CIRCUIT_BREAKER",
                         "reason": "max_daily_drawdown exceeded",
@@ -71,7 +71,7 @@ class LatencyArbStrategy(ArbStrategy):
                 return
 
         if not self.mapping_path.is_file():
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "SKIP:NO_MARKETS",
                     "reason": "data/binance_poly_mapping.json missing",
@@ -94,7 +94,7 @@ class LatencyArbStrategy(ArbStrategy):
                 for sym in self.symbols:
                     async with sess.get(BINANCE_TICK, params={"symbol": sym}) as resp:
                         if resp.status != 200:
-                            self.log_signal(
+                            await self.log_signal_async(
                                 {
                                     "action": "ERROR:API_ERROR",
                                     "reason": f"Binance HTTP {resp.status}",
@@ -121,7 +121,7 @@ class LatencyArbStrategy(ArbStrategy):
                     block = mapping.get(sym) or {}
                     mids = (block.get("up_markets") or []) + (block.get("down_markets") or [])
                     if not mids:
-                        self.log_signal(
+                        await self.log_signal_async(
                             {
                                 "action": "SKIP:NO_MARKETS",
                                 "reason": f"no poly markets mapped for {sym}",
@@ -137,7 +137,7 @@ class LatencyArbStrategy(ArbStrategy):
                         )
                         return
 
-                    self.log_signal(
+                    await self.log_signal_async(
                         {
                             "action": "SKIP:STALE_PRICE",
                             "reason": "mapping has ids but Poly WS/orderbook scan not implemented",
@@ -153,7 +153,7 @@ class LatencyArbStrategy(ArbStrategy):
                     )
                     return
 
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "SKIP:NO_MARKETS",
                     "reason": "no Binance tick above threshold",
@@ -168,7 +168,7 @@ class LatencyArbStrategy(ArbStrategy):
                 }
             )
         except asyncio.TimeoutError:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "ERROR:API_TIMEOUT",
                     "reason": "Binance request timeout",
@@ -183,7 +183,7 @@ class LatencyArbStrategy(ArbStrategy):
                 }
             )
         except Exception as e:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "ERROR:API_ERROR",
                     "reason": str(e)[:200],

@@ -68,7 +68,7 @@ class TermStructureStrategy(ArbStrategy):
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:CIRCUIT_BREAKER",
                         "reason": "max_daily_drawdown exceeded",
@@ -87,7 +87,7 @@ class TermStructureStrategy(ArbStrategy):
 
         lam = self._load_lambda()
         if lam <= 1e-5:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "SKIP:NO_MARKETS",
                     "reason": "insufficient resolution_history for lambda",
@@ -104,7 +104,7 @@ class TermStructureStrategy(ArbStrategy):
             )
             return
 
-        self.log_signal(
+        await self.log_signal_async(
             {
                 "action": "SKIP:NO_MARKETS",
                 "reason": "term pairs scan not wired — lambda_hat available",

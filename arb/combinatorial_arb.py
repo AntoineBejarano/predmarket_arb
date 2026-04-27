@@ -43,7 +43,7 @@ class CombinatorialArbStrategy(ArbStrategy):
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:CIRCUIT_BREAKER",
                         "reason": "max_daily_drawdown exceeded",
@@ -58,7 +58,7 @@ class CombinatorialArbStrategy(ArbStrategy):
                 return
 
         if not self.graph_path.is_file():
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "SKIP:NO_MARKETS",
                     "reason": "data/market_graph.json missing — stub combinatorial",
@@ -76,7 +76,7 @@ class CombinatorialArbStrategy(ArbStrategy):
             data = json.loads(self.graph_path.read_text(encoding="utf-8"))
             nodes = data.get("nodes") or data
             if not nodes:
-                self.log_signal(
+                await self.log_signal_async(
                     {
                         "action": "SKIP:NO_MARKETS",
                         "reason": "empty market graph",
@@ -90,7 +90,7 @@ class CombinatorialArbStrategy(ArbStrategy):
                 )
                 return
         except (json.JSONDecodeError, OSError) as e:
-            self.log_signal(
+            await self.log_signal_async(
                 {
                     "action": "ERROR:API_ERROR",
                     "reason": str(e)[:200],
@@ -104,7 +104,7 @@ class CombinatorialArbStrategy(ArbStrategy):
             )
             return
 
-        self.log_signal(
+        await self.log_signal_async(
             {
                 "action": "SKIP:NO_MARKETS",
                 "reason": "graph present but scan not implemented",
