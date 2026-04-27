@@ -30,6 +30,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.debug_markets import run_polymarket_market_debug
+
 load_dotenv(REPO_ROOT / ".env")
 
 log = logging.getLogger("api")
@@ -435,6 +437,15 @@ async def api_signals(
         df = df[df["asset"].astype(str).str.upper() == asset.strip().upper()]
     df = df.tail(int(limit))
     return df.to_dict(orient="records")
+
+
+@app.post("/api/debug/polymarket")
+async def api_debug_polymarket() -> dict[str, Any]:
+    """
+    Misma lógica que ``scripts/debug_markets.py``: Gamma por slug (5m) + muestra REST.
+    Útil en Railway si el navegador no puede llamar a Polymarket directamente.
+    """
+    return await asyncio.to_thread(run_polymarket_market_debug)
 
 
 @app.get("/api/debug/signals")

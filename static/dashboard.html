@@ -111,6 +111,25 @@
       </div>
     </section>
 
+    <!-- Polymarket Gamma (desde el servidor; Railway) -->
+    <section>
+      <h2 class="text-lg font-semibold text-white mb-1">Polymarket Gamma (diagnóstico)</h2>
+      <p class="text-xs text-slate-500 mb-3 max-w-3xl">
+        Ejecuta en el servidor la misma comprobación que <code class="text-slate-400">python scripts/debug_markets.py</code>
+        (slug 5m + <code class="text-slate-400">GET /markets</code>). Útil si hay errores de conexión desde tu red local.
+      </p>
+      <div class="flex flex-wrap gap-2 mb-2">
+        <button id="btnPolyDebug" type="button" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm">
+          Probar Gamma (Polymarket)
+        </button>
+        <button id="btnPolyCopy" type="button" class="px-4 py-2 rounded-lg border border-slate-600 hover:bg-slate-800 text-slate-200 font-medium text-sm">
+          Copiar salida
+        </button>
+        <span id="polyCopyHint" class="text-xs text-slate-500 self-center"></span>
+      </div>
+      <pre id="polyDebugOut" class="text-xs font-mono text-slate-300 bg-slate-950 border border-slate-700 rounded-xl p-4 max-h-96 overflow-auto whitespace-pre-wrap break-all">Pulsa «Probar Gamma» para cargar el informe.</pre>
+    </section>
+
     <!-- DEBUG: NearRes / window / market -->
     <section>
       <h2 class="text-lg font-semibold text-white mb-1">Signal debug</h2>
@@ -421,6 +440,53 @@
         alert('Stop failed');
       }
     };
+
+    async function runPolymarketDebug() {
+      const pre = $('polyDebugOut');
+      const btn = $('btnPolyDebug');
+      const hint = $('polyCopyHint');
+      if (hint) hint.textContent = '';
+      pre.textContent = 'Cargando…';
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/debug/polymarket', { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          pre.textContent =
+            'HTTP ' + r.status + '\n' + (j.detail ? JSON.stringify(j.detail, null, 2) : JSON.stringify(j, null, 2));
+          return;
+        }
+        pre.textContent = j.text || JSON.stringify(j, null, 2);
+      } catch (e) {
+        pre.textContent = 'Error: ' + (e && e.message ? e.message : String(e));
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    if ($('btnPolyDebug')) {
+      $('btnPolyDebug').onclick = () => runPolymarketDebug();
+    }
+    if ($('btnPolyCopy')) {
+      $('btnPolyCopy').onclick = async () => {
+        const pre = $('polyDebugOut');
+        const hint = $('polyCopyHint');
+        const t = pre ? pre.textContent : '';
+        if (!t || t.startsWith('Pulsa «')) {
+          if (hint) hint.textContent = 'Primero ejecuta el diagnóstico.';
+          return;
+        }
+        try {
+          await navigator.clipboard.writeText(t);
+          if (hint) {
+            hint.textContent = 'Copiado al portapapeles.';
+            setTimeout(() => { if (hint) hint.textContent = ''; }, 2500);
+          }
+        } catch (e) {
+          if (hint) hint.textContent = 'No se pudo copiar (permiso o HTTPS).';
+        }
+      };
+    }
 
     let es;
     function connectSSE() {
