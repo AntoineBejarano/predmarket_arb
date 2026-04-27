@@ -13,7 +13,7 @@ Sistema de **paper trading / validación de edge** sobre mercados Polymarket tip
 | `**scripts/validate_edge.py`** | Worker largo: Binance + Gamma, Rich en consola, escribe `logs/signals.csv`. Arrancado por el API como subproceso o en local a mano.                                  |
 
 
-- Comunicación: `**logs/signals.csv**` (ruta bajo `DATA_DIR`) y PID en memoria del API.
+- Comunicación: `**logs/signals.csv`** (ruta bajo `DATA_DIR`) y PID en memoria del API.
 - **Puertos:** el API usa `PORT` (p. ej. 8080). El worker tiene su propio mini HTTP de health en `**VALIDATOR_HEALTH_PORT`** (default `18088`) para no colisionar con el API.
 
 ## Archivos importantes
@@ -24,9 +24,9 @@ Sistema de **paper trading / validación de edge** sobre mercados Polymarket tip
 - `static/dashboard.html` — UI vanilla + Tailwind CDN; sin build npm.
 - `Dockerfile` / `railway.toml` — arranque con `python scripts/api.py`; healthcheck Railway en `/health` del API.
 
-En **`python:3.11-slim`** hace falta el paquete **`libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
+En `**python:3.11-slim`** hace falta el paquete `**libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
 
-Los **`.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma familia de `scikit-learn`** que al entrenar; en `pyproject.toml` está acotado a **1.6.x** para evitar `InconsistentVersionWarning` y resultados raros si Docker instala 1.8+.
+Los `**.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma familia de `scikit-learn`** que al entrenar; en `pyproject.toml` está acotado a **1.6.x** para evitar `InconsistentVersionWarning` y resultados raros si Docker instala 1.8+.
 
 ## Entorno y variables
 
@@ -61,10 +61,10 @@ AUTO_START=false PORT=8080 python scripts/api.py
 ## Logs en Railway
 
 - Los JSON de **flujos TCP** (netflow) en la consola **no** son logs de la app: no indican si Gamma/Binance fallan.
-- Mira **Deploy Logs** del servicio: ahí debe salir Uvicorn y, tras el cambio de supervisor, **`validate_edge`** (prefijo `[validate_edge]`, líneas tipo `Gamma: N mercados…`, `Iteración OK`, warnings de Binance).
-- El API escribe con prefijo **`[api]`**: arranque (`DATA_DIR`, `AUTO_START`), `POST /api/start` / `stop`, y apagado.
-- Cada iteración del validador (~30s) loguea **`Iteración #N`**: mercados Gamma tras filtro, observaciones totales, señales, resueltos, pendientes, **nº de velas 5m por activo** y **último precio spot** por activo (visibilidad Binance).
-- Si **`csv_rows`** en `GET /api/status` (o el pie del dashboard) **sube** cada ~30s con el worker en marcha, se están escribiendo observaciones (Gamma + filtros + precio); si se queda en **0** durante mucho tiempo, o no hay mercados que pasen el filtro o el worker no está arrancado (`AUTO_START` / botón START).
+- Mira **Deploy Logs** del servicio: ahí debe salir Uvicorn y, tras el cambio de supervisor, `**validate_edge`** (prefijo `[validate_edge]`, líneas tipo `Gamma: N mercados…`, `Iteración OK`, warnings de Binance).
+- El API escribe con prefijo `**[api]`**: arranque (`DATA_DIR`, `AUTO_START`), `POST /api/start` / `stop`, y apagado.
+- Cada iteración del validador (~30s) loguea `**Iteración #N`**: mercados Gamma tras filtro, observaciones totales, señales, resueltos, pendientes, **nº de velas 5m por activo** y **último precio spot** por activo (visibilidad Binance).
+- Si `**csv_rows`** en `GET /api/status` (o el pie del dashboard) **sube** cada ~30s con el worker en marcha, se están escribiendo observaciones (Gamma + filtros + precio); si se queda en **0** durante mucho tiempo, o no hay mercados que pasen el filtro o el worker no está arrancado (`AUTO_START` / botón START).
 
 ## Límites conocidos
 
