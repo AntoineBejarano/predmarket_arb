@@ -37,13 +37,14 @@ En `**python:3.11-slim`** hace falta el paquete `**libgomp1`** (OpenMP) o LightG
 
 Los `**.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma familia de `scikit-learn`** que al entrenar; en `pyproject.toml` está acotado a **1.6.x** para evitar `InconsistentVersionWarning` y resultados raros si Docker instala 1.8+.
 
-Órdenes CLOB en vivo requieren **`eth-account`** y **`py-order-utils`** (y Python **≥ 3.9.10** por el wheel de `py-order-utils`; el proyecto fija **≥ 3.11**).
+Órdenes CLOB en vivo requieren **`eth-account`** y **`py-order-utils`**. El runtime oficial del repo es **Python ≥ 3.11** (`pyproject.toml`, `setup.py` y imagen Docker); no uses 3.9.x para este proyecto.
 
 ## Entorno y variables
 
 - Copiar `.env.example` → `.env`. Relevantes: `DATA_DIR`, `PORT`, `AUTO_START`, `SIGNAL_THRESHOLD`, `LOG_LEVEL`, `GAMMA_MAX_PAGES`, `VALIDATOR_HEALTH_PORT`, `DASHBOARD_PASSWORD` (reservado; auth no implementada).
 - **Arb / CLOB:** `DRY_RUN` (default seguro `true`), `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY`; opcionales `POLY_FUNDER`, `POLY_SIGNATURE_TYPE`, `POLYGON_CHAIN_ID`. Sin secret L2, `place_order` en vivo falla con mensaje explícito.
-- Python del proyecto: `**pyproject.toml` pide ≥3.11** (Docker); entornos locales pueden ser 3.9 — en rutas FastAPI evitar anotaciones `X | Y` sin `from __future__ import annotations` o usar `Union`/`Optional` donde FastAPI evalúe el tipo en 3.9. **`py-order-utils` no instala en Python 3.9.6** (exige ≥ 3.9.10); usar 3.11+ para desarrollo con órdenes firmadas.
+- Python del proyecto: **≥ 3.11** obligatorio (`python setup.py` sale con error si no). Docker `python:3.11-slim` cumple. En rutas FastAPI evitar anotaciones `X | Y` sin `from __future__ import annotations` donde haga falta compatibilidad con intérpretes viejos.
+- **Arb en Railway:** con `DRY_RUN=true` y estrategias **desactivadas** por defecto en `data/strategy_state.json`, el despliegue levanta la UI lista; el motor no llama al CLOB hasta que actives toggles y pulses Start.
 
 ## Comandos útiles
 

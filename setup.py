@@ -32,14 +32,16 @@ PACKAGES = [
 ]
 
 
-def warn_python_version() -> None:
+def require_python_version() -> None:
+    """Alineado con pyproject.toml (>=3.11): deps del arb y py-order-utils no soportan 3.9.x antiguo."""
     if sys.version_info < (3, 11):
         print(
-            f"⚠️  Advertencia: se recomienda Python >= 3.11 (actual: "
-            f"{sys.version_info.major}.{sys.version_info.minor}). "
-            "Continuando de todas formas.\n",
+            f"❌ Este repo requiere Python >= 3.11 (tienes {sys.version_info.major}."
+            f"{sys.version_info.minor}.{sys.version_info.micro}).\n"
+            "   Instala 3.11+ (pyenv, asdf, brew, uv) y vuelve a ejecutar: python setup.py\n",
             file=sys.stderr,
         )
+        sys.exit(1)
 
 
 def venv_pip_python() -> tuple[Path, Path]:
@@ -54,7 +56,7 @@ def run(cmd: list[str]) -> None:
 
 
 def main() -> None:
-    warn_python_version()
+    require_python_version()
 
     if not VENV_DIR.is_dir():
         run([sys.executable, "-m", "venv", str(VENV_DIR)])

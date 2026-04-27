@@ -43,6 +43,10 @@ from risk.strategy_state import StrategyStateManager
 
 async def main() -> None:
     state_mgr = StrategyStateManager()
+    _st = await state_mgr.get_all()
+    _n_on = sum(1 for v in _st.values() if v.get("enabled"))
+    log.info("Control plane: %s/%s estrategias enabled (solo esas harán trabajo CLOB)", _n_on, len(_st))
+
     breaker = CircuitBreaker(max_daily_drawdown=float(os.getenv("MAX_DAILY_DRAWDOWN", "0.08")))
 
     base_cap = {

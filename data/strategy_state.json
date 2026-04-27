@@ -1,6 +1,6 @@
 {
-  "bundle_arb": {"enabled": true, "enabled_at": null, "disabled_at": null},
-  "cross_exchange": {"enabled": true, "enabled_at": null, "disabled_at": null},
+  "bundle_arb": {"enabled": false, "enabled_at": null, "disabled_at": null},
+  "cross_exchange": {"enabled": false, "enabled_at": null, "disabled_at": null},
   "market_maker": {"enabled": false, "enabled_at": null, "disabled_at": null},
   "combinatorial_arb": {"enabled": false, "enabled_at": null, "disabled_at": null},
   "term_structure": {"enabled": false, "enabled_at": null, "disabled_at": null},

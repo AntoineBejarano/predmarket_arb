@@ -12,7 +12,6 @@ import aiohttp
 import websockets
 
 from clients.poly_clob_auth import build_l2_headers
-from clients.poly_order_live import LiveDeps, build_post_order_body
 
 log = logging.getLogger("poly_clob")
 
@@ -136,6 +135,8 @@ class PolyCLOBClient:
         """POST /order — firma EIP-712 vía py-order-utils + cabeceras L2. Requiere DRY_RUN=false y credenciales."""
         if self.dry_run:
             raise RuntimeError("DRY_RUN=true — orden simulada, no enviada")
+        from clients.poly_order_live import LiveDeps, build_post_order_body
+
         deps = LiveDeps.check()
         if not deps.ok:
             raise RuntimeError(deps.error)

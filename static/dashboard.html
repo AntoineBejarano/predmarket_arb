@@ -186,12 +186,15 @@
 
   <section id="arb-control-plane" class="max-w-6xl mx-auto mt-10 px-4 pb-12 border-t border-slate-700 pt-8">
     <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
-      <div class="flex items-center gap-3 flex-wrap">
-        <h2 class="text-lg font-medium text-white">Arb Engine</h2>
-        <span id="arb-dry-badge"
-          class="text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-900/60 text-emerald-200">DRY_RUN</span>
-        <span id="arb-running-badge"
-          class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">STOPPED</span>
+      <div class="flex flex-col gap-1 min-w-0">
+        <div class="flex items-center gap-3 flex-wrap">
+          <h2 class="text-lg font-medium text-white">Arb Engine</h2>
+          <span id="arb-dry-badge"
+            class="text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-900/60 text-emerald-200">DRY_RUN</span>
+          <span id="arb-running-badge"
+            class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">STOPPED</span>
+        </div>
+        <p class="text-xs text-slate-500 max-w-xl">Por defecto ninguna estrategia está activa. Activa las que quieras, pulsa Start y revisa el feed. El validador ML de arriba sigue igual sin depender del motor.</p>
       </div>
       <div class="flex gap-2">
         <button type="button" onclick="arbStart()"
@@ -209,7 +212,7 @@
       <p class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Live feed</p>
       <div id="live-feed"
         class="font-mono text-xs bg-slate-950 rounded-lg p-3 h-36 overflow-y-auto space-y-0.5 border border-slate-700">
-        <p class="text-slate-600">— conectando —</p>
+        <p class="text-slate-600">Sin señales nuevas hasta que el motor esté en marcha y haya filas en los CSV de estrategias.</p>
       </div>
     </div>
 
@@ -735,12 +738,12 @@
     }
 
     async function refreshArbStatus() {
-      let data = null;
+      let data = { strategies: [], dry_run: true, engine_running: false };
       try {
         const r = await fetch("/api/arb/status");
         if (r.ok) data = await r.json();
       } catch (e) {}
-      if (!data) return;
+      if (!Array.isArray(data.strategies)) data.strategies = [];
 
       const rb = document.getElementById("arb-running-badge");
       if (rb) {
@@ -791,6 +794,7 @@
     }
 
     document.addEventListener("DOMContentLoaded", () => {
+      renderCards({ strategies: [], dry_run: true, engine_running: false });
       refreshArbStatus();
       setInterval(refreshArbStatus, 8000);
       startArbLiveFeed();

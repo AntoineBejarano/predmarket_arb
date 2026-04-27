@@ -32,12 +32,9 @@ class StrategyStateManager:
         self._load()
 
     def _default_state(self) -> dict:
+        # Desplegable seguro: motor en marcha no hace trabajo CLOB hasta activar toggles en la UI.
         return {
-            s: {
-                "enabled": s in ("bundle_arb", "cross_exchange"),
-                "enabled_at": None,
-                "disabled_at": None,
-            }
+            s: {"enabled": False, "enabled_at": None, "disabled_at": None}
             for s in _SLUGS
         }
 
