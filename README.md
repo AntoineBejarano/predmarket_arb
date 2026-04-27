@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="static/logo.png" alt="PredMarket Arb — Polymarket strategy lab" width="200" />
+</div>
+
 # PredMarket Arb — Polymarket strategy lab
 
 Paper-trading and **edge-validation** against Polymarket-style markets (today: **5-minute crypto Up or Down**). The stack compares market-implied probabilities (Gamma) with an ML model (LightGBM + isotonic calibration) and a NearRes heuristic. **No trading or wallet**—public APIs and CSV logs only.
