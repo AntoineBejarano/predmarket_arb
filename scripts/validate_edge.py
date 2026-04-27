@@ -998,6 +998,16 @@ def run_main(hours: float | None, threshold: float) -> None:
         threads.append(t_ohlcv)
     log.info("OHLCV 5m real: hilos=%s (refresh cada 300s)", len(price_symbols))
 
+    # Pre-fetch bloqueante: garantiza que ohlcv_buffer esté poblado antes del primer
+    # tick del bucle, evitando que window_open caiga a float(px) por buffer vacío.
+    log.info("Pre-cargando OHLCV 5m inicial (bloqueante)…")
+    for _sym in price_symbols:
+        _pre = fetch_real_5m_ohlcv(ASSET_MAP[_sym]["binance"], session)
+        if _pre:
+            with ohlcv_lock:
+                ohlcv_buffer[_sym] = deque(_pre, maxlen=60)
+            log.info("OHLCV pre-cargado %s: %s velas", _sym, len(_pre))
+
     gamma_cache = GammaCache()
     stats = SessionStats()
     fired_signals: set[tuple[str, str, str]] = set()
@@ -1213,15 +1223,29 @@ def run_main(hours: float | None, threshold: float) -> None:
                                     f"[bold red on black]SIGNAL ML[/] {asset} {direction} conf={float(confidence):.4f} "
                                     f"p_model={p_modelo:.4f} p_mkt={p_mercado:.4f}"
                                 )
+                            _nr_dir = "Up" if gap_nearres > 0 else "Down"
+                            # Solo disparar NR cuando la señal concuerda con el movimiento
+                            # realizado en la ventana: evita apostar contra un mercado eficiente
+                            # que ya incorporó el movimiento (gap_nr negativo + precio subiendo
+                            # → CLOB correcto, fórmula browniana se queda corta → no señal).
+                            _nr_consistent = (
+                                np.isfinite(window_return)
+                                and window_return != 0.0
+                                and (
+                                    (_nr_dir == "Up" and window_return > 0)
+                                    or (_nr_dir == "Down" and window_return < 0)
+                                )
+                            )
                             if (
                                 np.isfinite(gap_nearres)
                                 and abs(gap_nearres) > SIGNAL_THRESHOLD
                                 and minutes_elapsed >= 1
+                                and _nr_consistent
                                 and nr_key not in fired_signals
                             ):
                                 fired_signals.add(nr_key)
                                 sig_label = "NEARRES"
-                                direction = "Up" if gap_nearres > 0 else "Down"
+                                direction = _nr_dir
                                 confidence = str(abs(gap_nearres))
                                 stats.signals_fired += 1
                                 stats.last_signal_text = (
