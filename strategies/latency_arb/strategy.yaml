@@ -1,0 +1,15 @@
+slug: latency_arb
+name: "Latency Arbitrage (Binance → Polymarket)"
+version: "1.0.0"
+status: experimental
+type: pure_math
+data_inputs:
+  - source: binance_ws
+    fields: [price, price_delta_pct, symbol]
+    latency_target_ms: 50
+  - source: polymarket_clob
+    fields: [best_ask, best_bid, market_id]
+    latency_target_ms: 200
+dependencies_external: none
+dry_run_default: true
+csv_log: logs/latency_arb.csv

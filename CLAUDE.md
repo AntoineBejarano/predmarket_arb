@@ -2,38 +2,48 @@
 
 ## Qué es este repo
 
-Sistema de **paper trading / validación de edge** sobre mercados Polymarket tipo “5m crypto Up or Down”. Compara probabilidad del mercado (Gamma API) con un modelo ML (LightGBM + isotónica) y una heurística NearRes. **No hay trades ni wallet**: solo lectura de APIs y logs en CSV.
+Sistema de **paper trading / validación de edge** sobre mercados Polymarket tipo “5m crypto Up or Down”. Compara probabilidad del mercado (Gamma API) con un modelo ML (LightGBM + isotónica) y una heurística NearRes. **No hay trades ni wallet** en el validador clásico: solo lectura de APIs y logs en CSV.
 
-El repo está organizado como **laboratorio de estrategias** (`strategies/`): cada estrategia tiene `strategy.yaml`, experimentos bajo `experiments/<slug>/` con `RUNBOOK.md` + `LEARNINGS.md` y métricas pequeñas en git. Ver [strategies/README.md](strategies/README.md) (inglés).
+Además hay un **Arb Engine** opcional (`scripts/arb_engine.py`): laboratorio de estrategias de arbitraje / market making sobre CLOB Polymarket (y stubs Kalshi) con CSV bajo `DATA_DIR`. Por defecto **`DRY_RUN=true`**: no envía órdenes reales; con `DRY_RUN=false` y credenciales L2, `clients/poly_clob.py` puede **POST /order** al CLOB usando `py-order-utils` + `eth-account` (sin el SDK `py_clob_client`).
 
-## Arquitectura en dos procesos
+El repo está organizado como **laboratorio de estrategias** (`strategies/`): cada estrategia tiene `strategy.yaml`, experimentos bajo `experiments/<slug>/` con `RUNBOOK.md` + `LEARNINGS.md` y métricas pequeñas en git. Ver [strategies/README.md](strategies/README.md) (inglés). Las carpetas `strategies/bundle_arb`, `cross_exchange`, `market_maker`, etc. documentan bots del arb engine.
 
-
-| Proceso                        | Rol                                                                                                                                                                  |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `**scripts/api.py`**           | FastAPI: dashboard en `/` (`static/dashboard.html`), JSON `/api/status`, START/STOP del worker, SSE `/api/signals/live`, `/health` → `{"status":"ok"}` para Railway. |
-| `**scripts/validate_edge.py`** | Worker largo: Binance + Gamma, Rich en consola, escribe `logs/signals.csv`. Arrancado por el API como subproceso o en local a mano.                                  |
+## Arquitectura en procesos
 
 
-- Comunicación: `**logs/signals.csv`** (ruta bajo `DATA_DIR`) y PID en memoria del API.
+| Proceso                         | Rol                                                                                                                                                                  |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `**scripts/api.py`**            | FastAPI: dashboard en `/` (`static/dashboard.html`), JSON `/api/status`, START/STOP del worker, SSE `/api/signals/live`, `/health` → `{"status":"ok"}` para Railway. Además: **arb engine** — `POST/GET /api/arb/start|stop|status`, enable/disable por estrategia, log CSV, SSE `/api/arb/signals/live`. |
+| `**scripts/validate_edge.py`**  | Worker largo: Binance + Gamma, Rich en consola, escribe `logs/signals.csv`. Arrancado por el API como subproceso o en local a mano.                                  |
+| `**scripts/arb_engine.py`**     | Subproceso opcional lanzado desde el API: bucle de estrategias en `arb/` + `risk/`; usa `clients/poly_clob.py` (REST CLOB, órdenes si `DRY_RUN=false`).                |
+
+
+- Comunicación validador: `**logs/signals.csv`** (ruta bajo `DATA_DIR`) y PID en memoria del API.
+- Comunicación arb: CSV por estrategia bajo `DATA_DIR` / `logs` (según rutas en `scripts/api.py` y `data/`).
 - **Puertos:** el API usa `PORT` (p. ej. 8080). El worker tiene su propio mini HTTP de health en `**VALIDATOR_HEALTH_PORT`** (default `18088`) para no colisionar con el API.
 
 ## Archivos importantes
 
 - `models/train.py` — entrena y guarda PKL en `models/saved/{BTCUSDT,...}_*.pkl`. Las features en vivo del validador están alineadas con este pipeline (velas ~5m sintéticas desde ticks de 30s).
 - `scripts/validate_edge.py` — bucle principal, resolución de ventanas, informes diarios UTC, `SIGNAL_THRESHOLD`, etc.
+- `scripts/arb_engine.py` — punto de entrada del arb engine; estrategias en `arb/`, riesgo en `risk/`, clientes HTTP en `clients/`.
+- `clients/poly_clob.py` — CLOB REST (`/markets`, `/book`, `/order`, cancelaciones L2), WebSocket `subscribe_market` (payload tipo `market` con `assets_ids`). Firma de órdenes: `clients/poly_order_live.py` + `clients/poly_clob_auth.py` (HMAC L2 alineado con `py_clob_client`).
+- `clients/kalshi_rest.py` — cliente REST Kalshi (stubs donde aplique).
 - `scripts/healthcheck.py` — handler HTTP mínimo usado por el worker.
-- `static/dashboard.html` — UI vanilla + Tailwind CDN; sin build npm.
+- `static/dashboard.html` — UI vanilla + Tailwind CDN; sin build npm (incluye sección Arb).
 - `Dockerfile` / `railway.toml` — arranque con `python scripts/api.py`; healthcheck Railway en `/health` del API.
 
 En `**python:3.11-slim`** hace falta el paquete `**libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
 
 Los `**.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma familia de `scikit-learn`** que al entrenar; en `pyproject.toml` está acotado a **1.6.x** para evitar `InconsistentVersionWarning` y resultados raros si Docker instala 1.8+.
 
+Órdenes CLOB en vivo requieren **`eth-account`** y **`py-order-utils`** (y Python **≥ 3.9.10** por el wheel de `py-order-utils`; el proyecto fija **≥ 3.11**).
+
 ## Entorno y variables
 
 - Copiar `.env.example` → `.env`. Relevantes: `DATA_DIR`, `PORT`, `AUTO_START`, `SIGNAL_THRESHOLD`, `LOG_LEVEL`, `GAMMA_MAX_PAGES`, `VALIDATOR_HEALTH_PORT`, `DASHBOARD_PASSWORD` (reservado; auth no implementada).
-- Python del proyecto: `**pyproject.toml` pide ≥3.11** (Docker); entornos locales pueden ser 3.9 — en rutas FastAPI evitar anotaciones `X | Y` sin `from __future__ import annotations` o usar `Union`/`Optional` donde FastAPI evalúe el tipo en 3.9.
+- **Arb / CLOB:** `DRY_RUN` (default seguro `true`), `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY`; opcionales `POLY_FUNDER`, `POLY_SIGNATURE_TYPE`, `POLYGON_CHAIN_ID`. Sin secret L2, `place_order` en vivo falla con mensaje explícito.
+- Python del proyecto: `**pyproject.toml` pide ≥3.11** (Docker); entornos locales pueden ser 3.9 — en rutas FastAPI evitar anotaciones `X | Y` sin `from __future__ import annotations` o usar `Union`/`Optional` donde FastAPI evalúe el tipo en 3.9. **`py-order-utils` no instala en Python 3.9.6** (exige ≥ 3.9.10); usar 3.11+ para desarrollo con órdenes firmadas.
 
 ## Comandos útiles
 
@@ -72,4 +82,6 @@ AUTO_START=false PORT=8080 python scripts/api.py
 
 - Gamma devuelve muchos mercados; la paginación del validador está acotada (`GAMMA_MAX_PAGES`) — si no aparecen mercados 5m crypto, subir el límite o revisar filtros de pregunta.
 - En vivo `vol_zscore` de volumen no está disponible desde ticker simple; se fija según la lógica documentada en el validador.
+- El WebSocket `subscribe_market` sigue el formato documentado del canal `market`; si Polymarket cambia el mensaje de suscripción o la URL, ajustar `clients/poly_clob.py`.
+- Kalshi u otros conectores pueden seguir con métodos no implementados fuera de los flujos ya cableados.
 

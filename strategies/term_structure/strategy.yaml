@@ -1,0 +1,11 @@
+slug: term_structure
+name: "Term Structure Arbitrage"
+version: "1.0.0"
+status: experimental
+type: pure_math
+data_inputs:
+  - source: polymarket_clob
+    fields: [market_id, best_ask, expires_at, question]
+dependencies_external: none
+dry_run_default: true
+csv_log: logs/term_structure.csv

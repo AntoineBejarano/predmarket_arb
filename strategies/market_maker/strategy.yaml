@@ -1,0 +1,12 @@
+slug: market_maker
+name: "Market Making (Avellaneda-Stoikov)"
+version: "1.0.0"
+status: experimental
+type: pure_math
+data_inputs:
+  - source: polymarket_clob
+    fields: [best_ask, best_bid, mid_price, last_trade_price, volume]
+    latency_target_ms: 200
+dependencies_external: none
+dry_run_default: true
+csv_log: logs/market_maker.csv

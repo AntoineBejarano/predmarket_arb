@@ -1,0 +1,14 @@
+slug: cross_exchange
+name: "Cross-Exchange Arbitrage (Poly ↔ Kalshi)"
+version: "1.0.0"
+status: active
+type: pure_math
+data_inputs:
+  - source: polymarket_clob
+    fields: [best_ask, best_bid, market_id, token_id]
+  - source: kalshi_rest
+    fields: [yes_ask, no_ask, ticker]
+    latency_target_ms: 1000
+dependencies_external: none
+dry_run_default: true
+csv_log: logs/cross_exchange.csv

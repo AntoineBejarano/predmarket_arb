@@ -184,6 +184,38 @@
     </section>
   </div>
 
+  <section id="arb-control-plane" class="max-w-6xl mx-auto mt-10 px-4 pb-12 border-t border-slate-700 pt-8">
+    <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
+      <div class="flex items-center gap-3 flex-wrap">
+        <h2 class="text-lg font-medium text-white">Arb Engine</h2>
+        <span id="arb-dry-badge"
+          class="text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-900/60 text-emerald-200">DRY_RUN</span>
+        <span id="arb-running-badge"
+          class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">STOPPED</span>
+      </div>
+      <div class="flex gap-2">
+        <button type="button" onclick="arbStart()"
+          class="text-xs px-3 py-1.5 border border-slate-600 rounded-md hover:bg-slate-800 text-slate-200">
+          Start
+        </button>
+        <button type="button" onclick="arbStop()"
+          class="text-xs px-3 py-1.5 border border-red-800 text-red-400 rounded-md hover:bg-red-950/40">
+          Stop
+        </button>
+      </div>
+    </div>
+
+    <div class="mb-6">
+      <p class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">Live feed</p>
+      <div id="live-feed"
+        class="font-mono text-xs bg-slate-950 rounded-lg p-3 h-36 overflow-y-auto space-y-0.5 border border-slate-700">
+        <p class="text-slate-600">— conectando —</p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4" id="strategy-grid"></div>
+  </section>
+
   <script>
     const $ = (id) => document.getElementById(id);
 
@@ -522,6 +554,247 @@
     refreshAll();
     connectSSE();
     setInterval(refreshAll, 10000);
+  </script>
+
+  <script>
+    const STRATEGIES = [
+      { slug: "bundle_arb", label: "Bundle Arb", experimental: false },
+      { slug: "cross_exchange", label: "Cross Exchange", experimental: false },
+      { slug: "market_maker", label: "Market Maker", experimental: true },
+      { slug: "combinatorial_arb", label: "Combinatorial", experimental: true },
+      { slug: "term_structure", label: "Term Structure", experimental: true },
+      { slug: "latency_arb", label: "Latency Arb", experimental: true },
+    ];
+
+    const ACTION_COLOR = {
+      "SIGNAL": "text-yellow-400",
+      "EXECUTED": "text-emerald-400",
+      "QUOTE": "text-cyan-400",
+      "SKIP:LOW_EDGE": "text-slate-500",
+      "SKIP:DISABLED": "text-slate-600",
+      "SKIP:NO_MARKETS": "text-slate-500",
+      "SKIP:CIRCUIT_BREAKER": "text-orange-400",
+      "SKIP:LOCKUP": "text-slate-500",
+      "SKIP:HIGH_GAS": "text-slate-500",
+      "SKIP:STALE_PRICE": "text-slate-500",
+      "ERROR:API_TIMEOUT": "text-red-400",
+      "ERROR:API_ERROR": "text-red-400",
+      "ERROR:ORDER_FAIL": "text-red-500",
+      "ERROR:INTERNAL": "text-red-500",
+    };
+
+    function actionColor(action) {
+      if (!action) return "text-slate-400";
+      for (const [k, v] of Object.entries(ACTION_COLOR)) {
+        if (action.startsWith(k)) return v;
+      }
+      return "text-slate-400";
+    }
+
+    function renderCards(statusData) {
+      const grid = document.getElementById("strategy-grid");
+      if (!grid) return;
+      const bySlug = {};
+      (statusData.strategies || []).forEach((s) => { bySlug[s.slug] = s; });
+
+      grid.innerHTML = STRATEGIES.map((def) => {
+        const s = bySlug[def.slug] || {};
+        const enabled = !!s.enabled;
+        const lastActionColor = actionColor(s.last_action);
+        return `
+    <div class="border border-slate-700 rounded-xl p-4 bg-slate-800/40">
+      <div class="flex items-start justify-between mb-3">
+        <div>
+          <p class="text-sm font-medium text-white">
+            ${def.label}
+            ${def.experimental ? '<span class="ml-1 text-xs text-slate-500">(exp)</span>' : ""}
+          </p>
+        </div>
+        <button type="button"
+          onclick="toggleStrategy('${def.slug}', ${enabled})"
+          class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${enabled ? "bg-emerald-600" : "bg-slate-600"}"
+          title="${enabled ? "Desactivar" : "Activar"}">
+          <span class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${enabled ? "translate-x-4" : "translate-x-0"}"></span>
+        </button>
+      </div>
+      <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs mb-3">
+        <span class="text-slate-500">Señales hoy</span>
+        <span class="font-mono text-slate-200">${s.signals_today ?? "—"}</span>
+        <span class="text-slate-500">Ejecutadas</span>
+        <span class="font-mono ${(s.executed_today || 0) > 0 ? "text-emerald-400" : "text-slate-200"}">
+          ${s.executed_today ?? "—"}
+          ${statusData.dry_run && (s.executed_today || 0) > 0 ? '<span class="text-slate-500 text-xs">(dry)</span>' : ""}
+        </span>
+        <span class="text-slate-500">Skip rate</span>
+        <span class="font-mono text-slate-200">${s.skip_rate != null ? (s.skip_rate * 100).toFixed(0) + "%" : "—"}</span>
+        <span class="text-slate-500">Mejor edge</span>
+        <span class="font-mono ${(s.best_edge_today || 0) > 0.03 ? "text-yellow-400" : "text-slate-200"}">
+          ${s.best_edge_today != null ? (s.best_edge_today * 100).toFixed(2) + "%" : "—"}
+        </span>
+      </div>
+      <div class="text-xs border-t border-slate-700 pt-2 mb-3 truncate">
+        <span class="${lastActionColor} font-mono">${s.last_action ?? "—"}</span>
+        ${s.last_ts ? '<span class="text-slate-500 ml-1">' + String(s.last_ts).substring(11, 19) + " UTC</span>" : ""}
+        ${s.last_reason ? '<p class="text-slate-500 truncate mt-0.5">' + String(s.last_reason) + "</p>" : ""}
+      </div>
+      <div class="flex items-center gap-2">
+        <button type="button" onclick="toggleLog('${def.slug}')"
+          class="text-xs px-2 py-1 border border-slate-600 rounded text-slate-400 hover:text-slate-200 hover:border-slate-500">
+          Ver log ↓
+        </button>
+        <select id="filter-${def.slug}" onchange="loadLog('${def.slug}')"
+          class="text-xs bg-slate-900 border border-slate-600 rounded px-1 py-1 text-slate-400">
+          <option value="">Todas</option>
+          <option value="SIGNAL">SIGNAL</option>
+          <option value="EXECUTED">EXECUTED</option>
+          <option value="QUOTE">QUOTE</option>
+          <option value="SKIP">SKIP</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+      </div>
+      <div id="log-${def.slug}" class="hidden mt-3">
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs text-left">
+            <thead>
+              <tr class="text-slate-500 border-b border-slate-700">
+                <th class="pb-1 pr-3 font-medium">Hora</th>
+                <th class="pb-1 pr-3 font-medium">Action</th>
+                <th class="pb-1 pr-3 font-medium">Reason</th>
+                <th class="pb-1 pr-3 font-medium">Edge</th>
+                <th class="pb-1 font-medium">Dry</th>
+              </tr>
+            </thead>
+            <tbody id="log-body-${def.slug}" class="divide-y divide-slate-800">
+              <tr><td colspan="5" class="text-slate-600 py-2">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+      }).join("");
+    }
+
+    const _logVisible = {};
+
+    async function toggleLog(slug) {
+      const el = document.getElementById("log-" + slug);
+      if (!el) return;
+      _logVisible[slug] = !_logVisible[slug];
+      el.classList.toggle("hidden", !_logVisible[slug]);
+      if (_logVisible[slug]) await loadLog(slug);
+    }
+
+    async function loadLog(slug) {
+      if (!_logVisible[slug]) return;
+      const sel = document.getElementById("filter-" + slug);
+      const filter = sel ? sel.value : "";
+      const url = "/api/arb/strategy/" + slug + "/log?limit=100&action=" + encodeURIComponent(filter);
+      let rows = [];
+      try {
+        const r = await fetch(url);
+        if (r.ok) rows = await r.json();
+      } catch (e) {}
+      const tbody = document.getElementById("log-body-" + slug);
+      if (!tbody) return;
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="text-slate-600 py-2 font-mono">sin datos</td></tr>';
+        return;
+      }
+      tbody.innerHTML = [...rows].reverse().map((row) => {
+        const color = actionColor(row.action);
+        const hora = (row.ts || "").substring(11, 19);
+        let edge = "—";
+        if (row.edge != null && row.edge !== "") {
+          const p = parseFloat(row.edge);
+          if (!Number.isNaN(p)) edge = (p * 100).toFixed(2) + "%";
+        }
+        const dr = row.dry_run === "True" || row.dry_run === true;
+        return `<tr class="hover:bg-slate-800/50">
+          <td class="py-1 pr-3 font-mono text-slate-500">${hora}</td>
+          <td class="py-1 pr-3 font-mono ${color}">${row.action || "—"}</td>
+          <td class="py-1 pr-3 text-slate-500 max-w-[140px] truncate" title="${String(row.reason || "").replace(/"/g, "'")}">${row.reason || "—"}</td>
+          <td class="py-1 pr-3 font-mono text-slate-300">${edge}</td>
+          <td class="py-1 font-mono ${dr ? "text-slate-500" : "text-orange-400"}">${dr ? "dry" : "REAL"}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    async function toggleStrategy(slug, currentlyEnabled) {
+      const path = currentlyEnabled ? "disable" : "enable";
+      await fetch("/api/arb/strategy/" + slug + "/" + path, { method: "POST" });
+      await refreshArbStatus();
+    }
+
+    async function arbStart() {
+      await fetch("/api/arb/start", { method: "POST" });
+      await refreshArbStatus();
+    }
+    async function arbStop() {
+      await fetch("/api/arb/stop", { method: "POST" });
+      await refreshArbStatus();
+    }
+
+    async function refreshArbStatus() {
+      let data = null;
+      try {
+        const r = await fetch("/api/arb/status");
+        if (r.ok) data = await r.json();
+      } catch (e) {}
+      if (!data) return;
+
+      const rb = document.getElementById("arb-running-badge");
+      if (rb) {
+        rb.textContent = data.engine_running ? "● RUNNING" : "STOPPED";
+        rb.className = "text-xs font-medium px-2 py-0.5 rounded-full " + (data.engine_running
+          ? "bg-emerald-900/60 text-emerald-200"
+          : "bg-slate-700 text-slate-400");
+      }
+      const db = document.getElementById("arb-dry-badge");
+      if (db) {
+        db.textContent = data.dry_run ? "DRY_RUN" : "LIVE";
+        db.className = "text-xs font-medium px-2 py-0.5 rounded-full " + (data.dry_run
+          ? "bg-emerald-900/60 text-emerald-200"
+          : "bg-red-900/60 text-red-200");
+      }
+      renderCards(data);
+      for (const slug of Object.keys(_logVisible)) {
+        if (_logVisible[slug]) await loadLog(slug);
+      }
+    }
+
+    function startArbLiveFeed() {
+      const feed = document.getElementById("live-feed");
+      if (!feed) return;
+      const es = new EventSource("/api/arb/signals/live");
+      es.onmessage = (e) => {
+        let d = {};
+        try { d = JSON.parse(e.data); } catch (err) { return; }
+        const color = actionColor(d.action);
+        const hora = (d.ts || "").substring(11, 19);
+        let edgeStr = "";
+        if (d.edge != null && d.edge !== "") {
+          const p = parseFloat(d.edge);
+          if (!Number.isNaN(p)) edgeStr = " edge=" + (p * 100).toFixed(2) + "%";
+        }
+        const line = document.createElement("p");
+        line.className = "font-mono";
+        line.innerHTML = '<span class="text-slate-500">' + hora + '</span> <span class="text-slate-400 mx-1">' + String(d.strategy || "").replace(/_/g, " ") + '</span> <span class="' + color + '">' + (d.action || "—") + "</span><span class=\"text-slate-500\">" + edgeStr + "</span>";
+        feed.prepend(line);
+        while (feed.children.length > 60) feed.removeChild(feed.lastChild);
+      };
+      es.onerror = () => {
+        const p = document.createElement("p");
+        p.className = "text-red-400 font-mono text-xs";
+        p.textContent = "SSE arb desconectado — reintentando…";
+        feed.prepend(p);
+      };
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      refreshArbStatus();
+      setInterval(refreshArbStatus, 8000);
+      startArbLiveFeed();
+    });
   </script>
 </body>
 </html>

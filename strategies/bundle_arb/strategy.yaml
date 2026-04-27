@@ -1,0 +1,12 @@
+slug: bundle_arb
+name: "Bundle Arbitrage"
+version: "1.0.0"
+status: active
+type: pure_math
+data_inputs:
+  - source: polymarket_clob
+    fields: [best_ask, best_bid, token_id, market_id, outcomes]
+    latency_target_ms: 500
+dependencies_external: none
+dry_run_default: true
+csv_log: logs/bundle_arb.csv

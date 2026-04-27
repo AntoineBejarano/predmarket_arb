@@ -1,0 +1,11 @@
+slug: combinatorial_arb
+name: "Combinatorial Arbitrage (Multi-Leg)"
+version: "1.0.0"
+status: experimental
+type: pure_math
+data_inputs:
+  - source: polymarket_clob
+    fields: [market_id, outcomes, best_ask, best_bid]
+dependencies_external: none
+dry_run_default: true
+csv_log: logs/combinatorial_arb.csv

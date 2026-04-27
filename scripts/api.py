@@ -6,6 +6,7 @@ API FastAPI: dashboard HTML + control del proceso validate_edge (subprocess).
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import logging
 import math
@@ -22,7 +23,7 @@ import numpy as np
 import pandas as pd
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -373,6 +374,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("Apagado API: deteniendo validate_edge…")
         supervisor.stop()
         log.info("validate_edge detenido")
+    ok_arb, err_arb = _arb_engine_stop()
+    if ok_arb:
+        log.info("arb_engine detenido")
+    elif err_arb and err_arb != "not_running":
+        log.warning("arb_engine stop: %s", err_arb)
 
 
 app = FastAPI(title="PredMarket Arb API", lifespan=lifespan)
@@ -501,6 +507,211 @@ async def _signals_sse_gen() -> AsyncIterator[str]:
 async def api_signals_live() -> StreamingResponse:
     return StreamingResponse(
         _signals_sse_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---- ARB ENGINE (subprocess + control plane) ----
+from risk.strategy_state import StrategyStateManager
+
+_arb_proc: Optional[subprocess.Popen[Any]] = None
+_arb_lock = threading.Lock()
+_state_manager = StrategyStateManager()
+
+STRATEGY_SLUGS = [
+    "bundle_arb",
+    "cross_exchange",
+    "market_maker",
+    "combinatorial_arb",
+    "term_structure",
+    "latency_arb",
+]
+ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SLUGS}
+
+
+def _read_arb_csv_tail(path: Path, n: int = 200) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    return rows[-n:]
+
+
+def _csv_stats_today(path: Path) -> dict[str, Any]:
+    today = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+    rows = _read_arb_csv_tail(path, n=5000)
+    today_rows = [r for r in rows if str(r.get("ts", "")).startswith(today)]
+
+    signals = [r for r in today_rows if r.get("action") == "SIGNAL"]
+    executed = [r for r in today_rows if r.get("action") == "EXECUTED"]
+    skips = [r for r in today_rows if str(r.get("action", "")).startswith("SKIP")]
+    errors = [r for r in today_rows if str(r.get("action", "")).startswith("ERROR")]
+
+    edges: list[float] = []
+    for r in today_rows:
+        try:
+            v = float(r["edge"])
+            edges.append(v)
+        except (KeyError, ValueError, TypeError):
+            pass
+
+    last = today_rows[-1] if today_rows else {}
+    return {
+        "total_today": len(today_rows),
+        "signals_today": len(signals),
+        "executed_today": len(executed),
+        "skips_today": len(skips),
+        "errors_today": len(errors),
+        "skip_rate": round(len(skips) / max(len(today_rows), 1), 3),
+        "avg_edge_today": round(sum(edges) / len(edges), 4) if edges else None,
+        "best_edge_today": round(max(edges), 4) if edges else None,
+        "last_action": last.get("action"),
+        "last_ts": last.get("ts"),
+        "last_reason": last.get("reason"),
+    }
+
+
+def _arb_engine_start() -> tuple[bool, Optional[int], Optional[str]]:
+    global _arb_proc
+    with _arb_lock:
+        if _arb_proc is not None and _arb_proc.poll() is None:
+            return False, _arb_proc.pid, "already_running"
+        cmd = [sys.executable, str(REPO_ROOT / "scripts" / "arb_engine.py")]
+        try:
+            _arb_proc = subprocess.Popen(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=os.environ.copy(),
+                stdout=None,
+                stderr=None,
+                start_new_session=True,
+            )
+            log.info("POST /api/arb/start -> arb_engine pid=%s", _arb_proc.pid)
+            return True, _arb_proc.pid, None
+        except OSError as e:
+            _arb_proc = None
+            log.error("POST /api/arb/start error: %s", e)
+            return False, None, str(e)
+
+
+def _arb_engine_stop() -> tuple[bool, Optional[str]]:
+    global _arb_proc
+    with _arb_lock:
+        if _arb_proc is None or _arb_proc.poll() is not None:
+            _arb_proc = None
+            return False, "not_running"
+        try:
+            _arb_proc.terminate()
+            try:
+                _arb_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                _arb_proc.kill()
+                _arb_proc.wait(timeout=5)
+        except OSError as e:
+            return False, str(e)
+        finally:
+            _arb_proc = None
+        log.info("POST /api/arb/stop -> arb_engine detenido")
+        return True, None
+
+
+@app.get("/api/arb/status")
+async def arb_status() -> dict[str, Any]:
+    state = await _state_manager.get_all()
+    strategies: list[dict[str, Any]] = []
+    for slug in STRATEGY_SLUGS:
+        stats = _csv_stats_today(ARB_CSV_PATHS[slug])
+        strategies.append(
+            {
+                "slug": slug,
+                "enabled": state.get(slug, {}).get("enabled", False),
+                **stats,
+            }
+        )
+    running = False
+    with _arb_lock:
+        if _arb_proc is not None and _arb_proc.poll() is None:
+            running = True
+    return {
+        "engine_running": running,
+        "dry_run": os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
+        "strategies": strategies,
+    }
+
+
+@app.post("/api/arb/start")
+async def arb_start() -> dict[str, Any]:
+    started, pid, err = await asyncio.to_thread(_arb_engine_start)
+    if started:
+        return {"started": True, "pid": pid}
+    if err == "already_running":
+        return JSONResponse({"started": False, "pid": pid, "error": err}, status_code=409)
+    return JSONResponse({"started": False, "pid": None, "error": err or "unknown"}, status_code=500)
+
+
+@app.post("/api/arb/stop")
+async def arb_stop() -> dict[str, Any]:
+    stopped, err = await asyncio.to_thread(_arb_engine_stop)
+    if stopped:
+        return {"stopped": True}
+    return JSONResponse({"stopped": False, "error": err or "not_running"}, status_code=400)
+
+
+@app.post("/api/arb/strategy/{slug}/enable")
+async def arb_strategy_enable(slug: str) -> dict[str, Any]:
+    if slug not in STRATEGY_SLUGS:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {slug}")
+    await _state_manager.enable(slug)
+    return {"slug": slug, "enabled": True}
+
+
+@app.post("/api/arb/strategy/{slug}/disable")
+async def arb_strategy_disable(slug: str) -> dict[str, Any]:
+    if slug not in STRATEGY_SLUGS:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {slug}")
+    await _state_manager.disable(slug)
+    return {"slug": slug, "enabled": False}
+
+
+@app.get("/api/arb/strategy/{slug}/log")
+async def arb_strategy_log(
+    slug: str,
+    limit: int = Query(200, ge=1, le=500),
+    action: str = Query("", description="Prefijo o código exacto de action"),
+) -> list[dict[str, Any]]:
+    if slug not in STRATEGY_SLUGS:
+        raise HTTPException(status_code=404, detail="Unknown strategy")
+    rows = _read_arb_csv_tail(ARB_CSV_PATHS[slug], n=max(limit, 500))
+    if action:
+        rows = [r for r in rows if str(r.get("action", "")).startswith(action)]
+    return rows[-limit:]
+
+
+async def _arb_signals_sse_gen(request: Request) -> AsyncIterator[str]:
+    prev_len = {slug: len(_read_arb_csv_tail(ARB_CSV_PATHS[slug], n=5000)) for slug in STRATEGY_SLUGS}
+    while True:
+        if await request.is_disconnected():
+            break
+        for slug in STRATEGY_SLUGS:
+            rows = _read_arb_csv_tail(ARB_CSV_PATHS[slug], n=5000)
+            n = len(rows)
+            if n > prev_len[slug]:
+                for row in rows[prev_len[slug] :]:
+                    payload = {"strategy": slug, **row}
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+                prev_len[slug] = n
+        await asyncio.sleep(3)
+
+
+@app.get("/api/arb/signals/live")
+async def arb_signals_live(request: Request) -> StreamingResponse:
+    return StreamingResponse(
+        _arb_signals_sse_gen(request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
