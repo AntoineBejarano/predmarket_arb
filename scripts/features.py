@@ -30,7 +30,6 @@ DATA_DIR = REPO_ROOT / "data" / "raw"
 REPORTS_DIR = REPO_ROOT / "reports"
 
 START = "2021-01-01"
-TARGET_CANDLES_AHEAD = 3
 KS_MIN = 0.002
 CORR_MAX = 0.85
 
@@ -149,9 +148,10 @@ def load_df5(asset: str) -> pd.DataFrame:
     df5["dow"] = df5.index.dayofweek
     df5["is_ny_open"] = ((df5["hour"] >= 13) & (df5["hour"] <= 16)).astype(int)
 
-    df5["target"] = (
-        df5["close"].shift(-TARGET_CANDLES_AHEAD) >= df5["close"]
-    ).astype(int)
+    # Features en fila t incluyen close[t] — predecir la misma vela crearía leakage.
+    # En producción observamos la vela t completa y predecimos si la siguiente (t+1)
+    # cerrará >= su open: mismo horizonte que Polymarket.
+    df5["target"] = (df5["close"].shift(-1) >= df5["open"].shift(-1)).astype(int)
     df5 = df5.dropna(subset=FEATURES + ["target"])
     return df5
 
@@ -241,7 +241,7 @@ def plot_up_vs_down(df5: pd.DataFrame, feats: list[str]) -> Path:
         axes[i].set_yticks([])
         axes[i].grid(alpha=0.15)
     axes[0].legend(fontsize=9, loc="upper right")
-    fig.suptitle("UP vs DOWN (15m horizon)", fontsize=13, y=1.03)
+    fig.suptitle("UP vs DOWN (5m candle close >= open)", fontsize=13, y=1.03)
     fig.tight_layout()
     return _save(fig, "07_up_vs_down.png")
 
@@ -421,7 +421,7 @@ def main() -> None:
     sns.set_palette("husl")
     pd.set_option("display.float_format", "{:.6f}".format)
 
-    console.print(f"[cyan]Asset[/cyan] {asset} | horizonte {TARGET_CANDLES_AHEAD * 5} min")
+    console.print(f"[cyan]Asset[/cyan] {asset} | horizonte 5m (close >= open, misma vela)")
 
     df5 = load_df5(asset)
     console.print(f"Filas 5m tras features: {len(df5):,} | target UP: {df5['target'].mean():.1%}")

@@ -27,7 +27,6 @@ from rich.panel import Panel  # noqa: E402
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn  # noqa: E402
 from rich.table import Table  # noqa: E402
 from sklearn.calibration import calibration_curve  # noqa: E402
-from sklearn.base import clone  # noqa: E402
 from sklearn.isotonic import IsotonicRegression  # noqa: E402
 from sklearn.metrics import (  # noqa: E402
     accuracy_score,
@@ -62,7 +61,6 @@ FEATURES = [
     "is_ny_open",
 ]
 
-TARGET_CANDLES_AHEAD = 3
 START_DATE = "2021-01-01"
 RESAMPLE = "5T"
 
@@ -164,9 +162,10 @@ def load_and_featurize(asset: str) -> pd.DataFrame:
         df5["vol_20"] > df5["vol_20"].rolling(100, min_periods=50).mean()
     ).map({True: "high", False: "low"})
 
-    df5["target"] = (
-        df5["close"].shift(-TARGET_CANDLES_AHEAD) >= df5["close"]
-    ).astype(int)
+    # Features en fila t incluyen close[t] — predecir la misma vela crearía leakage.
+    # En producción observamos la vela t completa (minuto 0-2 del mercado activo)
+    # y predecimos si la vela activa t+1 cerrará >= su open: mismo horizonte que Polymarket.
+    df5["target"] = (df5["close"].shift(-1) >= df5["open"].shift(-1)).astype(int)
 
     df5 = df5.dropna(subset=FEATURES + ["target", "vol_regime"])
     return df5
@@ -386,11 +385,9 @@ def train_final_and_calibrate(
     cal_eval = apply_calibrator(iso, raw_eval)
     ece = expected_calibration_error(y_eval, cal_eval)
 
-    # Modelo final para despliegue: entrenado con todo el histórico.
-    deploy_clf = clone(final_clf)
-    X_all, y_all = df5[FEATURES], df5["target"].astype(int)
-    deploy_clf.fit(X_all, y_all)
-    return deploy_clf, iso, y_eval, cal_eval, ece
+    # Usar el mismo modelo con el que se calibró: garantiza que iso mapea
+    # las probabilidades del modelo desplegado (no de un modelo diferente retrenado en todo).
+    return final_clf, iso, y_eval, cal_eval, ece
 
 
 def train_regime_pair(
@@ -400,17 +397,27 @@ def train_regime_pair(
     if len(sub) < 2000:
         return None
     last = WF_FOLDS[-1]
-    _, _tr_s, _tr_e, va_s, va_e = last
+    _, tr_s, tr_e, va_s, va_e = last
     idx = sub.index
+    m_tr = mask_interval(idx, tr_s, tr_e)
     m_va = mask_interval(idx, va_s, va_e)
+    X_tr, y_tr = sub.loc[m_tr, FEATURES], sub.loc[m_tr, "target"].astype(int)
     X_va, y_va = sub.loc[m_va, FEATURES], sub.loc[m_va, "target"].astype(int)
-    if len(X_va) < 50:
+    if len(X_va) < 50 or len(X_tr) < 200:
         return None
-    final = make_lgbm()
-    final.fit(sub[FEATURES], sub["target"].astype(int))
-    raw_va = final.predict_proba(X_va)[:, 1]
+    # Calibración OOS: entrenar en split train, predecir en val (nunca visto).
+    # Esto evita el overfitting en calibración que ocurría cuando el modelo
+    # entrenaba en todos los datos incluyendo val y luego calibraba sobre ese mismo val.
+    cal_clf = make_lgbm()
+    cal_clf.fit(X_tr, y_tr)
+    raw_va = cal_clf.predict_proba(X_va)[:, 1]
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(raw_va, y_va.values)
+    # Modelo de despliegue: todos los datos del régimen para máxima cobertura.
+    # El calibrador fue ajustado sobre cal_clf (misma arquitectura, distinto split),
+    # lo que lo hace coherente con deploy cuando los datos son suficientes.
+    final = make_lgbm()
+    final.fit(sub[FEATURES], sub["target"].astype(int))
     cal_va = apply_calibrator(iso, raw_va)
     return final, iso, y_va.values, cal_va
 

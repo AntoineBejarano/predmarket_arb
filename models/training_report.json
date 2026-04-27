@@ -1,64 +1,64 @@
 {
-  "trained_at": "2026-04-27T07:19:39.678440+00:00",
+  "trained_at": "2026-04-27T08:38:56.714647+00:00",
   "assets": {
     "BTCUSDT": {
-      "wf_accuracy_mean": 0.5285870584015387,
-      "wf_accuracy_std": 0.00779390628039233,
-      "edge": 0.02858705840153868,
-      "brier_score": 0.24888741016316024,
-      "ece": 0.003070283834031101,
+      "wf_accuracy_mean": 0.5229546274013701,
+      "wf_accuracy_std": 0.006907629205353761,
+      "edge": 0.022954627401369977,
+      "brier_score": 0.2492944837315192,
+      "ece": 0.004734481871975014,
       "best_features": [
-        "ret_48",
-        "atr_5",
-        "hour"
-      ]
-    },
-    "ETHUSDT": {
-      "wf_accuracy_mean": 0.5288813574305922,
-      "wf_accuracy_std": 0.005558416884833988,
-      "edge": 0.02888135743059206,
-      "brier_score": 0.2489159156883852,
-      "ece": 0.005799534362194647,
-      "best_features": [
-        "ret_48",
-        "atr_5",
-        "vol_10"
-      ]
-    },
-    "SOLUSDT": {
-      "wf_accuracy_mean": 0.5185448694944355,
-      "wf_accuracy_std": 0.010147556539037065,
-      "edge": 0.0185448694944355,
-      "brier_score": 0.2496343403821022,
-      "ece": 0.005652807410874608,
-      "best_features": [
-        "atr_5",
-        "vol_10",
-        "ret_48"
-      ]
-    },
-    "XRPUSDT": {
-      "wf_accuracy_mean": 0.534880592732233,
-      "wf_accuracy_std": 0.008959490158068512,
-      "edge": 0.03488059273223294,
-      "brier_score": 0.24841081533732812,
-      "ece": 0.007298271847011425,
-      "best_features": [
-        "hour",
-        "vol_10",
+        "ret_6",
+        "ret_3",
         "atr_5"
       ]
     },
-    "BNBUSDT": {
-      "wf_accuracy_mean": 0.5381823392413941,
-      "wf_accuracy_std": 0.013046896331419389,
-      "edge": 0.038182339241394116,
-      "brier_score": 0.24796611251854106,
-      "ece": 0.007795426376097766,
+    "ETHUSDT": {
+      "wf_accuracy_mean": 0.5228952985134685,
+      "wf_accuracy_std": 0.005694315047316152,
+      "edge": 0.022895298513468408,
+      "brier_score": 0.24926056248665582,
+      "ece": 0.004115360683111371,
       "best_features": [
         "atr_5",
-        "vol_10",
+        "ret_6",
         "ret_48"
+      ]
+    },
+    "SOLUSDT": {
+      "wf_accuracy_mean": 0.523562396605149,
+      "wf_accuracy_std": 0.013353530179386374,
+      "edge": 0.02356239660514896,
+      "brier_score": 0.24917328395937616,
+      "ece": 0.005400517752157245,
+      "best_features": [
+        "atr_5",
+        "ret_1",
+        "ret_3"
+      ]
+    },
+    "XRPUSDT": {
+      "wf_accuracy_mean": 0.5418082546151111,
+      "wf_accuracy_std": 0.01558789453349492,
+      "edge": 0.04180825461511102,
+      "brier_score": 0.24780143482415565,
+      "ece": 0.0020674716259268056,
+      "best_features": [
+        "atr_5",
+        "ret_1",
+        "ret_3"
+      ]
+    },
+    "BNBUSDT": {
+      "wf_accuracy_mean": 0.5468333585466263,
+      "wf_accuracy_std": 0.017994320391657756,
+      "edge": 0.0468333585466262,
+      "brier_score": 0.24733181261708767,
+      "ece": 0.009650177059370567,
+      "best_features": [
+        "atr_5",
+        "ret_6",
+        "vol_zscore"
       ]
     }
   }

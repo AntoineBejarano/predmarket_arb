@@ -363,6 +363,7 @@ def fetch_real_5m_ohlcv(symbol: str, session: requests.Session) -> list[dict[str
         for c in raw:
             out.append(
                 {
+                    "open_time": float(c[0]),  # ms epoch — used to anchor window_open
                     "open": float(c[1]),
                     "high": float(c[2]),
                     "low": float(c[3]),
@@ -1138,7 +1139,21 @@ def run_main(hours: float | None, threshold: float) -> None:
                                 log.debug("Sin precio aún para %s", asset)
                                 continue
                             if cid not in window_open:
-                                window_open[cid] = float(px)
+                                # Anchor to the 5m candle that opened this window so that
+                                # window_return is correct even when first observed at min 3+.
+                                win_open_ms = float(start_dt.timestamp() * 1000)
+                                anchor: float | None = None
+                                for _c in reversed(candles):
+                                    if _c.get("open_time") == win_open_ms:
+                                        anchor = float(_c["open"])
+                                        break
+                                window_open[cid] = anchor if anchor is not None else float(px)
+                                if anchor is None:
+                                    log.debug(
+                                        "window_open %s: sin vela OHLCV para ts=%.0f, usando spot",
+                                        cid,
+                                        win_open_ms,
+                                    )
                             w0 = window_open[cid]
                             window_return = (float(px) - w0) / w0 if w0 else float("nan")
                             VOL_PER_MIN: dict[str, float] = {
@@ -1201,7 +1216,7 @@ def run_main(hours: float | None, threshold: float) -> None:
                             if (
                                 np.isfinite(gap_nearres)
                                 and abs(gap_nearres) > SIGNAL_THRESHOLD
-                                and minutes_elapsed >= 3
+                                and minutes_elapsed >= 1
                                 and nr_key not in fired_signals
                             ):
                                 fired_signals.add(nr_key)

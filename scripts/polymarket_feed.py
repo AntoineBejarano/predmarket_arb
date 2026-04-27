@@ -376,7 +376,7 @@ def clob_market_ws_bundle(
                     bids = data.get("bids", [])
                     asks = data.get("asks", [])
                     if bids and asks and asset_id:
-                        mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                        mid = (float(bids[0]["price"]) + float(asks[0]["price"])) / 2.0
                         with tick_lock:
                             is_first = asset_id not in market_prices
                             market_prices[asset_id] = mid
