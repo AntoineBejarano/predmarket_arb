@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
 Diagnóstico one-shot: un mercado Polymarket 5m activo (por slug) y muestra todos los campos.
-Ejecutar en local: python scripts/debug_markets.py
+
+Prueba local (desde la raíz del repo, con el venv que tenga ``requests``)::
+
+    python scripts/debug_markets.py
+
+En la salida, revisa la sección **WINDOW TIMING (validate_edge)**:
+
+- ``events[0]["startTime"]`` → apertura de la ventana 5m (p. ej. ``2026-04-27T06:00:00Z``).
+- ``endDate`` → cierre (p. ej. ``2026-04-27T06:05:00Z``).
+- La diferencia debe ser **300 s (5 min)** para alinear el cálculo de ``minutes_elapsed`` con ``validate_edge.py``.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +31,72 @@ from scripts import polymarket_feed  # noqa: E402
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 ASSETS = ["BTC", "ETH", "SOL", "XRP", "BNB"]
+
+# Tolerancia en segundos: cierre − apertura ≈ 300 s (ventana 5m).
+_WINDOW_LEN_SEC = 300.0
+_WINDOW_TOLERANCE_SEC = 1.0
+
+
+def _parse_iso_utc(value: Any) -> datetime | None:
+    if value is None or not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def window_timing_check(m: dict[str, Any]) -> dict[str, Any]:
+    """
+    Misma lógica de ventana que ``validate_edge``: inicio en ``events[0]['startTime']``
+    (o ``eventStartTime``), cierre en ``endDate``. Comprueba Δ ≈ 5 min.
+    """
+    events = m.get("events") or []
+    start_s: Any = None
+    if events and isinstance(events, list) and len(events) > 0:
+        ev0 = events[0]
+        if isinstance(ev0, dict):
+            start_s = ev0.get("startTime")
+    if not start_s:
+        start_s = m.get("eventStartTime")
+    end_s = m.get("endDate")
+
+    out: dict[str, Any] = {
+        "events_0_startTime": start_s,
+        "endDate": end_s,
+        "delta_seconds": None,
+        "delta_minutes": None,
+        "ok_exact_5min": False,
+        "fallback_start_derived": False,
+    }
+
+    start_dt = _parse_iso_utc(start_s)
+    end_dt = _parse_iso_utc(end_s)
+
+    if start_dt is None and end_dt is not None:
+        try:
+            start_dt = end_dt - timedelta(minutes=5)
+            start_s = start_dt.isoformat().replace("+00:00", "Z")
+            out["events_0_startTime"] = start_s
+            out["fallback_start_derived"] = True
+        except Exception:
+            start_dt = None
+
+    if start_dt is None or end_dt is None:
+        out["note"] = "Falta start parseable o endDate"
+        return out
+
+    delta_sec = (end_dt - start_dt).total_seconds()
+    out["delta_seconds"] = round(delta_sec, 3)
+    out["delta_minutes"] = round(delta_sec / 60.0, 4)
+    out["ok_exact_5min"] = abs(delta_sec - _WINDOW_LEN_SEC) <= _WINDOW_TOLERANCE_SEC
+    return out
 
 
 def _json_safe(obj: Any) -> Any:
@@ -60,6 +135,7 @@ def run_polymarket_market_debug(
         "window_ts": None,
         "first_market": None,
         "date_fields": {},
+        "window_timing": None,
     }
 
     try:
@@ -75,6 +151,21 @@ def run_polymarket_market_debug(
 
         if markets:
             m = markets[0]
+            wt = window_timing_check(m)
+            slug_section["window_timing"] = _json_safe(wt)
+            emit("WINDOW TIMING (validate_edge)")
+            emit(f"  events[0][\"startTime\"] = {wt.get('events_0_startTime')!r}")
+            emit(f"  endDate                 = {wt.get('endDate')!r}")
+            if wt.get("fallback_start_derived"):
+                emit("  (inicio derivado de endDate − 5 min; faltaba startTime en events)")
+            ds = wt.get("delta_seconds")
+            if ds is not None:
+                mark = "OK (5 min)" if wt.get("ok_exact_5min") else "NO coincide con 5 min"
+                emit(f"  delta                   = {ds} s ({wt.get('delta_minutes')} min)  → {mark}")
+            else:
+                emit(f"  delta                   = —  ({wt.get('note', 'sin fechas')})")
+            emit()
+
             slug_section["first_market"] = _json_safe(m)
             emit("FIRST MARKET — ALL KEYS:")
             emit(json.dumps(m, indent=2, default=str))

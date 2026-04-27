@@ -959,9 +959,32 @@ def run_main(hours: float | None, threshold: float) -> None:
                             asset = va if isinstance(va, str) and va in ASSET_MAP else parse_asset_from_question(q)
                             if asset is None or asset not in ASSET_MAP:
                                 continue
-                            start_s = m.get("startDateIso") or m.get("start_date_iso") or m.get("startDate")
-                            end_s = m.get("endDateIso") or m.get("end_date_iso") or m.get("endDate")
-                            if not start_s or not end_s:
+                            # endDate is the window close (correct)
+                            end_s = m.get("endDate")
+
+                            # startTime inside events[0] is the window open (correct)
+                            start_s = None
+                            events = m.get("events") or []
+                            if events and isinstance(events, list) and len(events) > 0:
+                                start_s = events[0].get("startTime")
+
+                            # Also try eventStartTime at top level as fallback
+                            if not start_s:
+                                start_s = m.get("eventStartTime")
+
+                            # Last fallback: derive from endDate - 5 minutes
+                            if not start_s and end_s:
+                                from datetime import timedelta
+
+                                try:
+                                    end_tmp = pd.Timestamp(end_s)
+                                    if end_tmp.tzinfo is None:
+                                        end_tmp = end_tmp.tz_localize("UTC")
+                                    start_s = (end_tmp - timedelta(minutes=5)).isoformat()
+                                except Exception:
+                                    pass
+
+                            if not end_s:
                                 continue
                             start_dt = pd.Timestamp(start_s).to_pydatetime()
                             if start_dt.tzinfo is None:
