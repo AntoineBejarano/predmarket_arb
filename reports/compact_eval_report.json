@@ -1,0 +1,58 @@
+{
+  "generated_at": "2026-04-27T11:36:12.077749+00:00",
+  "assets": [
+    {
+      "asset": "BTCUSDT",
+      "rows": 26496,
+      "majority": 0.5014341787439613,
+      "baseline_mean": 0.5094202898550725,
+      "baseline_std": 0.004016778668232158,
+      "compact_mean": 0.5106884057971015,
+      "compact_std": 0.0067044284388030765,
+      "delta_vs_baseline": 0.0012681159420290244
+    },
+    {
+      "asset": "ETHUSDT",
+      "rows": 26496,
+      "majority": 0.5057744565217391,
+      "baseline_mean": 0.5196105072463768,
+      "baseline_std": 0.009486684225204395,
+      "compact_mean": 0.5171195652173913,
+      "compact_std": 0.005770858853694392,
+      "delta_vs_baseline": -0.0024909420289854767
+    },
+    {
+      "asset": "SOLUSDT",
+      "rows": 26496,
+      "majority": 0.511850845410628,
+      "baseline_mean": 0.5148097826086956,
+      "baseline_std": 0.00657498892897081,
+      "compact_mean": 0.5161231884057971,
+      "compact_std": 0.00714575749581778,
+      "delta_vs_baseline": 0.0013134057971014856
+    },
+    {
+      "asset": "XRPUSDT",
+      "rows": 26496,
+      "majority": 0.5253623188405797,
+      "baseline_mean": 0.525090579710145,
+      "baseline_std": 0.010451462049335707,
+      "compact_mean": 0.526947463768116,
+      "compact_std": 0.008226064088145257,
+      "delta_vs_baseline": 0.00185688405797102
+    },
+    {
+      "asset": "BNBUSDT",
+      "rows": 26496,
+      "majority": 0.5270229468599034,
+      "baseline_mean": 0.5199728260869565,
+      "baseline_std": 0.0049888784892128096,
+      "compact_mean": 0.515625,
+      "compact_std": 0.003160569985936219,
+      "delta_vs_baseline": -0.004347826086956497
+    }
+  ],
+  "valid_assets": 5,
+  "compact_wins": 3,
+  "decision": "GO_CANDIDATE"
+}

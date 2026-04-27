@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-04-27T10:45:34.875764+00:00",
+  "baseline_target": "close[t+1] >= open[t+1]",
+  "assets": [
+    {
+      "asset": "BTCUSDT",
+      "rows": 51841,
+      "target_up_rate": 0.5029802665843637,
+      "majority_baseline_acc": 0.5029802665843637,
+      "saved_model_acc": 0.5143997993865859,
+      "saved_model_edge_vs_majority": 0.011419532802222188
+    },
+    {
+      "asset": "ETHUSDT",
+      "rows": 51841,
+      "target_up_rate": 0.5051021392334253,
+      "majority_baseline_acc": 0.5051021392334253,
+      "saved_model_acc": 0.5215948766420401,
+      "saved_model_edge_vs_majority": 0.016492737408614788
+    },
+    {
+      "asset": "SOLUSDT",
+      "rows": 51841,
+      "target_up_rate": 0.5113905981751895,
+      "majority_baseline_acc": 0.5113905981751895,
+      "saved_model_acc": 0.5176018981115333,
+      "saved_model_edge_vs_majority": 0.006211299936343839
+    },
+    {
+      "asset": "XRPUSDT",
+      "rows": 51841,
+      "target_up_rate": 0.5309311162979109,
+      "majority_baseline_acc": 0.5309311162979109,
+      "saved_model_acc": 0.5358885823961729,
+      "saved_model_edge_vs_majority": 0.004957466098261976
+    },
+    {
+      "asset": "BNBUSDT",
+      "rows": 51841,
+      "target_up_rate": 0.531316911325013,
+      "majority_baseline_acc": 0.531316911325013,
+      "saved_model_acc": 0.5304488725140333,
+      "saved_model_edge_vs_majority": -0.0008680388109797432
+    }
+  ]
+}

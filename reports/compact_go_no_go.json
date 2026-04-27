@@ -1,0 +1,7 @@
+{
+  "decision": "NO-GO",
+  "reason": "sin mejora consistente frente a baseline",
+  "valid_assets": 5,
+  "wins": 3,
+  "mean_delta_vs_baseline": -0.00048007246376808866
+}
