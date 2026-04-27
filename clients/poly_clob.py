@@ -87,7 +87,113 @@ class PolyCLOBClient:
             out = dict(data)
             out["best_bid"] = best_bid
             out["best_ask"] = best_ask
+            if best_ask is not None:
+                sz = _size_at_price(asks, best_ask)
+                out["best_ask_size"] = sz
+                if sz is not None:
+                    out["best_ask_notional_usdc"] = float(best_ask) * float(sz)
+                else:
+                    out["best_ask_notional_usdc"] = None
+            else:
+                out["best_ask_size"] = None
+                out["best_ask_notional_usdc"] = None
             return out
+
+    async def get_midpoint(self, token_id: str) -> Optional[float]:
+        """GET /midpoint?token_id=… — precio medio CLOB (público)."""
+        sess = self._require_session()
+        url = f"{CLOB_REST}/midpoint"
+        async with sess.get(url, params={"token_id": token_id}) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                return None
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(data, dict):
+                return None
+            mid = data.get("mid")
+            if mid is None:
+                return None
+            try:
+                return float(mid)
+            except (TypeError, ValueError):
+                return None
+
+    async def get_price(self, token_id: str, side: str = "buy") -> Optional[float]:
+        """GET /price?token_id=…&side=buy|sell (público)."""
+        sess = self._require_session()
+        url = f"{CLOB_REST}/price"
+        s = side.strip().lower()
+        if s not in ("buy", "sell"):
+            s = "buy"
+        async with sess.get(url, params={"token_id": token_id, "side": s}) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                return None
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(data, dict):
+                return None
+            px = data.get("price") or data.get("p")
+            if px is None:
+                return None
+            try:
+                return float(px)
+            except (TypeError, ValueError):
+                return None
+
+    async def get_open_orders(
+        self,
+        next_cursor: str = "MA==",
+        market: str = "",
+        asset_id: str = "",
+        order_id: str = "",
+    ) -> dict[str, Any]:
+        """
+        GET /data/orders — órdenes abiertas (L2). Requiere credenciales en env + private_key.
+        Devuelve JSON con ``data`` y ``next_cursor`` como el CLOB.
+        """
+        secret, passphrase = self._live_secrets()
+        if not self.private_key or not self.api_key or not secret or not passphrase:
+            raise RuntimeError("Credenciales incompletas para get_open_orders")
+        from eth_account import Account
+
+        signer_addr = Account.from_key(self.private_key).address
+        request_path = "/data/orders"
+        headers = build_l2_headers(
+            signer_addr,
+            self.api_key,
+            secret,
+            passphrase,
+            "GET",
+            request_path,
+            None,
+        )
+        req_headers = {**_DEFAULT_HEADERS, **headers}
+        sess = self._require_session()
+        params: dict[str, str] = {}
+        if next_cursor:
+            params["next_cursor"] = next_cursor
+        if market:
+            params["market"] = market
+        if asset_id:
+            params["asset_id"] = asset_id
+        if order_id:
+            params["id"] = order_id
+        url = f"{CLOB_REST}{request_path}"
+        async with sess.get(url, headers=req_headers, params=params or None) as resp:
+            text = await resp.text()
+            try:
+                out = json.loads(text)
+            except json.JSONDecodeError:
+                return {"error": f"HTTP {resp.status}", "raw": text[:500], "data": []}
+            if resp.status != 200:
+                return {"error": f"HTTP {resp.status}", "raw": text[:500], "data": []}
+            return out if isinstance(out, dict) else {"data": []}
 
     async def get_market(self, market_id: str) -> dict[str, Any]:
         """GET /markets/{condition_id} — metadata de un mercado."""
@@ -346,6 +452,35 @@ class PolyCLOBClient:
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+
+def _level_size(lvl: Any) -> Optional[float]:
+    if isinstance(lvl, dict):
+        raw = lvl.get("size")
+    elif isinstance(lvl, (list, tuple)) and len(lvl) > 1:
+        raw = lvl[1]
+    else:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _size_at_price(levels: list, target_price: float) -> Optional[float]:
+    """Suma tamaños en niveles cuyo precio coincide con target (tolerancia float)."""
+    eps = 1e-9
+    total = 0.0
+    found = False
+    for lvl in levels:
+        p = _level_price(lvl)
+        if p is None or abs(p - target_price) > eps:
+            continue
+        sz = _level_size(lvl)
+        if sz is not None:
+            total += sz
+            found = True
+    return total if found else None
 
 
 def _best_price_side(levels: list, is_bid: bool) -> Optional[float]:

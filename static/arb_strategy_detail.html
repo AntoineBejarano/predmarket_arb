@@ -227,7 +227,7 @@
       es.onerror = () => es.close();
     }
 
-    const PREFERRED_ORDER = ["ts", "action", "reason", "edge", "size_usdc", "fict_stake_eur", "fict_pnl_est_eur", "fict_pnl_cum_eur", "fict_roi", "market_id", "n_outcomes", "sum_ask", "gas_est", "dry_run"];
+    const PREFERRED_ORDER = ["ts", "action", "reason", "edge", "edge_gross", "size_usdc", "fict_stake_eur", "fict_pnl_est_eur", "fict_pnl_cum_eur", "fict_roi", "market_id", "n_outcomes", "sum_ask", "execution_buffer_est", "fees_est", "order_ids", "mid_dev_max", "dry_run"];
 
     async function loadLog() {
       const tbody = document.getElementById("log-body");
