@@ -11,8 +11,11 @@ Estrategia 1 del RUNBOOK strategies/bundle_arb/RUNBOOK.md:
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from clients.poly_clob import PolyCLOBClient
@@ -39,6 +42,23 @@ def _outcome_priority(n: int) -> int:
     if n == 4:
         return 1
     return 2
+
+
+def _market_mini(m: dict[str, Any]) -> dict[str, Any]:
+    q = m.get("question") or m.get("title") or m.get("description") or ""
+    return {
+        "condition_id": str(m.get("condition_id", "")),
+        "question": str(q)[:160],
+        "n_tokens": len(_market_token_ids(m)),
+        "accepting_orders": bool(m.get("accepting_orders")),
+        "closed": bool(m.get("closed")),
+        "enable_order_book": bool(m.get("enable_order_book")),
+    }
+
+
+def _bundle_scan_path() -> Path:
+    base = Path(os.getenv("DATA_DIR", ".")).resolve()
+    return base / "logs" / "bundle_arb_scan.json"
 
 
 class BundleArbStrategy(ArbStrategy):
@@ -156,6 +176,13 @@ class BundleArbStrategy(ArbStrategy):
                     return str(v)
         return None
 
+    def _persist_scan_diag(self, diag: dict[str, Any]) -> None:
+        """Escribe diagnóstico del último ciclo para la UI (`/api/arb/strategy/bundle_arb/scan`)."""
+        diag = {**diag, "updated_at": datetime.now(timezone.utc).isoformat(), "slug": self.slug}
+        p = _bundle_scan_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(diag, indent=2, ensure_ascii=False), encoding="utf-8")
+
     async def run_once(self) -> None:
         empty = self._empty_row()
         if self._breaker:
@@ -168,6 +195,12 @@ class BundleArbStrategy(ArbStrategy):
                         **empty,
                     }
                 )
+                self._persist_scan_diag(
+                    {
+                        "outcome": "SKIP:CIRCUIT_BREAKER",
+                        "help": "Circuit breaker de drawdown; no se llamó al CLOB.",
+                    }
+                )
                 return
 
         best: Optional[dict[str, Any]] = None
@@ -177,6 +210,15 @@ class BundleArbStrategy(ArbStrategy):
         skipped_gas = 0
         skipped_depth = 0
         skipped_mid = 0
+        pages_fetched = 0
+        markets_raw_total = 0
+        skip_not_accepting = 0
+        skip_closed = 0
+        skip_no_orderbook = 0
+        skip_outcomes = 0
+        skip_bad_book = 0
+        eligible_samples: list[dict[str, Any]] = []
+        _MAX_ELIGIBLE_SAMPLE = 12
 
         try:
             async with PolyCLOBClient(
@@ -199,8 +241,17 @@ class BundleArbStrategy(ArbStrategy):
                                 **empty,
                             }
                         )
+                        self._persist_scan_diag(
+                            {
+                                "outcome": "ERROR:API_TIMEOUT",
+                                "pages_fetched": pages_fetched,
+                                "markets_raw_total": markets_raw_total,
+                                "help": "Timeout en GET /markets; revisa red o sube timeout.",
+                            }
+                        )
                         return
 
+                    pages_fetched += 1
                     markets = list(page.get("data") or [])
                     markets.sort(
                         key=lambda m: (
@@ -210,21 +261,30 @@ class BundleArbStrategy(ArbStrategy):
                     )
 
                     for m in markets:
+                        markets_raw_total += 1
                         if not m.get("accepting_orders"):
+                            skip_not_accepting += 1
                             continue
                         if m.get("closed"):
+                            skip_closed += 1
                             continue
                         if not m.get("enable_order_book"):
+                            skip_no_orderbook += 1
                             continue
 
                         token_ids = _market_token_ids(m)
                         n = len(token_ids)
                         if n < self.min_outcomes or n > self.max_outcomes:
+                            skip_outcomes += 1
                             continue
+
+                        if len(eligible_samples) < _MAX_ELIGIBLE_SAMPLE:
+                            eligible_samples.append(_market_mini(m))
 
                         asks, noms, _book_err = await self._legs_snapshot(poly, token_ids)
                         scanned_books += 1
                         if asks is None:
+                            skip_bad_book += 1
                             continue
 
                         execution_buffer_est = self.gas_per_leg * n
@@ -334,6 +394,31 @@ class BundleArbStrategy(ArbStrategy):
                             row["reason"] = str(e)[:200]
                             row["order_ids"] = ""
                     await self.log_signal_async(row)
+                    self._persist_scan_diag(
+                        {
+                            "outcome": row.get("action", ""),
+                            "pages_fetched": pages_fetched,
+                            "markets_raw_total": markets_raw_total,
+                            "scanned_books": scanned_books,
+                            "skip_not_accepting": skip_not_accepting,
+                            "skip_closed": skip_closed,
+                            "skip_no_orderbook": skip_no_orderbook,
+                            "skip_outcomes": skip_outcomes,
+                            "skip_bad_book": skip_bad_book,
+                            "skip_high_buffer": skipped_gas,
+                            "skip_insufficient_depth": skipped_depth,
+                            "skip_mid": skipped_mid,
+                            "best_edge_net": best_edge_net,
+                            "min_edge": self.min_edge,
+                            "max_size_usdc": self.max_size,
+                            "eligible_sample": eligible_samples,
+                            "best_market": best_meta.get("market_id") if best_meta else None,
+                            "help": (
+                                "Último ciclo encontró oportunidad que pasó filtros (libro, profundidad, fees, mid opcional). "
+                                "Ver contadores para el universo escaneado en GET /markets."
+                            ),
+                        }
+                    )
                     return
 
                 if best_edge_net > -1e8 and best_edge_net <= self.min_edge and best_meta is not None:
@@ -357,6 +442,30 @@ class BundleArbStrategy(ArbStrategy):
                             "mid_dev_max": best_meta.get("mid_dev_max", ""),
                         }
                     )
+                    self._persist_scan_diag(
+                        {
+                            "outcome": "SKIP:LOW_EDGE",
+                            "pages_fetched": pages_fetched,
+                            "markets_raw_total": markets_raw_total,
+                            "scanned_books": scanned_books,
+                            "skip_not_accepting": skip_not_accepting,
+                            "skip_closed": skip_closed,
+                            "skip_no_orderbook": skip_no_orderbook,
+                            "skip_outcomes": skip_outcomes,
+                            "skip_bad_book": skip_bad_book,
+                            "skip_high_buffer": skipped_gas,
+                            "skip_insufficient_depth": skipped_depth,
+                            "skip_mid": skipped_mid,
+                            "best_edge_net": best_edge_net,
+                            "min_edge": self.min_edge,
+                            "best_market": best_meta.get("market_id"),
+                            "eligible_sample": eligible_samples,
+                            "help": (
+                                "Había al menos un mercado con libro válido pero el mejor edge_net "
+                                f"({best_edge_net:.4f}) no superó BUNDLE_MIN_EDGE ({self.min_edge})."
+                            ),
+                        }
+                    )
                     return
 
                 await self.log_signal_async(
@@ -365,9 +474,44 @@ class BundleArbStrategy(ArbStrategy):
                         "reason": (
                             f"no bundle candidate in {self.max_pages} pages "
                             f"(book_ok={scanned_books}, skip_high_buffer={skipped_gas}, "
-                            f"skip_insufficient_depth={skipped_depth}, skip_mid={skipped_mid})"
+                            f"skip_insufficient_depth={skipped_depth}, skip_mid={skipped_mid}; "
+                            f"raw={markets_raw_total}, !accepting={skip_not_accepting}, closed={skip_closed}, "
+                            f"!orderbook={skip_no_orderbook}, outcomes={skip_outcomes}, bad_book={skip_bad_book})"
                         ),
                         **empty,
+                    }
+                )
+                self._persist_scan_diag(
+                    {
+                        "outcome": "SKIP:NO_MARKETS",
+                        "pages_fetched": pages_fetched,
+                        "markets_raw_total": markets_raw_total,
+                        "scanned_books": scanned_books,
+                        "skip_not_accepting": skip_not_accepting,
+                        "skip_closed": skip_closed,
+                        "skip_no_orderbook": skip_no_orderbook,
+                        "skip_outcomes": skip_outcomes,
+                        "skip_bad_book": skip_bad_book,
+                        "skip_high_buffer": skipped_gas,
+                        "skip_insufficient_depth": skipped_depth,
+                        "skip_mid": skipped_mid,
+                        "best_edge_net": None if best_edge_net < -1e8 else best_edge_net,
+                        "min_edge": self.min_edge,
+                        "max_size_usdc": self.max_size,
+                        "mid_max_dev": self.mid_max_dev,
+                        "eligible_sample": eligible_samples,
+                        "params": {
+                            "max_pages": self.max_pages,
+                            "min_outcomes": self.min_outcomes,
+                            "max_outcomes": self.max_outcomes,
+                        },
+                        "help": (
+                            "Origen de datos: CLOB https://clob.polymarket.com/markets (paginación). "
+                            "Cada fila `markets.data[]` es un mercado; bundle solo considera los que pasan filtros "
+                            "(ver contadores). Luego GET /book por token para sumar best_ask y comprobar profundidad "
+                            f"≥ size_usdc/n ({self.max_size} USDC / n piernas). "
+                            "Si casi todo cae en skip_insufficient_depth, baja BUNDLE_MAX_SIZE_USDC o asume poco liquidez al mejor ask."
+                        ),
                     }
                 )
         except Exception as e:
@@ -376,5 +520,14 @@ class BundleArbStrategy(ArbStrategy):
                     "action": "ERROR:API_ERROR",
                     "reason": str(e)[:200],
                     **empty,
+                }
+            )
+            self._persist_scan_diag(
+                {
+                    "outcome": "ERROR:API_ERROR",
+                    "error": str(e)[:300],
+                    "pages_fetched": pages_fetched,
+                    "markets_raw_total": markets_raw_total,
+                    "eligible_sample": eligible_samples,
                 }
             )

@@ -63,6 +63,7 @@ STRATEGY_SLUGS = [
     "latency_arb",
 ]
 ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SLUGS}
+BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
 
 
 def signals_path() -> Path:
@@ -721,6 +722,30 @@ async def arb_strategy_log(
     if action:
         rows = [r for r in rows if str(r.get("action", "")).startswith(action)]
     return rows[-limit:]
+
+
+@app.get("/api/arb/strategy/{slug}/scan")
+async def arb_strategy_scan(slug: str) -> dict[str, Any]:
+    """
+    Diagnóstico del último ciclo de escaneo CLOB (solo ``bundle_arb``).
+    Generado en ``data/logs/bundle_arb_scan.json`` al terminar cada ``run_once``.
+    """
+    if slug != "bundle_arb":
+        raise HTTPException(
+            status_code=404,
+            detail="scan solo disponible para bundle_arb",
+        )
+    if not BUNDLE_ARB_SCAN_JSON.is_file():
+        return {
+            "available": False,
+            "path": str(BUNDLE_ARB_SCAN_JSON),
+            "detail": "Sin archivo aún: activa la estrategia y espera un ciclo del motor (~poll_interval).",
+        }
+    try:
+        data = json.loads(BUNDLE_ARB_SCAN_JSON.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return {"available": False, "detail": str(e)}
+    return {"available": True, "path": str(BUNDLE_ARB_SCAN_JSON), "scan": data}
 
 
 async def _arb_signals_sse_gen(request: Request) -> AsyncIterator[str]:

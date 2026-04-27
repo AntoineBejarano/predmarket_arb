@@ -79,6 +79,21 @@
       </div>
     </section>
 
+    <section id="bundle-scan-wrap" class="hidden rounded-xl border border-indigo-900/50 bg-indigo-950/20 p-4 space-y-3">
+      <div class="flex items-start justify-between gap-2 flex-wrap">
+        <div>
+          <h2 class="text-sm font-medium text-indigo-200">Último escaneo CLOB (bundle arb)</h2>
+          <p class="text-xs text-slate-500 mt-1">
+            Origen: <code class="text-slate-400">GET https://clob.polymarket.com/markets</code> paginado + <code class="text-slate-400">/book</code> por token.
+            Los contadores explican por qué ves <code class="text-slate-400">SKIP:NO_MARKETS</code> u otras acciones.
+          </p>
+        </div>
+        <button type="button" onclick="loadBundleScan()" class="text-xs px-2 py-1 border border-indigo-800 rounded hover:bg-indigo-950/80 shrink-0">Refrescar</button>
+      </div>
+      <p id="bundle-scan-status" class="text-xs text-slate-500">Cargando…</p>
+      <div id="bundle-scan-body" class="text-xs font-mono text-slate-300 space-y-2"></div>
+    </section>
+
     <section>
       <h2 class="text-sm font-medium text-slate-300 mb-2">Live (solo esta estrategia)</h2>
       <div id="live-feed" class="font-mono text-xs bg-slate-950 rounded-lg p-3 h-40 overflow-y-auto border border-slate-700 space-y-0.5">
@@ -116,6 +131,11 @@
     document.getElementById("nav-slug").textContent = SLUG;
     document.getElementById("title-h1").textContent = SLUG.replace(/_/g, " ");
     document.title = SLUG + " — detalle · PredMarket Arb";
+
+    if (SLUG === "bundle_arb") {
+      const wrap = document.getElementById("bundle-scan-wrap");
+      if (wrap) wrap.classList.remove("hidden");
+    }
 
     const ACTION_COLOR = {
       SIGNAL: "text-yellow-400",
@@ -229,6 +249,72 @@
 
     const PREFERRED_ORDER = ["ts", "action", "reason", "edge", "edge_gross", "size_usdc", "fict_stake_eur", "fict_pnl_est_eur", "fict_pnl_cum_eur", "fict_roi", "market_id", "n_outcomes", "sum_ask", "execution_buffer_est", "fees_est", "order_ids", "mid_dev_max", "dry_run"];
 
+    async function loadBundleScan() {
+      if (SLUG !== "bundle_arb") return;
+      const st = document.getElementById("bundle-scan-status");
+      const body = document.getElementById("bundle-scan-body");
+      if (!st || !body) return;
+      let j = {};
+      try {
+        const r = await fetch("/api/arb/strategy/bundle_arb/scan");
+        if (r.ok) j = await r.json();
+      } catch (e) {
+        st.textContent = "Error de red al leer diagnóstico.";
+        return;
+      }
+      if (!j.available) {
+        st.textContent = j.detail || "Sin diagnóstico todavía.";
+        body.innerHTML = "<p class=\"text-slate-500\">" + esc(j.path || "") + "</p>";
+        return;
+      }
+      const s = j.scan || {};
+      st.textContent = "Actualizado: " + (s.updated_at || "—") + " · resultado: " + (s.outcome || "—");
+      const c = [
+        ["Páginas /markets leídas", s.pages_fetched],
+        ["Filas mercado en bucle (raw)", s.markets_raw_total],
+        ["Mercados con libro analizado (scanned_books)", s.scanned_books],
+        ["skip: no accepting_orders", s.skip_not_accepting],
+        ["skip: cerrados", s.skip_closed],
+        ["skip: sin enable_order_book", s.skip_no_orderbook],
+        ["skip: n tokens fuera de rango", s.skip_outcomes],
+        ["skip: libro incompleto / error", s.skip_bad_book],
+        ["skip: buffer ejecución alto", s.skip_high_buffer],
+        ["skip: poca liquidez al best ask", s.skip_insufficient_depth],
+        ["skip: midpoint (BUNDLE_MID_MAX_DEV)", s.skip_mid],
+      ];
+      const grid =
+        '<div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1">' +
+        c.map(([k, v]) => '<div class="text-slate-500">' + esc(k) + '</div><div class="text-indigo-100">' + esc(v != null ? String(v) : "—") + "</div>").join("") +
+        "</div>";
+      const edge =
+        '<p class="pt-2 border-t border-slate-700"><span class="text-slate-500">best_edge_net</span> ' +
+        esc(s.best_edge_net != null ? String(s.best_edge_net) : "—") +
+        ' <span class="text-slate-600">vs min_edge</span> ' +
+        esc(s.min_edge != null ? String(s.min_edge) : "—") +
+        ' · <span class="text-slate-500">max_size_usdc</span> ' +
+        esc(s.max_size_usdc != null ? String(s.max_size_usdc) : "—") +
+        "</p>";
+      let samples = "";
+      const arr = s.eligible_sample || [];
+      if (arr.length) {
+        samples =
+          '<p class="text-slate-500 mt-2">Muestra de mercados que pasaron filtros básicos (question + condition_id):</p><ul class="list-disc pl-4 space-y-1 max-h-48 overflow-y-auto">';
+        arr.forEach((m) => {
+          samples +=
+            "<li><span class=\"text-slate-500\">" +
+            esc(m.condition_id || "").slice(0, 18) +
+            "…</span> · " +
+            esc(m.question || "—") +
+            " <span class=\"text-slate-600\">(n=" +
+            esc(String(m.n_tokens)) +
+            ")</span></li>";
+        });
+        samples += "</ul>";
+      }
+      const help = s.help ? '<p class="text-slate-500 mt-2 leading-relaxed">' + esc(s.help) + "</p>" : "";
+      body.innerHTML = grid + edge + samples + help;
+    }
+
     async function loadLog() {
       const tbody = document.getElementById("log-body");
       const thead = document.getElementById("log-head");
@@ -269,6 +355,10 @@
       setInterval(refreshStatus, 6000);
       loadLog();
       setInterval(loadLog, 20000);
+      if (SLUG === "bundle_arb") {
+        loadBundleScan();
+        setInterval(loadBundleScan, 15000);
+      }
       startLive();
     });
   </script>
