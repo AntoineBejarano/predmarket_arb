@@ -17,9 +17,10 @@ The repository is structured as a **strategy laboratory**: each hypothesis lives
 
 | Piece                      | Role                                                                               |
 | -------------------------- | ---------------------------------------------------------------------------------- |
-| `scripts/api.py`           | FastAPI: `/`, `/api/status`, worker START/STOP, SSE `/api/signals/live`, `/health` |
+| `scripts/api.py`           | FastAPI: `/` (ML validator UI), `/arb` (math strategies UI), `/api/status`, worker START/STOP, SSE, `/health` |
 | `scripts/validate_edge.py` | Worker: Binance + Gamma → `logs/signals.csv` under `DATA_DIR`                      |
-| `static/dashboard.html`    | Control panel                                                                      |
+| `static/dashboard.html`    | ML / NearRes control panel (`/`)                                                   |
+| `static/arb.html`          | Arb Engine control panel (`/arb`)                                                  |
 | `static/logo.png`          | Lab logo (header + favicon via `/static/logo.png`)                                 |
 | `models/train.py`          | Training; PKL under `models/saved/`                                                |
 | `models/saved/*.pkl`       | Shipped for Railway/local without retraining                                       |
@@ -69,7 +70,7 @@ python models/train.py
 python scripts/validate_edge.py --hours 72
 ```
 
-API + dashboard (optional):
+API + dashboards (optional): open `http://127.0.0.1:8080/` for the ML validator and `http://127.0.0.1:8080/arb` for mathematical strategies.
 
 ```bash
 AUTO_START=false PORT=8080 python scripts/api.py

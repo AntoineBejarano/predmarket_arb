@@ -51,6 +51,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
 SIGNALS_CSV = DATA_DIR / "logs" / "signals.csv"
 STATIC_DIR = REPO_ROOT / "static"
 DASHBOARD_HTML = STATIC_DIR / "dashboard.html"
+ARB_HTML = STATIC_DIR / "arb.html"
 
 
 def signals_path() -> Path:
@@ -397,6 +398,15 @@ async def root() -> Union[FileResponse, JSONResponse]:
     if not DASHBOARD_HTML.is_file():
         return JSONResponse({"detail": "static/dashboard.html not found"}, status_code=404)
     return FileResponse(path=str(DASHBOARD_HTML), media_type="text/html; charset=utf-8")
+
+
+@app.get("/arb", response_model=None)
+async def arb_dashboard() -> Union[FileResponse, JSONResponse]:
+    """UI del Arb Engine (estrategias matemáticas); separada del validador ML en `/`."""
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    if not ARB_HTML.is_file():
+        return JSONResponse({"detail": "static/arb.html not found"}, status_code=404)
+    return FileResponse(path=str(ARB_HTML), media_type="text/html; charset=utf-8")
 
 
 @app.get("/health")
