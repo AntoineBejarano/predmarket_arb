@@ -6,18 +6,20 @@ import json
 import math
 import os
 import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import aiohttp
 
 from clients.poly_parse import (
     api_bool_true,
+    extract_yes_token_id,
     gamma_condition_id,
-    gamma_market_child_discoverable,
     gamma_market_token_ids,
-    gamma_yes_token_id,
+    parse_json_list_maybe,
 )
 
 if TYPE_CHECKING:
@@ -128,6 +130,28 @@ def _parse_end_date(m: dict[str, Any]) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _logs_dir() -> Path:
+    base = Path(os.getenv("DATA_DIR", ".")).resolve()
+    out = base / "logs"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _extract_children_from_event(ev: dict[str, Any]) -> list[dict[str, Any]]:
+    keys = ("markets", "children", "childMarkets")
+    out: list[dict[str, Any]] = []
+    for key in keys:
+        v = ev.get(key)
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    out.append(item)
+    direct = ev.get("market")
+    if isinstance(direct, dict):
+        out.append(direct)
+    return out
 
 
 class MarketsRegistry:
@@ -267,6 +291,28 @@ class MarketsRegistry:
         Filtra negRisk, fechas sobre ``endDate`` del evento, hijos tradeables con token YES.
         """
         now = datetime.now(timezone.utc)
+        require_negrisk = api_bool_true(os.getenv("BUNDLE_REQUIRE_NEGRISK", "true"))
+        min_days = float(os.getenv("BUNDLE_MIN_DAYS_TO_EXPIRY", "14"))
+        max_days = float(os.getenv("BUNDLE_MAX_DAYS_TO_EXPIRY", "365"))
+        max_cap = int(os.getenv("BUNDLE_MAX_CANDIDATES_PER_CYCLE", "120"))
+        min_liq_clob = float(os.getenv("BUNDLE_MIN_LIQUIDITY_CLOB", "0"))
+        min_vol24 = float(os.getenv("BUNDLE_MIN_VOLUME_24H", "0"))
+        assume_first_yes = api_bool_true(os.getenv("BUNDLE_ASSUME_FIRST_TOKEN_IS_YES", "false"))
+        do_audit = api_bool_true(os.getenv("BUNDLE_DISCOVERY_AUDIT", "false"))
+        audit_limit = max(1, int(os.getenv("BUNDLE_DISCOVERY_AUDIT_LIMIT", "100")))
+        raw_samples_limit = max(1, int(os.getenv("BUNDLE_DISCOVERY_AUDIT_RAW_SAMPLES", "20")))
+        max_samples_per_reason = min(5, raw_samples_limit)
+        relaxed_diag = api_bool_true(os.getenv("BUNDLE_DISCOVERY_RELAXED_DIAGNOSTIC", "false"))
+
+        allow_aug_env = os.getenv("BUNDLE_ALLOW_AUGMENTED_NEGRISK")
+        skip_aug_env = os.getenv("BUNDLE_SKIP_AUGMENTED")
+        if allow_aug_env is not None:
+            effective_skip_augmented = not api_bool_true(allow_aug_env)
+        elif skip_aug_env is not None:
+            effective_skip_augmented = api_bool_true(skip_aug_env)
+        else:
+            effective_skip_augmented = True
+
         diag: dict[str, Any] = {
             "events_pages": 0,
             "events_raw": 0,
@@ -282,15 +328,86 @@ class MarketsRegistry:
             "candidates_built": 0,
             "candidates_after_cap": 0,
         }
-        require_negrisk = api_bool_true(os.getenv("BUNDLE_REQUIRE_NEGRISK", "true"))
-        allow_augmented = api_bool_true(os.getenv("BUNDLE_ALLOW_AUGMENTED_NEGRISK", "false"))
-        min_days = float(os.getenv("BUNDLE_MIN_DAYS_TO_EXPIRY", "14"))
-        max_days = float(os.getenv("BUNDLE_MAX_DAYS_TO_EXPIRY", "365"))
-        max_cap = int(os.getenv("BUNDLE_MAX_CANDIDATES_PER_CYCLE", "120"))
-        min_liq_clob = float(os.getenv("BUNDLE_MIN_LIQUIDITY_CLOB", "0"))
-        min_vol24 = float(os.getenv("BUNDLE_MIN_VOLUME_24H", "0"))
-
+        funnel: dict[str, int] = {
+            "raw_events": 0,
+            "with_event_id": 0,
+            "negRisk_true": 0,
+            "negRisk_false": 0,
+            "negRisk_missing": 0,
+            "augmented_true": 0,
+            "augmented_false": 0,
+            "strict_negrisk_non_augmented": 0,
+            "date_valid": 0,
+            "has_children_or_markets": 0,
+            "children_total": 0,
+            "children_active": 0,
+            "children_with_condition_id": 0,
+            "children_with_outcomes": 0,
+            "children_with_clob_token_ids": 0,
+            "children_with_aligned_outcomes_tokens": 0,
+            "children_with_yes_token": 0,
+            "events_with_candidate_legs": 0,
+            "built_candidates": 0,
+        }
+        reject_counter: Counter[str] = Counter()
+        samples_by_reason: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        sample_total = 0
         built: list[NegRiskBundleCandidate] = []
+        relaxed_counts: dict[str, int] = {
+            "base": 0,
+            "include_augmented": 0,
+            "ignore_date_filter": 0,
+            "ignore_require_negrisk": 0,
+            "allow_missing_enable_orderbook": 0,
+            "allow_assume_first_yes": 0,
+        }
+
+        def _record_reject(
+            *,
+            ev: dict[str, Any],
+            child: Optional[dict[str, Any]],
+            reject_stage: str,
+            reject_reason: str,
+            parser_error: str = "",
+            parsed_outcomes: Optional[list[Any]] = None,
+            parsed_clob_token_ids: Optional[list[Any]] = None,
+        ) -> None:
+            nonlocal sample_total
+            reject_counter[reject_reason] += 1
+            if not do_audit:
+                return
+            if sample_total >= raw_samples_limit:
+                return
+            current = samples_by_reason[reject_reason]
+            if len(current) >= max_samples_per_reason:
+                return
+            eid = _event_id(ev)
+            markets = _extract_children_from_event(ev)
+            sample_child = child or {}
+            sample = {
+                "reject_stage": reject_stage,
+                "reject_reason": reject_reason,
+                "event_id": eid,
+                "event_title": str(ev.get("title") or ev.get("question") or "")[:180],
+                "event_slug": _event_slug(ev),
+                "negRisk": ev.get("negRisk"),
+                "negRiskAugmented": ev.get("negRiskAugmented"),
+                "active": ev.get("active"),
+                "closed": ev.get("closed"),
+                "endDate": ev.get("endDate") or ev.get("end_date"),
+                "num_markets": len(ev.get("markets") or []) if isinstance(ev.get("markets"), list) else 0,
+                "num_children": len(markets),
+                "sample_child_keys": list(sample_child.keys())[:12],
+                "sample_child_question": str(sample_child.get("question") or sample_child.get("title") or "")[:160],
+                "sample_child_outcomes_raw": sample_child.get("outcomes"),
+                "sample_child_clobTokenIds_raw": sample_child.get("clobTokenIds") or sample_child.get("clob_token_ids"),
+                "parsed_outcomes": parsed_outcomes,
+                "parsed_clobTokenIds": parsed_clob_token_ids,
+                "parser_error": parser_error,
+            }
+            current.append(sample)
+            sample_total += 1
+
         cursor: str = ""
         base = f"{GAMMA_API_URL}/events/keyset"
 
@@ -318,74 +435,246 @@ class MarketsRegistry:
             if not isinstance(events, list):
                 diag["events_keyset_error"] = "events_not_list"
                 break
+
             for ev in events:
                 if not isinstance(ev, dict):
                     continue
+                if diag["events_raw"] >= audit_limit:
+                    break
                 diag["events_raw"] += 1
-                if require_negrisk and not api_bool_true(ev.get("negRisk")):
+                funnel["raw_events"] += 1
+                eid = _event_id(ev)
+                if eid:
+                    funnel["with_event_id"] += 1
+                else:
+                    diag["skip_no_event_id"] += 1
+                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="missing_event_id")
+                    continue
+
+                neg_v = ev.get("negRisk")
+                if neg_v is None:
+                    funnel["negRisk_missing"] += 1
+                elif api_bool_true(neg_v):
+                    funnel["negRisk_true"] += 1
+                else:
+                    funnel["negRisk_false"] += 1
+                is_augmented = api_bool_true(ev.get("negRiskAugmented"))
+                if is_augmented:
+                    funnel["augmented_true"] += 1
+                else:
+                    funnel["augmented_false"] += 1
+
+                if require_negrisk and not api_bool_true(neg_v):
                     diag["skip_not_negrisk"] += 1
+                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="not_negrisk")
                     continue
-                if not allow_augmented and api_bool_true(ev.get("negRiskAugmented")):
+                if effective_skip_augmented and is_augmented:
                     diag["skip_augmented"] += 1
+                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="augmented_skipped")
                     continue
+                funnel["strict_negrisk_non_augmented"] += 1
+
                 end_dt = _parse_end_date(ev)
                 if end_dt is None:
                     diag["skip_date"] += 1
+                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="date_filter")
                     continue
                 days = (end_dt - now).total_seconds() / 86400.0
                 if days < min_days or days > max_days:
                     diag["skip_date"] += 1
+                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="date_filter")
                     continue
+                funnel["date_valid"] += 1
 
                 if min_liq_clob > 0:
                     eliq = _float_field(ev, "liquidityClob", "liquidityNum", "liquidity")
                     if eliq is None or eliq < min_liq_clob:
                         diag["skip_event_liquidity"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=None,
+                            reject_stage="strict_filter",
+                            reject_reason="low_event_liquidity",
+                        )
                         continue
                 if min_vol24 > 0:
                     ev24 = _float_field(ev, "volume24hr", "volume24Hr", "volume24HR")
                     if ev24 is None or ev24 < min_vol24:
                         diag["skip_event_volume"] += 1
+                        _record_reject(ev=ev, child=None, reject_stage="strict_filter", reject_reason="low_event_volume")
                         continue
 
+                children = _extract_children_from_event(ev)
+                if children:
+                    funnel["has_children_or_markets"] += 1
+                else:
+                    _record_reject(ev=ev, child=None, reject_stage="child_extract", reject_reason="no_children")
+                    continue
+                funnel["children_total"] += len(children)
+
                 legs: list[NegRiskLeg] = []
-                markets = ev.get("markets") or []
-                if not isinstance(markets, list):
-                    markets = []
-                for m in markets:
-                    if not isinstance(m, dict):
-                        continue
-                    ok_child, _reason = gamma_market_child_discoverable(m)
-                    if not ok_child:
+                has_any_active_child = False
+                for child in children:
+                    if not api_bool_true(child.get("active")):
                         diag["skip_child_tradability"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_extract",
+                            reject_reason="inactive",
+                        )
                         continue
-                    cid = gamma_condition_id(m)
-                    yid = gamma_yes_token_id(m)
-                    if not cid or not yid:
+                    if api_bool_true(child.get("closed")) or api_bool_true(child.get("isClosed")):
+                        diag["skip_child_tradability"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_extract",
+                            reject_reason="closed",
+                        )
+                        continue
+                    if api_bool_true(child.get("archived")):
+                        diag["skip_child_tradability"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_extract",
+                            reject_reason="archived",
+                        )
+                        continue
+                    if api_bool_true(child.get("restricted")):
+                        diag["skip_child_tradability"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_extract",
+                            reject_reason="restricted",
+                        )
+                        continue
+                    acc = child.get("acceptingOrders")
+                    if acc is None:
+                        acc = child.get("accepting_orders")
+                    if acc is not None and not api_bool_true(acc):
+                        diag["skip_child_tradability"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_extract",
+                            reject_reason="not_accepting",
+                        )
+                        continue
+                    eob = child.get("enableOrderBook")
+                    if eob is None:
+                        eob = child.get("enable_order_book")
+                    if eob is not None and not api_bool_true(eob):
+                        diag["skip_child_tradability"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_extract",
+                            reject_reason="no_orderbook",
+                        )
+                        continue
+                    has_any_active_child = True
+                    funnel["children_active"] += 1
+
+                    cid = gamma_condition_id(child)
+                    if not cid:
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_extract",
+                            reject_reason="missing_condition_id",
+                        )
+                        continue
+                    funnel["children_with_condition_id"] += 1
+
+                    outcomes_raw = child.get("outcomes")
+                    clob_raw = child.get("clobTokenIds") or child.get("clob_token_ids")
+                    parsed_outcomes, out_err = parse_json_list_maybe(outcomes_raw)
+                    if parsed_outcomes is None:
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_parse",
+                            reject_reason="malformed_outcomes",
+                            parser_error=out_err or "",
+                        )
+                        continue
+                    funnel["children_with_outcomes"] += 1
+
+                    parsed_tokens, tok_err = parse_json_list_maybe(clob_raw)
+                    if parsed_tokens is None:
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_parse",
+                            reject_reason="malformed_clob_token_ids",
+                            parser_error=tok_err or "",
+                            parsed_outcomes=parsed_outcomes,
+                        )
+                        continue
+                    funnel["children_with_clob_token_ids"] += 1
+
+                    if len(parsed_outcomes) != len(parsed_tokens):
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="child_parse",
+                            reject_reason="length_mismatch",
+                            parsed_outcomes=parsed_outcomes,
+                            parsed_clob_token_ids=parsed_tokens,
+                        )
+                        continue
+                    funnel["children_with_aligned_outcomes_tokens"] += 1
+
+                    yid, _yes_source, yes_reason = extract_yes_token_id(
+                        parsed_outcomes,
+                        parsed_tokens,
+                        assume_first=assume_first_yes,
+                    )
+                    if yid is None:
                         diag["skip_yes_token"] += 1
+                        _record_reject(
+                            ev=ev,
+                            child=child,
+                            reject_stage="yes_extract",
+                            reject_reason=yes_reason or "no_yes_outcome",
+                            parsed_outcomes=parsed_outcomes,
+                            parsed_clob_token_ids=parsed_tokens,
+                        )
                         continue
-                    q = str(m.get("question") or m.get("title") or "")[:200]
-                    fe = m.get("feesEnabled")
+                    funnel["children_with_yes_token"] += 1
+
+                    q = str(child.get("question") or child.get("title") or "")[:200]
+                    fe = child.get("feesEnabled")
                     if fe is None:
-                        fe = m.get("fees_enabled")
+                        fe = child.get("fees_enabled")
                     fees_en: Optional[bool] = None
                     if isinstance(fe, bool):
                         fees_en = fe
                     elif isinstance(fe, str):
                         fees_en = api_bool_true(fe)
-                    legs.append(
-                        NegRiskLeg(condition_id=cid, yes_token_id=yid, question=q, fees_enabled=fees_en)
+                    leg = NegRiskLeg(condition_id=cid, yes_token_id=yid, question=q, fees_enabled=fees_en)
+                    legs.append(leg)
+
+                if not has_any_active_child:
+                    _record_reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="child_extract",
+                        reject_reason="no_children",
                     )
+                    continue
 
                 n = len(legs)
+                if n >= self.min_outcomes:
+                    funnel["events_with_candidate_legs"] += 1
                 if n < self.min_outcomes or n > self.max_outcomes:
                     diag["skip_outcomes_range"] += 1
+                    _record_reject(ev=ev, child=None, reject_stage="strict_filter", reject_reason="too_many_outcomes")
                     continue
 
-                eid = _event_id(ev)
-                if not eid:
-                    diag["skip_no_event_id"] += 1
-                    continue
                 end_raw = str(ev.get("endDate") or ev.get("end_date") or "")[:40]
                 sc = _score_negrisk_event(ev, n, now)
                 built.append(
@@ -398,14 +687,75 @@ class MarketsRegistry:
                     )
                 )
                 diag["candidates_built"] += 1
+                funnel["built_candidates"] += 1
+
+                if relaxed_diag:
+                    relaxed_counts["base"] = diag["candidates_built"]
+                    if require_negrisk or effective_skip_augmented:
+                        relaxed_counts["ignore_require_negrisk"] += 1
+                    if effective_skip_augmented:
+                        relaxed_counts["include_augmented"] += 1
+                    if assume_first_yes:
+                        relaxed_counts["allow_assume_first_yes"] += 1
 
             cursor = str(payload.get("next_cursor") or "").strip()
             if not cursor:
                 break
 
+        if relaxed_diag and relaxed_counts["base"] == 0:
+            relaxed_counts["base"] = diag["candidates_built"]
+            relaxed_counts["ignore_date_filter"] = reject_counter.get("date_filter", 0)
+            relaxed_counts["include_augmented"] = reject_counter.get("augmented_skipped", 0)
+            relaxed_counts["ignore_require_negrisk"] = reject_counter.get("not_negrisk", 0)
+            relaxed_counts["allow_missing_enable_orderbook"] = reject_counter.get("no_orderbook", 0)
+            relaxed_counts["allow_assume_first_yes"] = reject_counter.get("no_yes_outcome", 0)
+
         built.sort(key=lambda c: c.score, reverse=True)
         capped = built[: max(0, max_cap)]
         diag["candidates_after_cap"] = len(capped)
+        diag["built_candidates"] = diag["candidates_built"]
+        top_reject_reasons = dict(reject_counter.most_common(10))
+        diag["top_reject_reasons"] = top_reject_reasons
+        diag["funnel"] = funnel
+        if relaxed_diag:
+            diag["relaxed_counts"] = relaxed_counts
+        diag["events_with_negRisk_true_and_non_augmented"] = funnel["strict_negrisk_non_augmented"]
+
+        audit_path = _logs_dir() / "negrisk_discovery_audit.json"
+        reject_path = _logs_dir() / "negrisk_discovery_reject_samples.json"
+        if do_audit:
+            audit_obj = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "config": {
+                    "BUNDLE_DISCOVERY": os.getenv("BUNDLE_DISCOVERY", "gamma_events"),
+                    "BUNDLE_REQUIRE_NEGRISK": os.getenv("BUNDLE_REQUIRE_NEGRISK", "true"),
+                    "BUNDLE_ALLOW_AUGMENTED_NEGRISK": allow_aug_env,
+                    "BUNDLE_SKIP_AUGMENTED": skip_aug_env,
+                    "effective_skip_augmented": effective_skip_augmented,
+                    "BUNDLE_MIN_DAYS_TO_EXPIRY": os.getenv("BUNDLE_MIN_DAYS_TO_EXPIRY", "14"),
+                    "BUNDLE_MAX_DAYS_TO_EXPIRY": os.getenv("BUNDLE_MAX_DAYS_TO_EXPIRY", "365"),
+                    "BUNDLE_GAMMA_EVENTS_MAX_PAGES": os.getenv("BUNDLE_GAMMA_EVENTS_MAX_PAGES", "20"),
+                    "BUNDLE_MAX_OUTCOMES": os.getenv("BUNDLE_MAX_OUTCOMES", ""),
+                    "BUNDLE_MAX_OUTCOMES_LIVE": os.getenv("BUNDLE_MAX_OUTCOMES_LIVE", ""),
+                },
+                "funnel": funnel,
+                "top_reject_reasons": top_reject_reasons,
+            }
+            if relaxed_diag:
+                audit_obj["relaxed_counts"] = relaxed_counts
+            audit_path.write_text(json.dumps(audit_obj, indent=2, ensure_ascii=False), encoding="utf-8")
+            reject_payload = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "max_total": raw_samples_limit,
+                "max_per_reason": max_samples_per_reason,
+                "sample_count": sample_total,
+                "samples_by_reason": dict(samples_by_reason),
+            }
+            reject_path.write_text(json.dumps(reject_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            diag["discovery_audit_path"] = str(audit_path)
+            diag["sample_rejects_path"] = str(reject_path)
+            diag["sample_rejects_available"] = sample_total > 0
+
         self._last_diag = diag
         return capped, diag
 

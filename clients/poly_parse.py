@@ -23,6 +23,31 @@ def parse_json_maybe(val: Any) -> Any:
     return val
 
 
+def parse_json_list_maybe(val: Any) -> tuple[Optional[list[Any]], Optional[str]]:
+    """
+    Parsea una lista que puede venir como lista real o string JSON.
+    Devuelve (lista|None, error|None) con motivo explícito.
+    """
+    if val is None:
+        return None, "missing"
+    if isinstance(val, tuple):
+        return list(val), None
+    if isinstance(val, list):
+        return val, None
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None, "empty_string"
+        try:
+            parsed = json.loads(s)
+        except json.JSONDecodeError:
+            return None, "malformed_json_list"
+        if not isinstance(parsed, list):
+            return None, "json_not_list"
+        return parsed, None
+    return None, "not_list"
+
+
 def api_bool_true(v: Any) -> bool:
     """True solo para valores claramente afirmativos (evita truthiness de strings raros)."""
     if isinstance(v, bool):
@@ -71,21 +96,59 @@ def parse_outcomes_list(m: dict[str, Any]) -> list[str]:
     return [str(x).strip() for x in parsed]
 
 
+def _normalize_outcome_label(item: Any) -> str:
+    if isinstance(item, dict):
+        for k in ("name", "label", "value", "outcome"):
+            v = item.get(k)
+            if v is not None:
+                return str(v).strip()
+        return ""
+    return str(item).strip()
+
+
+def extract_yes_token_id(
+    outcomes: Any,
+    clob_token_ids: Any,
+    *,
+    assume_first: bool = False,
+) -> tuple[Optional[str], str, Optional[str]]:
+    """
+    Extrae token YES alineando outcomes con clobTokenIds.
+    Retorna (token_id|None, yes_token_source, reject_reason|None).
+    """
+    parsed_outcomes, out_err = parse_json_list_maybe(outcomes)
+    if parsed_outcomes is None:
+        return None, "unknown", "malformed_outcomes" if out_err != "missing" else "missing_outcomes"
+    parsed_tokens, tok_err = parse_json_list_maybe(clob_token_ids)
+    if parsed_tokens is None:
+        return None, "unknown", "malformed_clob_token_ids" if tok_err != "missing" else "missing_clob_token_ids"
+    if len(parsed_outcomes) != len(parsed_tokens):
+        return None, "unknown", "length_mismatch"
+    for idx, item in enumerate(parsed_outcomes):
+        if _normalize_outcome_label(item).lower() == "yes":
+            tid = str(parsed_tokens[idx]).strip()
+            if tid:
+                return tid, "explicit_yes_outcome", None
+            return None, "unknown", "empty_yes_token_id"
+    if assume_first and parsed_tokens:
+        tid0 = str(parsed_tokens[0]).strip()
+        if tid0:
+            return tid0, "assumed_first_token", None
+    return None, "unknown", "no_yes_outcome"
+
+
 def gamma_yes_token_id(m: dict[str, Any]) -> Optional[str]:
     """
     Token CLOB del lado **Yes** para un market binario Gamma.
     Alinea ``outcomes[i]`` con ``clobTokenIds[i]`` (misma longitud).
     """
-    outcomes = parse_outcomes_list(m)
     raw_tok = m.get("clobTokenIds") or m.get("clob_token_ids")
-    tokens = parse_json_maybe(raw_tok)
-    if not isinstance(tokens, (list, tuple)) or len(outcomes) != len(tokens):
-        return None
-    for i, lab in enumerate(outcomes):
-        if str(lab).strip().lower() == "yes":
-            tid = str(tokens[i]).strip()
-            return tid or None
-    return None
+    yid, _source, _reason = extract_yes_token_id(
+        m.get("outcomes"),
+        raw_tok,
+        assume_first=False,
+    )
+    return yid
 
 
 def gamma_market_child_discoverable(m: dict[str, Any]) -> Tuple[bool, str]:
@@ -144,8 +207,8 @@ def gamma_market_child_eligible(m: dict[str, Any]) -> Tuple[bool, str]:
 def gamma_market_token_ids(m: dict[str, Any]) -> list[str]:
     """Token IDs CLOB desde payload Gamma (``clobTokenIds`` JSON o lista)."""
     raw = m.get("clobTokenIds") or m.get("clob_token_ids")
-    parsed = parse_json_maybe(raw)
-    if not isinstance(parsed, (list, tuple)):
+    parsed, _err = parse_json_list_maybe(raw)
+    if not isinstance(parsed, list):
         return []
     out: list[str] = []
     for x in parsed:

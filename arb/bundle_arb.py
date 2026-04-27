@@ -307,6 +307,8 @@ class BundleArbStrategy(ArbStrategy):
         if self.discovery not in ("gamma_events",):
             reg_mode = "gamma_events"
         candidates, reg_diag = await self._registry.get_candidates(reg_mode, poly, force_refresh=False)
+        top_reject = reg_diag.get("top_reject_reasons") or {}
+        discovery_result = "DISCOVERY:CANDIDATES_FOUND" if candidates else "SKIP:NO_ELIGIBLE_DISCOVERY"
 
         async def leg_book_for(tid: str) -> LegBook:
             ob = await poly.get_orderbook(tid)
@@ -382,6 +384,13 @@ class BundleArbStrategy(ArbStrategy):
                 {
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                     "bundle_mode": "maker_first",
+                    "mode": "maker_first_dry_run" if self.dry_run else "maker_first_live",
+                    "discovery_result": discovery_result,
+                    "candidates_count": len(candidates),
+                    "rejects_count": int(sum(v for v in top_reject.values() if isinstance(v, int))),
+                    "top_reject_reasons": top_reject,
+                    "audit_path": reg_diag.get("discovery_audit_path"),
+                    "sample_rejects_path": reg_diag.get("sample_rejects_path"),
                     "events": events_out,
                     "kill_live_posting": self._maker_kill.live_posting_disabled,
                 },
@@ -506,6 +515,16 @@ class BundleArbStrategy(ArbStrategy):
                 "skip_event_volume": reg_diag.get("skip_event_volume"),
                 "candidates_built": reg_diag.get("candidates_built"),
                 "candidates_after_cap": reg_diag.get("candidates_after_cap"),
+                "built_candidates": reg_diag.get("built_candidates"),
+                "top_reject_reasons": reg_diag.get("top_reject_reasons"),
+                "relaxed_counts": reg_diag.get("relaxed_counts"),
+                "discovery_audit_path": reg_diag.get("discovery_audit_path"),
+                "sample_rejects_path": reg_diag.get("sample_rejects_path"),
+                "sample_rejects_available": reg_diag.get("sample_rejects_available"),
+                "funnel": reg_diag.get("funnel"),
+                "events_with_negRisk_true_and_non_augmented": reg_diag.get(
+                    "events_with_negRisk_true_and_non_augmented"
+                ),
             }
             return {**base, **extra}
 

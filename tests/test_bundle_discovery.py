@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import patch
 
 from arb.bundle_pricing import vwap_buy_avg_price
 from clients.poly_markets import (
@@ -16,15 +21,32 @@ from clients.poly_markets import (
 from clients.poly_parse import (
     api_bool_true,
     clob_market_tradeable,
+    extract_yes_token_id,
     gamma_market_child_discoverable,
     gamma_market_child_eligible,
     gamma_market_token_ids,
     gamma_yes_token_id,
+    parse_json_list_maybe,
     parse_outcomes_list,
 )
 
 
 class TestPolyParse(unittest.TestCase):
+    def test_parse_json_list_maybe_list_real(self) -> None:
+        v, err = parse_json_list_maybe(["a", "b"])
+        self.assertEqual(v, ["a", "b"])
+        self.assertIsNone(err)
+
+    def test_parse_json_list_maybe_string_json(self) -> None:
+        v, err = parse_json_list_maybe('["a","b"]')
+        self.assertEqual(v, ["a", "b"])
+        self.assertIsNone(err)
+
+    def test_parse_json_list_maybe_malformed(self) -> None:
+        v, err = parse_json_list_maybe("[a,b")
+        self.assertIsNone(v)
+        self.assertEqual(err, "malformed_json_list")
+
     def test_api_bool_true(self) -> None:
         self.assertTrue(api_bool_true(True))
         self.assertFalse(api_bool_true(False))
@@ -68,6 +90,37 @@ class TestPolyParse(unittest.TestCase):
         }
         self.assertEqual(parse_outcomes_list(m), ["Yes", "No"])
         self.assertEqual(gamma_yes_token_id(m), "tok_yes")
+
+    def test_extract_yes_token_yes_no(self) -> None:
+        yid, src, reason = extract_yes_token_id(["Yes", "No"], ["tok_yes", "tok_no"])
+        self.assertEqual(yid, "tok_yes")
+        self.assertEqual(src, "explicit_yes_outcome")
+        self.assertIsNone(reason)
+
+    def test_extract_yes_token_no_yes(self) -> None:
+        yid, src, reason = extract_yes_token_id(["No", "Yes"], ["tok_no", "tok_yes"])
+        self.assertEqual(yid, "tok_yes")
+        self.assertEqual(src, "explicit_yes_outcome")
+        self.assertIsNone(reason)
+
+    def test_extract_yes_token_missing_yes(self) -> None:
+        yid, src, reason = extract_yes_token_id(["Up", "Down"], ["tok_up", "tok_down"])
+        self.assertIsNone(yid)
+        self.assertEqual(src, "unknown")
+        self.assertEqual(reason, "no_yes_outcome")
+
+    def test_outcomes_list_of_dicts(self) -> None:
+        yid, src, reason = extract_yes_token_id(
+            [{"label": "No"}, {"name": "Yes"}],
+            ["tok_no", "tok_yes"],
+        )
+        self.assertEqual(yid, "tok_yes")
+        self.assertEqual(src, "explicit_yes_outcome")
+        self.assertIsNone(reason)
+
+    def test_clob_token_ids_string_json_with_spaces(self) -> None:
+        m = {"clobTokenIds": ' [ "111" , "222" ] '}
+        self.assertEqual(gamma_market_token_ids(m), ["111", "222"])
 
     def test_gamma_market_child_eligible(self) -> None:
         good = {
@@ -167,3 +220,182 @@ class TestMarketsRegistry(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(c.legs), 1)
         self.assertEqual(c.legs[0].yes_token_id, "t1")
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict[str, Any], status: int = 200):
+        self.status = status
+        self._payload = payload
+
+    async def __aenter__(self) -> "_FakeResponse":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def text(self) -> str:
+        return json.dumps(self._payload)
+
+
+class _FakeSession:
+    def __init__(self, payload: dict[str, Any]):
+        self._payload = payload
+
+    def get(self, *args, **kwargs) -> _FakeResponse:
+        return _FakeResponse(self._payload)
+
+
+class TestGammaEventsDiscoveryAudit(unittest.IsolatedAsyncioTestCase):
+    async def test_valid_event_builds_candidate(self) -> None:
+        event = {
+            "id": "evt-1",
+            "slug": "evt-1",
+            "negRisk": True,
+            "negRiskAugmented": False,
+            "endDate": "2099-01-01T00:00:00Z",
+            "markets": [
+                {
+                    "conditionId": "c1",
+                    "active": True,
+                    "closed": False,
+                    "outcomes": '["Yes","No"]',
+                    "clobTokenIds": '["y1","n1"]',
+                },
+                {
+                    "conditionId": "c2",
+                    "active": True,
+                    "closed": False,
+                    "outcomes": '["No","Yes"]',
+                    "clobTokenIds": '["n2","y2"]',
+                },
+            ],
+        }
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=10)
+        payload = {"events": [event], "next_cursor": ""}
+        with patch.dict(
+            os.environ,
+            {
+                "BUNDLE_DISCOVERY_AUDIT": "false",
+                "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
+                "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
+            },
+            clear=False,
+        ):
+            cands, diag = await reg.discover_gamma_events_keyset(_FakeSession(payload))
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(diag.get("candidates_built"), 1)
+
+    async def test_augmented_precedence_allow_over_skip(self) -> None:
+        event = {
+            "id": "evt-aug",
+            "slug": "evt-aug",
+            "negRisk": True,
+            "negRiskAugmented": True,
+            "endDate": "2099-01-01T00:00:00Z",
+            "markets": [
+                {
+                    "conditionId": "c1",
+                    "active": True,
+                    "closed": False,
+                    "outcomes": ["Yes", "No"],
+                    "clobTokenIds": ["y1", "n1"],
+                },
+                {
+                    "conditionId": "c2",
+                    "active": True,
+                    "closed": False,
+                    "outcomes": ["Yes", "No"],
+                    "clobTokenIds": ["y2", "n2"],
+                },
+            ],
+        }
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=10)
+        payload = {"events": [event], "next_cursor": ""}
+        env = {
+            "BUNDLE_ALLOW_AUGMENTED_NEGRISK": "true",
+            "BUNDLE_SKIP_AUGMENTED": "true",
+            "BUNDLE_DISCOVERY_AUDIT": "false",
+            "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
+            "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cands, diag = await reg.discover_gamma_events_keyset(_FakeSession(payload))
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(diag.get("skip_augmented"), 0)
+
+    async def test_length_mismatch_rejected_and_audited(self) -> None:
+        bad = {
+            "id": "evt-mismatch",
+            "slug": "evt-mismatch",
+            "negRisk": True,
+            "negRiskAugmented": False,
+            "endDate": "2099-01-01T00:00:00Z",
+            "markets": [
+                {
+                    "conditionId": "c1",
+                    "active": True,
+                    "closed": False,
+                    "outcomes": '["Yes","No"]',
+                    "clobTokenIds": '["only_one"]',
+                }
+            ],
+        }
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=10)
+        payload = {"events": [bad], "next_cursor": ""}
+        with tempfile.TemporaryDirectory() as td:
+            env = {
+                "DATA_DIR": td,
+                "BUNDLE_DISCOVERY_AUDIT": "true",
+                "BUNDLE_DISCOVERY_AUDIT_RAW_SAMPLES": "20",
+                "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
+                "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                cands, diag = await reg.discover_gamma_events_keyset(_FakeSession(payload))
+            self.assertEqual(len(cands), 0)
+            self.assertTrue(diag.get("sample_rejects_available"))
+            p = os.path.join(td, "logs", "negrisk_discovery_reject_samples.json")
+            with open(p, "r", encoding="utf-8") as fh:
+                js = json.load(fh)
+            self.assertIn("samples_by_reason", js)
+            self.assertIn("length_mismatch", js["samples_by_reason"])
+
+    async def test_sample_cap_per_reason(self) -> None:
+        events = []
+        for i in range(10):
+            events.append(
+                {
+                    "id": f"evt-{i}",
+                    "slug": f"evt-{i}",
+                    "negRisk": True,
+                    "negRiskAugmented": False,
+                    "endDate": "2099-01-01T00:00:00Z",
+                    "markets": [
+                        {
+                            "conditionId": f"c{i}",
+                            "active": True,
+                            "closed": False,
+                            "outcomes": '["Yes","No"]',
+                            "clobTokenIds": '["only_one"]',
+                        }
+                    ],
+                }
+            )
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=50)
+        payload = {"events": events, "next_cursor": ""}
+        with tempfile.TemporaryDirectory() as td:
+            env = {
+                "DATA_DIR": td,
+                "BUNDLE_DISCOVERY_AUDIT": "true",
+                "BUNDLE_DISCOVERY_AUDIT_RAW_SAMPLES": "7",
+                "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
+                "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                await reg.discover_gamma_events_keyset(_FakeSession(payload))
+            p = os.path.join(td, "logs", "negrisk_discovery_reject_samples.json")
+            with open(p, "r", encoding="utf-8") as fh:
+                js = json.load(fh)
+            lm = js["samples_by_reason"].get("length_mismatch", [])
+            self.assertLessEqual(len(lm), 5)
+            self.assertLessEqual(js.get("sample_count", 0), 7)
