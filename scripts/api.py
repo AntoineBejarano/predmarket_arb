@@ -419,7 +419,7 @@ async def root() -> Union[FileResponse, JSONResponse]:
 
 @app.get("/ml", response_model=None)
 async def ml_models_index_page() -> Union[FileResponse, JSONResponse]:
-    """Listado de modelos ML (toggles + enlaces a detalle), análogo a /arb."""
+    """Catálogo ML (`/ml`): toggles + enlaces al monitor por slug; análogo al índice `/arb`."""
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     if not ML_MODELS_HTML.is_file():
         return JSONResponse({"detail": "static/ml_models.html not found"}, status_code=404)
@@ -438,7 +438,7 @@ async def ml_model_detail_page(slug: str) -> Union[FileResponse, JSONResponse]:
 
 @app.get("/arb", response_model=None)
 async def arb_dashboard() -> Union[FileResponse, JSONResponse]:
-    """UI del Arb Engine (estrategias matemáticas); separada del validador ML en `/`."""
+    """UI del motor Arb (CLOB); separada del monitor validador ML (`/` y `/ml`)."""
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     if not ARB_HTML.is_file():
         return JSONResponse({"detail": "static/arb.html not found"}, status_code=404)

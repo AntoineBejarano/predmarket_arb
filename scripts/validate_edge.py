@@ -868,7 +868,7 @@ def run_main(hours: float | None, threshold: float) -> None:
         )
     else:
         log.info(
-            "Modelos ML listos (%s activos): %s",
+            "Pipelines ML cargados (%s activos): %s",
             len(models),
             ", ".join(sorted(models.keys())),
         )

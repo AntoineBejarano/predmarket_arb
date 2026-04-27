@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PredMarket Arb — Modelos ML</title>
+  <title>PredMarket Arb — Catálogo ML</title>
   <link rel="icon" type="image/png" href="/static/logo.png" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -25,7 +25,7 @@
             class="rounded-xl ring-1 ring-slate-600 shrink-0 mt-0.5 bg-slate-800/50" />
           <div>
             <h1 class="text-2xl font-bold text-white tracking-tight">PredMarket Arb</h1>
-            <p class="text-slate-400 text-sm mt-1">Validador ML — catálogo de modelos</p>
+            <p class="text-slate-400 text-sm mt-1">Registro de pipelines ML vs mercado (Gamma, signals.csv)</p>
             <p class="text-xs text-slate-500 mt-2 max-w-xl">
               Cada tarjeta enlaza al <strong class="text-slate-400">panel en detalle</strong> (métricas, CSV, START/STOP del worker).
               El interruptor guarda preferencia en <code class="text-slate-500">data/model_state.json</code>; hoy <code class="text-slate-500">validate_edge</code> sigue un solo pipeline (LightGBM 5m + NearRes).
@@ -35,9 +35,9 @@
       </div>
       <nav class="flex flex-wrap gap-2 items-center text-sm">
         <span class="text-slate-500">Vistas:</span>
-        <span class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Modelos ML</span>
-        <a href="/" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Detalle modelo por defecto (/)</a>
-        <a href="/arb" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Estrategias matemáticas</a>
+        <span class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Catálogo ML</span>
+        <a href="/" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Monitor validador</a>
+        <a href="/arb" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Motor Arb (CLOB)</a>
       </nav>
     </header>
 

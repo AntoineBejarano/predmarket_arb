@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PredMarket Arb — Detalle modelo ML</title>
+  <title>PredMarket Arb — Monitor validador</title>
   <link rel="icon" type="image/png" href="/static/logo.png" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -63,9 +63,9 @@
 
     <nav class="flex flex-wrap gap-2 items-center text-sm -mt-2 mb-2">
       <span class="text-slate-500">Vistas:</span>
-      <a href="/ml" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Todos los modelos</a>
-      <span id="navDetailBadge" class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Detalle modelo</span>
-      <a href="/arb" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Estrategias matemáticas (Arb)</a>
+      <a href="/ml" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Catálogo ML</a>
+      <span id="navDetailBadge" class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Monitor validador</span>
+      <a href="/arb" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Motor Arb (CLOB)</a>
     </nav>
 
     <div id="bannerDisabled" class="hidden rounded-lg border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-200/90 mb-2">
@@ -231,7 +231,7 @@
       const ban = $('bannerDisabled');
       if (modelMeta) {
         if (sub) sub.textContent = modelMeta.label || slug;
-        if (badge) badge.textContent = 'Detalle: ' + (modelMeta.label || slug);
+        if (badge) badge.textContent = 'Monitor · ' + (modelMeta.label || slug);
       } else {
         if (sub) sub.textContent = 'Modelo: ' + slug;
       }
