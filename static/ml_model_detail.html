@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PredMarket Arb — Validador ML</title>
+  <title>PredMarket Arb — Detalle modelo ML</title>
   <link rel="icon" type="image/png" href="/static/logo.png" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -36,7 +36,7 @@
         />
         <div>
           <h1 class="text-2xl font-bold text-white tracking-tight">PredMarket Arb</h1>
-          <p class="text-slate-400 text-sm mt-1">Validador ML — modelos probabilísticos vs mercado</p>
+          <p id="headerSubtitle" class="text-slate-400 text-sm mt-1">Validador ML — cargando modelo…</p>
         </div>
       </div>
       <div class="flex flex-wrap items-center gap-3">
@@ -63,10 +63,22 @@
 
     <nav class="flex flex-wrap gap-2 items-center text-sm -mt-2 mb-2">
       <span class="text-slate-500">Vistas:</span>
-      <span class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Validador ML</span>
+      <a href="/ml" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Todos los modelos</a>
+      <span id="navDetailBadge" class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Detalle modelo</span>
       <a href="/arb" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Estrategias matemáticas (Arb)</a>
     </nav>
 
+    <div id="bannerDisabled" class="hidden rounded-lg border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-200/90 mb-2">
+      Este modelo figura como <strong>desactivado</strong> en <code class="text-amber-100/80">model_state.json</code>. El worker único no cambia aún; es preferencia para cuando haya varios pipelines.
+    </div>
+
+    <div id="stubPanel" class="hidden rounded-xl border border-slate-600 bg-slate-800/40 p-8 text-center space-y-3">
+      <p class="text-slate-300">Este slug está en el catálogo para desarrollo futuro.</p>
+      <p class="text-sm text-slate-500">No hay panel de señales ni CSV dedicado hasta implementar el pipeline en <code class="text-slate-400">validate_edge.py</code>.</p>
+      <a href="/ml" class="inline-block text-indigo-400 hover:underline text-sm">← Volver al listado de modelos</a>
+    </div>
+
+    <div id="mainDashboard">
     <!-- STATUS CARDS -->
     <section class="grid grid-cols-2 lg:grid-cols-4 gap-3">
       <div id="cardUptime" class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
@@ -188,10 +200,58 @@
       <h2 class="text-lg font-semibold text-white mb-3">Last 50 resolved signals</h2>
       <div id="accChart" class="flex flex-wrap gap-0.5 p-4 rounded-xl border border-slate-700 bg-slate-800/30 min-h-[3rem]"></div>
     </section>
+    </div>
   </div>
 
   <script>
     const $ = (id) => document.getElementById(id);
+
+    function currentModelSlug() {
+      const m = window.location.pathname.match(/^\/ml\/model\/([^/]+)\/?$/);
+      if (m) return decodeURIComponent(m[1]);
+      return 'crypto_5m_lgbm';
+    }
+
+    let modelMeta = null;
+
+    async function loadModelMeta() {
+      const slug = currentModelSlug();
+      try {
+        const r = await fetch('/api/ml/models');
+        if (!r.ok) return;
+        const j = await r.json();
+        modelMeta = (j.models || []).find((x) => x.slug === slug) || null;
+      } catch (e) {
+        modelMeta = null;
+      }
+      const sub = $('headerSubtitle');
+      const badge = $('navDetailBadge');
+      const stub = $('stubPanel');
+      const main = $('mainDashboard');
+      const ban = $('bannerDisabled');
+      if (modelMeta) {
+        if (sub) sub.textContent = modelMeta.label || slug;
+        if (badge) badge.textContent = 'Detalle: ' + (modelMeta.label || slug);
+      } else {
+        if (sub) sub.textContent = 'Modelo: ' + slug;
+      }
+      let implemented = !!(modelMeta && modelMeta.implemented);
+      if (!modelMeta && slug === 'crypto_5m_lgbm') implemented = true;
+      const enabled = modelMeta ? !!modelMeta.enabled : true;
+      if (stub && main) {
+        if (!implemented) {
+          stub.classList.remove('hidden');
+          main.classList.add('hidden');
+        } else {
+          stub.classList.add('hidden');
+          main.classList.remove('hidden');
+        }
+      }
+      if (ban) {
+        if (implemented && modelMeta && !enabled) ban.classList.remove('hidden');
+        else ban.classList.add('hidden');
+      }
+    }
 
     function fmtPct(x) {
       if (x === '' || x === undefined || x === null) return '—';
@@ -429,6 +489,11 @@
 
     async function refreshAll() {
       try {
+        await loadModelMeta();
+        const slug = currentModelSlug();
+        let implemented = !!(modelMeta && modelMeta.implemented);
+        if (!modelMeta && slug === 'crypto_5m_lgbm') implemented = true;
+        if (!implemented) return;
         const s = await fetchStatus();
         renderStatus(s);
         const rows = await fetchSignals(200);
@@ -525,7 +590,7 @@
       };
     }
 
-    refreshAll();
+    loadModelMeta().then(() => refreshAll());
     connectSSE();
     setInterval(refreshAll, 10000);
   </script>

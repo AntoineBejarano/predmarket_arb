@@ -33,6 +33,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.debug_markets import run_polymarket_market_debug
+from risk.ml_model_registry import ML_MODELS, ML_MODEL_SLUGS
+from risk.model_state import ModelStateManager
 
 load_dotenv(REPO_ROOT / ".env")
 
@@ -50,7 +52,8 @@ log.propagate = False
 DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
 SIGNALS_CSV = DATA_DIR / "logs" / "signals.csv"
 STATIC_DIR = REPO_ROOT / "static"
-DASHBOARD_HTML = STATIC_DIR / "dashboard.html"
+ML_MODELS_HTML = STATIC_DIR / "ml_models.html"
+ML_MODEL_DETAIL_HTML = STATIC_DIR / "ml_model_detail.html"
 ARB_HTML = STATIC_DIR / "arb.html"
 ARB_STRATEGY_DETAIL_HTML = STATIC_DIR / "arb_strategy_detail.html"
 
@@ -322,6 +325,7 @@ class ValidatorSupervisor:
 
 
 supervisor = ValidatorSupervisor()
+_model_state_manager = ModelStateManager()
 
 
 def build_status_payload() -> dict[str, Any]:
@@ -406,10 +410,30 @@ app.add_middleware(
 
 @app.get("/", response_model=None)
 async def root() -> Union[FileResponse, JSONResponse]:
+    """Validador ML (modelo por defecto); misma UI que /ml/model/crypto_5m_lgbm."""
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
-    if not DASHBOARD_HTML.is_file():
-        return JSONResponse({"detail": "static/dashboard.html not found"}, status_code=404)
-    return FileResponse(path=str(DASHBOARD_HTML), media_type="text/html; charset=utf-8")
+    if not ML_MODEL_DETAIL_HTML.is_file():
+        return JSONResponse({"detail": "static/ml_model_detail.html not found"}, status_code=404)
+    return FileResponse(path=str(ML_MODEL_DETAIL_HTML), media_type="text/html; charset=utf-8")
+
+
+@app.get("/ml", response_model=None)
+async def ml_models_index_page() -> Union[FileResponse, JSONResponse]:
+    """Listado de modelos ML (toggles + enlaces a detalle), análogo a /arb."""
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    if not ML_MODELS_HTML.is_file():
+        return JSONResponse({"detail": "static/ml_models.html not found"}, status_code=404)
+    return FileResponse(path=str(ML_MODELS_HTML), media_type="text/html; charset=utf-8")
+
+
+@app.get("/ml/model/{slug}", response_model=None)
+async def ml_model_detail_page(slug: str) -> Union[FileResponse, JSONResponse]:
+    if slug not in ML_MODEL_SLUGS:
+        return JSONResponse({"detail": "unknown model slug"}, status_code=404)
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    if not ML_MODEL_DETAIL_HTML.is_file():
+        return JSONResponse({"detail": "static/ml_model_detail.html not found"}, status_code=404)
+    return FileResponse(path=str(ML_MODEL_DETAIL_HTML), media_type="text/html; charset=utf-8")
 
 
 @app.get("/arb", response_model=None)
@@ -547,6 +571,35 @@ async def api_signals_live() -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/ml/models")
+async def api_ml_models() -> dict[str, Any]:
+    """Catálogo + estado enabled (persistido); validate_edge aún no selecciona pipeline por slug."""
+    state = await _model_state_manager.get_all()
+    models: list[dict[str, Any]] = []
+    for meta in ML_MODELS:
+        slug = str(meta["slug"])
+        st = state.get(slug, {}) or {}
+        row = {**meta, "enabled": bool(st.get("enabled", False))}
+        models.append(row)
+    return {"models": models}
+
+
+@app.post("/api/ml/models/{slug}/enable")
+async def api_ml_model_enable(slug: str) -> dict[str, Any]:
+    if slug not in ML_MODEL_SLUGS:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {slug}")
+    await _model_state_manager.enable(slug)
+    return {"slug": slug, "enabled": True}
+
+
+@app.post("/api/ml/models/{slug}/disable")
+async def api_ml_model_disable(slug: str) -> dict[str, Any]:
+    if slug not in ML_MODEL_SLUGS:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {slug}")
+    await _model_state_manager.disable(slug)
+    return {"slug": slug, "enabled": False}
 
 
 # ---- ARB ENGINE (subprocess + control plane) ----

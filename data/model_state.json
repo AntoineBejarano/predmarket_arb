@@ -1,0 +1,12 @@
+{
+  "crypto_5m_lgbm": {
+    "enabled": true,
+    "enabled_at": null,
+    "disabled_at": null
+  },
+  "multi_horizon_stub": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null
+  }
+}
