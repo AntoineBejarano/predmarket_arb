@@ -37,24 +37,26 @@ for each active_market:
 
 ## CSV schema
 
-| campo | tipo | descripción |
-|-------|------|-------------|
-| ts | ISO8601 | timestamp UTC |
-| market_id | str | ID del mercado Polymarket |
-| n_outcomes | int | número de outcomes |
-| sum_ask | float | suma de best_ask de todos los outcomes |
-| gas_est | float | coste estimado de gas en USDC |
-| edge | float | 1.0 - sum_ask - gas_est |
-| action | str | SIGNAL / SKIP / EXECUTED / DRY_RUN |
-| size_usdc | float | tamaño de la posición en USDC (0 si SKIP) |
-| dry_run | bool | si fue ejecutado en paper o real |
+
+| campo      | tipo    | descripción                               |
+| ---------- | ------- | ----------------------------------------- |
+| ts         | ISO8601 | timestamp UTC                             |
+| market_id  | str     | ID del mercado Polymarket                 |
+| n_outcomes | int     | número de outcomes                        |
+| sum_ask    | float   | suma de best_ask de todos los outcomes    |
+| gas_est    | float   | coste estimado de gas en USDC             |
+| edge       | float   | 1.0 - sum_ask - gas_est                   |
+| action     | str     | SIGNAL / SKIP / EXECUTED / DRY_RUN        |
+| size_usdc  | float   | tamaño de la posición en USDC (0 si SKIP) |
+| dry_run    | bool    | si fue ejecutado en paper o real          |
+
 
 ## Riesgos
 
 - Resolución ambigua: leer siempre market.rules antes de ejecutar
 - Gas spike en Polygon: si gas > 0.05 USDC/tx, saltar la oportunidad
 - Ventana corta: bots institucionales escanean esto. Edge real en mercados
-  con < $50K volumen total o abiertos hace < 6 horas.
+con < $50K volumen total o abiertos hace < 6 horas.
 
 ## Parámetros (env vars)
 
@@ -62,3 +64,4 @@ for each active_market:
 - BUNDLE_MAX_SIZE_USDC=300 (máximo por trade)
 - BUNDLE_POLL_INTERVAL=10 (segundos entre scans)
 - BUNDLE_MAX_OUTCOMES=5 (descartar mercados con más de N outcomes)
+

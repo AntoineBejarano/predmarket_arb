@@ -27,17 +27,19 @@ solapadas tienen alta probabilidad de relación lógica.
 
 ## CSV schema
 
-| campo | tipo | descripción |
-|-------|------|-------------|
-| ts | ISO8601 | |
-| arb_type | str | REBALANCING / COMBINATORIAL |
-| markets | str | JSON array de market_ids involucrados |
-| legs | str | JSON de {token_id, side, price} por leg |
-| cost_total | float | coste total de abrir todas las legs |
-| fair_value | float | pago garantizado si hay arb |
-| edge | float | fair_value - cost_total - fees |
-| action | str | SIGNAL / SKIP / EXECUTED / DRY_RUN |
-| dry_run | bool | |
+
+| campo      | tipo    | descripción                             |
+| ---------- | ------- | --------------------------------------- |
+| ts         | ISO8601 |                                         |
+| arb_type   | str     | REBALANCING / COMBINATORIAL             |
+| markets    | str     | JSON array de market_ids involucrados   |
+| legs       | str     | JSON de {token_id, side, price} por leg |
+| cost_total | float   | coste total de abrir todas las legs     |
+| fair_value | float   | pago garantizado si hay arb             |
+| edge       | float   | fair_value - cost_total - fees          |
+| action     | str     | SIGNAL / SKIP / EXECUTED / DRY_RUN      |
+| dry_run    | bool    |                                         |
+
 
 ## Parámetros
 
