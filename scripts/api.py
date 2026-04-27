@@ -439,6 +439,18 @@ async def api_signals(
     return df.to_dict(orient="records")
 
 
+@app.get("/api/signals/download", response_model=None)
+async def api_signals_download() -> Union[FileResponse, JSONResponse]:
+    p = signals_path()
+    if not p.is_file():
+        return JSONResponse({"detail": "signals.csv not found"}, status_code=404)
+    return FileResponse(
+        path=str(p),
+        media_type="text/csv; charset=utf-8",
+        filename="signals.csv",
+    )
+
+
 @app.post("/api/debug/polymarket")
 async def api_debug_polymarket() -> dict[str, Any]:
     """
