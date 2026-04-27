@@ -21,6 +21,7 @@ The repository is structured as a **strategy laboratory**: each hypothesis lives
 | `scripts/validate_edge.py` | Worker: Binance + Gamma → `logs/signals.csv` under `DATA_DIR`                      |
 | `static/dashboard.html`    | ML / NearRes control panel (`/`)                                                   |
 | `static/arb.html`          | Arb Engine control panel (`/arb`)                                                  |
+| `static/arb_strategy_detail.html` | Detalle de una estrategia (`/arb/strategy/<slug>`)                          |
 | `static/logo.png`          | Lab logo (header + favicon via `/static/logo.png`)                                 |
 | `models/train.py`          | Training; PKL under `models/saved/`                                                |
 | `models/saved/*.pkl`       | Shipped for Railway/local without retraining                                       |

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Detalle estrategia — PredMarket Arb</title>
+  <link rel="icon" type="image/png" href="/static/logo.png" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { fontFamily: { mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'] } } } };
+  </script>
+</head>
+<body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
+  <div class="max-w-5xl mx-auto px-4 py-6 space-y-6">
+    <header class="border-b border-slate-700 pb-5">
+      <nav class="flex flex-wrap gap-2 text-sm mb-4">
+        <a href="/" class="text-slate-400 hover:text-white">Validador ML</a>
+        <span class="text-slate-600">/</span>
+        <a href="/arb" class="text-indigo-400 hover:underline">Arb (todas)</a>
+        <span class="text-slate-600">/</span>
+        <span id="nav-slug" class="text-slate-200 font-medium">…</span>
+      </nav>
+      <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+        <div>
+          <h1 id="title-h1" class="text-2xl font-bold text-white tracking-tight">Estrategia</h1>
+          <p id="title-sub" class="text-sm text-slate-400 mt-1">Detalle, paper PnL y log CSV</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <span id="dry-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">DRY_RUN</span>
+          <span id="run-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">motor</span>
+          <button type="button" onclick="arbStart()" class="text-xs px-3 py-1.5 border border-slate-600 rounded-md hover:bg-slate-800">Start motor</button>
+          <button type="button" onclick="arbStop()" class="text-xs px-3 py-1.5 border border-red-900 text-red-400 rounded-md hover:bg-red-950/30">Stop motor</button>
+        </div>
+      </div>
+    </header>
+
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">Activada</p>
+        <div class="mt-2 flex items-center gap-2">
+          <button type="button" id="btn-toggle" onclick="toggleEnabled()"
+            class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent bg-slate-600 transition-colors">
+            <span id="toggle-knob" class="pointer-events-none inline-block h-5 w-5 translate-x-0 transform rounded-full bg-white shadow transition-transform"></span>
+          </button>
+          <span id="toggle-label" class="text-xs text-slate-400">—</span>
+        </div>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">Capital paper</p>
+        <p id="k-cap" class="font-mono text-lg text-indigo-200 mt-1">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">PnL acum. (est.)</p>
+        <p id="k-pnl" class="font-mono text-lg mt-1">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">ROI · ops paper</p>
+        <p id="k-roi" class="font-mono text-lg text-slate-200 mt-1">—</p>
+        <p id="k-trades" class="text-xs text-slate-500 mt-0.5">—</p>
+      </div>
+    </section>
+
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <p class="text-xs text-slate-500">Señales hoy</p>
+        <p id="k-sig" class="font-mono text-white">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <p class="text-xs text-slate-500">Mejor edge hoy</p>
+        <p id="k-edge" class="font-mono text-yellow-400/90">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <p class="text-xs text-slate-500">Última acción</p>
+        <p id="k-last-a" class="font-mono text-xs text-slate-300 truncate">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <p class="text-xs text-slate-500">Última hora (UTC)</p>
+        <p id="k-last-t" class="font-mono text-xs text-slate-400">—</p>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="text-sm font-medium text-slate-300 mb-2">Live (solo esta estrategia)</h2>
+      <div id="live-feed" class="font-mono text-xs bg-slate-950 rounded-lg p-3 h-40 overflow-y-auto border border-slate-700 space-y-0.5">
+        <p class="text-slate-600">Esperando eventos…</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+        <h2 class="text-sm font-medium text-slate-300">Log CSV (últimas filas)</h2>
+        <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
+      </div>
+      <div class="overflow-x-auto rounded-xl border border-slate-700">
+        <table class="w-full text-xs text-left min-w-[720px]">
+          <thead id="log-head" class="bg-slate-800 text-slate-400 uppercase"></thead>
+          <tbody id="log-body" class="divide-y divide-slate-800 font-mono"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <p class="text-xs text-slate-600">Capital paper y acumulados viven en <code class="text-slate-500">data/strategy_state.json</code>. Más estrategias tendrán su propia ruta bajo <code class="text-slate-500">/arb/strategy/&lt;slug&gt;</code>.</p>
+  </div>
+
+  <script>
+    const KNOWN = new Set(["bundle_arb", "cross_exchange", "market_maker", "combinatorial_arb", "term_structure", "latency_arb"]);
+    const SLUG = (function () {
+      const p = location.pathname.replace(/\/$/, "").split("/").filter(Boolean);
+      return p[p.length - 1] || "";
+    })();
+
+    if (!KNOWN.has(SLUG)) {
+      window.location.href = "/arb";
+    }
+
+    document.getElementById("nav-slug").textContent = SLUG;
+    document.getElementById("title-h1").textContent = SLUG.replace(/_/g, " ");
+    document.title = SLUG + " — detalle · PredMarket Arb";
+
+    const ACTION_COLOR = {
+      SIGNAL: "text-yellow-400",
+      EXECUTED: "text-emerald-400",
+      QUOTE: "text-cyan-400",
+      "SKIP:": "text-slate-500",
+      "ERROR:": "text-red-400",
+    };
+    function esc(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/\"/g, "&quot;");
+    }
+
+    function actionClass(a) {
+      if (!a) return "text-slate-400";
+      if (a.startsWith("SKIP:")) return "text-slate-500";
+      if (a.startsWith("ERROR:")) return "text-red-400";
+      for (const [k, v] of Object.entries(ACTION_COLOR)) {
+        if (a.startsWith(k)) return v;
+      }
+      return "text-slate-400";
+    }
+
+    let _enabled = false;
+
+    async function refreshStatus() {
+      let data = { strategies: [], dry_run: true, engine_running: false };
+      try {
+        const r = await fetch("/api/arb/status");
+        if (r.ok) data = await r.json();
+      } catch (e) {}
+      const s = (data.strategies || []).find((x) => x.slug === SLUG) || {};
+      _enabled = !!s.enabled;
+
+      const dry = document.getElementById("dry-badge");
+      if (dry) {
+        dry.textContent = data.dry_run ? "DRY_RUN" : "LIVE";
+        dry.className = "text-xs px-2 py-0.5 rounded-full " + (data.dry_run ? "bg-emerald-900/60 text-emerald-200" : "bg-red-900/60 text-red-200");
+      }
+      const rb = document.getElementById("run-badge");
+      if (rb) {
+        rb.textContent = data.engine_running ? "● motor RUNNING" : "motor STOPPED";
+        rb.className = "text-xs px-2 py-0.5 rounded-full " + (data.engine_running ? "bg-emerald-900/50 text-emerald-200" : "bg-slate-700 text-slate-400");
+      }
+
+      document.getElementById("k-cap").textContent = s.fict_capital_eur != null ? Number(s.fict_capital_eur).toFixed(0) + " u" : "—";
+      const pnl = s.fict_pnl_cumulative_eur;
+      const elPnl = document.getElementById("k-pnl");
+      if (elPnl) {
+        elPnl.textContent = pnl != null ? Number(pnl).toFixed(4) : "—";
+        elPnl.className = "font-mono text-lg mt-1 " + ((pnl || 0) >= 0 ? "text-emerald-400" : "text-red-400");
+      }
+      document.getElementById("k-roi").textContent = s.fict_roi != null ? (Number(s.fict_roi) * 100).toFixed(2) + "%" : "—";
+      document.getElementById("k-trades").textContent = s.fict_trades != null ? "Ops paper: " + s.fict_trades : "—";
+
+      document.getElementById("k-sig").textContent = s.signals_today != null ? String(s.signals_today) : "—";
+      document.getElementById("k-edge").textContent = s.best_edge_today != null ? (Number(s.best_edge_today) * 100).toFixed(2) + "%" : "—";
+      document.getElementById("k-last-a").textContent = s.last_action || "—";
+      document.getElementById("k-last-t").textContent = s.last_ts ? String(s.last_ts).substring(11, 19) + "Z" : "—";
+
+      const btn = document.getElementById("btn-toggle");
+      const knob = document.getElementById("toggle-knob");
+      const lab = document.getElementById("toggle-label");
+      if (btn && knob) {
+        btn.className = "relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors " + (_enabled ? "bg-emerald-600" : "bg-slate-600");
+        knob.className = "pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow transition-transform " + (_enabled ? "translate-x-5" : "translate-x-0");
+      }
+      if (lab) lab.textContent = _enabled ? "encendida" : "apagada";
+    }
+
+    async function toggleEnabled() {
+      const path = _enabled ? "disable" : "enable";
+      await fetch("/api/arb/strategy/" + SLUG + "/" + path, { method: "POST" });
+      await refreshStatus();
+    }
+
+    async function arbStart() {
+      await fetch("/api/arb/start", { method: "POST" });
+      await refreshStatus();
+    }
+    async function arbStop() {
+      await fetch("/api/arb/stop", { method: "POST" });
+      await refreshStatus();
+    }
+
+    function pushLiveLine(payload) {
+      if (String(payload.strategy || "") !== SLUG) return;
+      const feed = document.getElementById("live-feed");
+      if (!feed) return;
+      if (feed.querySelector("p.text-slate-600")) feed.innerHTML = "";
+      const p = document.createElement("p");
+      const a = payload.action || "—";
+      p.className = "font-mono";
+      p.innerHTML = '<span class="text-slate-500">' + String(payload.ts || "").substring(11, 19) + '</span> <span class="' + actionClass(a) + '">' + a + "</span> <span class=\"text-slate-500\">" + String(payload.reason || "").slice(0, 120) + "</span>";
+      feed.prepend(p);
+      while (feed.children.length > 80) feed.removeChild(feed.lastChild);
+    }
+
+    function startLive() {
+      const es = new EventSource("/api/arb/signals/live");
+      es.onmessage = (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          pushLiveLine(d);
+        } catch (err) {}
+      };
+      es.onerror = () => es.close();
+    }
+
+    const PREFERRED_ORDER = ["ts", "action", "reason", "edge", "size_usdc", "fict_stake_eur", "fict_pnl_est_eur", "fict_pnl_cum_eur", "fict_roi", "market_id", "n_outcomes", "sum_ask", "gas_est", "dry_run"];
+
+    async function loadLog() {
+      const tbody = document.getElementById("log-body");
+      const thead = document.getElementById("log-head");
+      if (!tbody || !thead) return;
+      let rows = [];
+      try {
+        const r = await fetch("/api/arb/strategy/" + SLUG + "/log?limit=400");
+        if (r.ok) rows = await r.json();
+      } catch (e) {}
+      if (!rows.length) {
+        thead.innerHTML = "<tr><th class=\"px-2 py-2\">—</th></tr>";
+        tbody.innerHTML = "<tr><td class=\"px-2 py-4 text-slate-500\">Sin filas en el CSV aún</td></tr>";
+        return;
+      }
+      const keys = new Set();
+      rows.forEach((row) => Object.keys(row).forEach((k) => keys.add(k)));
+      const ordered = [];
+      PREFERRED_ORDER.forEach((k) => {
+        if (keys.has(k)) ordered.push(k);
+      });
+      keys.forEach((k) => {
+        if (!ordered.includes(k)) ordered.push(k);
+      });
+      thead.innerHTML = "<tr>" + ordered.map((k) => "<th class=\"px-2 py-2 font-medium whitespace-nowrap\">" + k + "</th>").join("") + "</tr>";
+      tbody.innerHTML = [...rows].reverse().map((row) => {
+        return "<tr class=\"hover:bg-slate-800/40\">" + ordered.map((k) => {
+          let v = row[k];
+          if (v == null || v === "") v = "—";
+          const vs = String(v);
+          const cls = k === "action" ? actionClass(vs) : "text-slate-300";
+          return "<td class=\"px-2 py-1.5 max-w-[220px] truncate " + cls + "\" title=\"" + esc(vs) + "\">" + esc(vs) + "</td>";
+        }).join("") + "</tr>";
+      }).join("");
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      refreshStatus();
+      setInterval(refreshStatus, 6000);
+      loadLog();
+      setInterval(loadLog, 20000);
+      startLive();
+    });
+  </script>
+</body>
+</html>

@@ -30,7 +30,7 @@ El repo está organizado como **laboratorio de estrategias** (`strategies/`): ca
 - `clients/poly_clob.py` — CLOB REST (`/markets`, `/book`, `/order`, cancelaciones L2), WebSocket `subscribe_market` (payload tipo `market` con `assets_ids`). Firma de órdenes: `clients/poly_order_live.py` + `clients/poly_clob_auth.py` (HMAC L2 alineado con `py_clob_client`).
 - `clients/kalshi_rest.py` — cliente REST Kalshi (stubs donde aplique).
 - `scripts/healthcheck.py` — handler HTTP mínimo usado por el worker.
-- `static/dashboard.html` — validador ML / NearRes (`/`). `static/arb.html` — Arb Engine (`/arb`). Navegación cruzada entre ambas.
+- `static/dashboard.html` — validador ML / NearRes (`/`). `static/arb.html` — Arb Engine (`/arb`). `static/arb_strategy_detail.html` — detalle por estrategia (`/arb/strategy/<slug>`, p. ej. `bundle_arb`). Navegación cruzada entre vistas.
 - `Dockerfile` / `railway.toml` — arranque con `python scripts/api.py`; healthcheck Railway en `/health` del API.
 
 En `**python:3.11-slim`** hace falta el paquete `**libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
@@ -62,7 +62,7 @@ python scripts/validate_edge.py --hours 72
 
 # API + dashboard (supervisor)
 AUTO_START=false PORT=8080 python scripts/api.py
-# http://127.0.0.1:8080/ (validador ML) · http://127.0.0.1:8080/arb (estrategias matemáticas) — http://127.0.0.1:8080/health
+# http://127.0.0.1:8080/ (validador ML) · http://127.0.0.1:8080/arb (estrategias) · http://127.0.0.1:8080/arb/strategy/bundle_arb (detalle) — http://127.0.0.1:8080/health
 ```
 
 ## Convenciones al editar

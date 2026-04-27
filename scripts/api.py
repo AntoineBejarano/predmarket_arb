@@ -52,6 +52,17 @@ SIGNALS_CSV = DATA_DIR / "logs" / "signals.csv"
 STATIC_DIR = REPO_ROOT / "static"
 DASHBOARD_HTML = STATIC_DIR / "dashboard.html"
 ARB_HTML = STATIC_DIR / "arb.html"
+ARB_STRATEGY_DETAIL_HTML = STATIC_DIR / "arb_strategy_detail.html"
+
+STRATEGY_SLUGS = [
+    "bundle_arb",
+    "cross_exchange",
+    "market_maker",
+    "combinatorial_arb",
+    "term_structure",
+    "latency_arb",
+]
+ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SLUGS}
 
 
 def signals_path() -> Path:
@@ -409,6 +420,17 @@ async def arb_dashboard() -> Union[FileResponse, JSONResponse]:
     return FileResponse(path=str(ARB_HTML), media_type="text/html; charset=utf-8")
 
 
+@app.get("/arb/strategy/{slug}", response_model=None)
+async def arb_strategy_detail_page(slug: str) -> Union[FileResponse, JSONResponse]:
+    """Vista detallada de una estrategia del arb (paper / CSV / feed filtrado en cliente)."""
+    if slug not in STRATEGY_SLUGS:
+        return JSONResponse({"detail": "unknown strategy slug"}, status_code=404)
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    if not ARB_STRATEGY_DETAIL_HTML.is_file():
+        return JSONResponse({"detail": "static/arb_strategy_detail.html not found"}, status_code=404)
+    return FileResponse(path=str(ARB_STRATEGY_DETAIL_HTML), media_type="text/html; charset=utf-8")
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -532,17 +554,6 @@ from risk.strategy_state import StrategyStateManager
 _arb_proc: Optional[subprocess.Popen[Any]] = None
 _arb_lock = threading.Lock()
 _state_manager = StrategyStateManager()
-
-STRATEGY_SLUGS = [
-    "bundle_arb",
-    "cross_exchange",
-    "market_maker",
-    "combinatorial_arb",
-    "term_structure",
-    "latency_arb",
-]
-ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SLUGS}
-
 
 def _read_arb_csv_tail(path: Path, n: int = 200) -> list[dict[str, Any]]:
     if not path.is_file():
