@@ -89,8 +89,10 @@
         <div>
           <h2 class="text-sm font-medium text-indigo-200">Último escaneo CLOB (bundle arb)</h2>
           <p class="text-xs text-slate-500 mt-1">
-            Origen: <code class="text-slate-400">GET https://clob.polymarket.com/markets</code> paginado + <code class="text-slate-400">/book</code> por token.
-            Los contadores explican por qué ves <code class="text-slate-400">SKIP:NO_MARKETS</code> u otras acciones.
+            Origen según <code class="text-slate-400">BUNDLE_DISCOVERY</code>: por defecto Gamma
+            <code class="text-slate-400">GET gamma-api…/markets</code> + validación
+            <code class="text-slate-400">GET clob…/markets/{condition_id}</code> + <code class="text-slate-400">/book</code> por token.
+            Los contadores explican <code class="text-slate-400">SKIP:*</code> y errores de API.
           </p>
         </div>
         <button type="button" onclick="loadBundleScan()" class="text-xs px-2 py-1 border border-indigo-800 rounded hover:bg-indigo-950/80 shrink-0">Refrescar</button>

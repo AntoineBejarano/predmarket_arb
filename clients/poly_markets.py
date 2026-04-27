@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -151,7 +152,7 @@ class MarketsRegistry:
                 if resp.status != 200:
                     diag["gamma_error"] = f"HTTP {resp.status}: {text[:200]}"
                     break
-                chunk = aiohttp.helpers.json_loads(text)
+                chunk = json.loads(text)
             if not isinstance(chunk, list):
                 diag["gamma_error"] = "response_not_list"
                 break
