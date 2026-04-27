@@ -1,0 +1,22 @@
+# Copy this folder to strategies/<your_strategy_id>/ and edit.
+
+id: my_strategy_id
+domain: other # crypto | sports | politics | other
+title: "Short human title"
+summary: |
+  One paragraph: what market on Polymarket, what signal, what horizon.
+
+polymarket:
+  # Examples: short_term_crypto_5m, sports_game_winner, election_binary
+  market_families: []
+
+# e.g. binance_spot_1m, polymarket_gamma, official_scores_api
+data_sources: []
+
+runtime:
+  # Scripts that implement or validate this strategy (may be empty while designing)
+  validator: null
+  trainer: null
+  dashboard: null
+
+status: draft # draft | active | archived

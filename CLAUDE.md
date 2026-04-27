@@ -4,6 +4,8 @@
 
 Sistema de **paper trading / validación de edge** sobre mercados Polymarket tipo “5m crypto Up or Down”. Compara probabilidad del mercado (Gamma API) con un modelo ML (LightGBM + isotónica) y una heurística NearRes. **No hay trades ni wallet**: solo lectura de APIs y logs en CSV.
 
+El repo está organizado como **laboratorio de estrategias** (`strategies/`): cada estrategia tiene `strategy.yaml`, experimentos bajo `experiments/<slug>/` con `RUNBOOK.md` + `LEARNINGS.md` y métricas pequeñas en git. Ver [strategies/README.md](strategies/README.md) (inglés).
+
 ## Arquitectura en dos procesos
 
 

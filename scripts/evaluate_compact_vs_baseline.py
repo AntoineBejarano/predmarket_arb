@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,8 +25,12 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from lab.paths import default_compact_experiment_dir
+
 COMPACT_DIR = REPO_ROOT / "data" / "raw" / "exogenous" / "compact_5m"
-REPORTS_DIR = REPO_ROOT / "reports"
 
 BASELINE_FEATURES = [
     "ret_1",
@@ -148,6 +153,7 @@ class EvalCfg:
     start: str
     n_splits: int
     verbose: bool
+    experiment_dir: Path
 
 
 def parse_args() -> EvalCfg:
@@ -156,6 +162,12 @@ def parse_args() -> EvalCfg:
     p.add_argument("--start", default="2021-01-01")
     p.add_argument("--n-splits", type=int, default=5)
     p.add_argument("--verbose", action="store_true")
+    p.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=None,
+        help="Salida JSON/MD (default: strategies/crypto_5m_updown/experiments/exogenous_compact o PM_STRATEGY_EXPERIMENT_DIR).",
+    )
     a = p.parse_args()
     assets = []
     for x in a.assets:
@@ -163,18 +175,24 @@ def parse_args() -> EvalCfg:
         if not s.endswith("USDT"):
             s = f"{s}USDT"
         assets.append(s)
+    if a.experiment_dir is not None:
+        exp = a.experiment_dir.resolve() if a.experiment_dir.is_absolute() else (REPO_ROOT / a.experiment_dir).resolve()
+    else:
+        exp = default_compact_experiment_dir()
     return EvalCfg(
         assets=list(dict.fromkeys(assets)),
         start=str(a.start),
         n_splits=max(3, int(a.n_splits)),
         verbose=bool(a.verbose),
+        experiment_dir=exp,
     )
 
 
 def main() -> None:
     cfg = parse_args()
     setup_logging(cfg.verbose)
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = cfg.experiment_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     asset_rows: list[dict] = []
     compact_wins = 0
@@ -241,8 +259,8 @@ def main() -> None:
         "decision": decision,
     }
 
-    json_path = REPORTS_DIR / "compact_eval_report.json"
-    md_path = REPORTS_DIR / "compact_eval_report.md"
+    json_path = out_dir / "compact_eval_report.json"
+    md_path = out_dir / "compact_eval_report.md"
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     md_path.write_text(_build_markdown(report), encoding="utf-8")
     log.info("Reporte JSON: %s", json_path.relative_to(REPO_ROOT))

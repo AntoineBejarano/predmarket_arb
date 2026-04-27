@@ -1,0 +1,23 @@
+id: crypto_5m_updown
+domain: crypto
+title: "5m crypto spot vs Polymarket Up/Down"
+summary: |
+  Compare Polymarket implied probabilities for short-horizon crypto Up/Down windows
+  with a LightGBM + isotonic model and NearRes heuristic on Binance-derived 5m features.
+
+polymarket:
+  market_families:
+    - short_term_crypto_5m
+
+data_sources:
+  - binance_spot_1m_bulk
+  - gamma_markets_api
+  - binance_um_aggtrades_optional
+  - polymarket_clob_prices_history_optional
+
+runtime:
+  validator: scripts/validate_edge.py
+  trainer: models/train.py
+  dashboard: scripts/api.py
+
+status: active

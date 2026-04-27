@@ -1,7 +1,7 @@
 [project]
 name = "predmarket-arb"
 version = "0.1.0"
-description = "Polymarket prediction arbitrage system"
+description = "Polymarket strategy lab: paper trading, ML edge validation, reproducible experiments"
 requires-python = ">=3.11"
 
 dependencies = [

@@ -3,15 +3,32 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-REPORTS_DIR = REPO_ROOT / "reports"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from lab.paths import default_compact_experiment_dir
 
 
 def main() -> None:
-    p = REPORTS_DIR / "compact_eval_report.json"
+    ap = argparse.ArgumentParser(description="GO/NO-GO desde compact_eval_report.json.")
+    ap.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=None,
+        help="Carpeta del experimento (default: strategies/crypto_5m_updown/experiments/exogenous_compact).",
+    )
+    a = ap.parse_args()
+    if a.experiment_dir is not None:
+        out_dir = a.experiment_dir.resolve() if a.experiment_dir.is_absolute() else (REPO_ROOT / a.experiment_dir).resolve()
+    else:
+        out_dir = default_compact_experiment_dir()
+    p = out_dir / "compact_eval_report.json"
     if not p.is_file():
         raise SystemExit(f"Falta {p}. Ejecuta scripts/evaluate_compact_vs_baseline.py primero.")
     rep = json.loads(p.read_text(encoding="utf-8"))
@@ -31,7 +48,7 @@ def main() -> None:
         "wins": wins,
         "mean_delta_vs_baseline": mean_delta,
     }
-    out_path = REPORTS_DIR / "compact_go_no_go.json"
+    out_path = out_dir / "compact_go_no_go.json"
     out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(json.dumps(out, indent=2))
 

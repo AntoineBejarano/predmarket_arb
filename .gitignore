@@ -18,13 +18,15 @@ __pycache__/
 # Logs (Railway generates these)
 logs/
 
-# Reports: ignore bulky local exploration; keep compact analysis for forks
-reports/*
-!reports/compact_baseline_freeze.json
-!reports/compact_eval_report.json
-!reports/compact_eval_report.md
-!reports/compact_go_no_go.json
-!reports/compact_feature_spec.md
+# Local exploration outputs (PNGs, scratch); strategy evidence lives under strategies/
+reports/
+
+# Strategy lab — keep LEARNINGS/RUNBOOK + small JSON/MD in git; ignore heavy outputs
+strategies/**/data/
+strategies/**/scratch/
+strategies/**/experiments/**/*.png
+strategies/**/experiments/**/*.parquet
+strategies/**/experiments/**/*.zip
 
 # Local agent / IDE artefacts
 .claude/

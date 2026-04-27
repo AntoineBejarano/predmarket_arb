@@ -10,7 +10,9 @@ Mide, por activo:
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from pathlib import Path
 
 import joblib
@@ -18,9 +20,13 @@ import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from lab.paths import default_compact_experiment_dir
+
 RAW_DIR = REPO_ROOT / "data" / "raw"
 MODELS_DIR = REPO_ROOT / "models" / "saved"
-REPORTS_DIR = REPO_ROOT / "reports"
 
 ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
 FEATURES = [
@@ -101,14 +107,26 @@ def run_one(asset: str) -> dict:
 
 
 def main() -> None:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser(description="Congela baseline vs modelo guardado.")
+    ap.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=None,
+        help="Directorio de salida (default: lab path crypto exogenous_compact o PM_STRATEGY_EXPERIMENT_DIR).",
+    )
+    a = ap.parse_args()
+    if a.experiment_dir is not None:
+        out_dir = a.experiment_dir.resolve() if a.experiment_dir.is_absolute() else (REPO_ROOT / a.experiment_dir).resolve()
+    else:
+        out_dir = default_compact_experiment_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
     rows = [run_one(a) for a in ASSETS]
     report = {
         "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
         "baseline_target": "close[t+1] >= open[t+1]",
         "assets": rows,
     }
-    p = REPORTS_DIR / "compact_baseline_freeze.json"
+    p = out_dir / "compact_baseline_freeze.json"
     p.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
 
