@@ -27,6 +27,7 @@ from rich.panel import Panel  # noqa: E402
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn  # noqa: E402
 from rich.table import Table  # noqa: E402
 from sklearn.calibration import calibration_curve  # noqa: E402
+from sklearn.base import clone  # noqa: E402
 from sklearn.isotonic import IsotonicRegression  # noqa: E402
 from sklearn.metrics import (  # noqa: E402
     accuracy_score,
@@ -348,22 +349,28 @@ def train_final_and_calibrate(
     df5: pd.DataFrame,
     _fold_rows: list[FoldMetrics],
 ) -> tuple[Any, IsotonicRegression, np.ndarray, np.ndarray, float]:
-    """Modelo en todo el histórico; isotonic ajustada en val del último fold con probas del modelo final."""
+    """Calibración honesta en val OOS y modelo final de despliegue reentrenado en todo el histórico."""
     idx = df5.index
     last = WF_FOLDS[-1]
-    _, _tr_s, _tr_e, va_s, va_e = last
+    _, tr_s, tr_e, va_s, va_e = last
+    m_tr = mask_interval(idx, tr_s, tr_e)
     m_va = mask_interval(idx, va_s, va_e)
+    X_tr, y_tr = df5.loc[m_tr, FEATURES], df5.loc[m_tr, "target"].astype(int)
     X_va, y_va = df5.loc[m_va, FEATURES], df5.loc[m_va, "target"].astype(int)
 
     final_clf = make_lgbm()
-    X_all, y_all = df5[FEATURES], df5["target"].astype(int)
-    final_clf.fit(X_all, y_all)
+    final_clf.fit(X_tr, y_tr)
     raw_val = final_clf.predict_proba(X_va)[:, 1]
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(raw_val, y_va.values)
     cal_val = apply_calibrator(iso, raw_val)
     ece = expected_calibration_error(y_va.values, cal_val)
-    return final_clf, iso, y_va.values, cal_val, ece
+
+    # Modelo final para despliegue: entrenado con todo el histórico.
+    deploy_clf = clone(final_clf)
+    X_all, y_all = df5[FEATURES], df5["target"].astype(int)
+    deploy_clf.fit(X_all, y_all)
+    return deploy_clf, iso, y_va.values, cal_val, ece
 
 
 def train_regime_pair(

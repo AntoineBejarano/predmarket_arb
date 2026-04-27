@@ -297,3 +297,126 @@ def polymarket_crypto_ws_bundle(
         t.start()
         threads.append(t)
     return threads
+
+
+def clob_market_ws_bundle(
+    stop_event: threading.Event,
+    tick_lock: threading.Lock,
+    market_prices: dict[str, float],
+    token_ids: list[str],
+) -> threading.Thread:
+    """
+    CLOB market WS (sin auth): mantiene midpoint por token_id (asset_id).
+    Re-suscribe automáticamente si cambia token_ids.
+    """
+    try:
+        import websocket  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise RuntimeError("Instala websocket-client (pyproject / uv pip)") from e
+
+    ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+    def _run() -> None:
+        ws_holder: dict[str, Any] = {"ws": None}
+        subscribed_ids: set[str] = set()
+
+        def _wanted_ids() -> list[str]:
+            # token_ids se comparte desde validate_edge; hacemos copia para evitar carreras.
+            dedup = list(dict.fromkeys(str(t) for t in token_ids if str(t).strip()))
+            return dedup
+
+        def _send_subscription(ws: Any) -> None:
+            wanted = _wanted_ids()
+            if not wanted:
+                return
+            sub = {
+                "assets_ids": wanted,
+                "type": "market",
+                "custom_feature_enabled": True,
+            }
+            ws.send(json.dumps(sub))
+            subscribed_ids.clear()
+            subscribed_ids.update(wanted)
+            log.info("CLOB WS: subscribed to %s tokens", len(wanted))
+
+        def on_open(ws: Any) -> None:
+            ws_holder["ws"] = ws
+            try:
+                _send_subscription(ws)
+            except Exception as e:
+                log.warning("CLOB WS: fallo al suscribir: %s", e)
+
+        def on_message(_ws: Any, message: Any) -> None:
+            try:
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", errors="replace")
+                data = json.loads(message)
+                if not isinstance(data, dict):
+                    return
+                event_type = data.get("event_type")
+                asset_id = str(data.get("asset_id", ""))
+                if not asset_id:
+                    return
+
+                if event_type == "book":
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    if bids and asks:
+                        mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                        with tick_lock:
+                            market_prices[asset_id] = mid
+                elif event_type == "price_change":
+                    for change in data.get("price_changes", []):
+                        bid = change.get("best_bid")
+                        ask = change.get("best_ask")
+                        if bid and ask:
+                            mid = (float(bid) + float(ask)) / 2.0
+                            with tick_lock:
+                                market_prices[asset_id] = mid
+                elif event_type == "last_trade_price":
+                    price = data.get("price")
+                    if price:
+                        with tick_lock:
+                            market_prices.setdefault(asset_id, float(price))
+            except Exception as e:
+                log.error("CLOB WS message error: %s", e)
+
+        def on_error(_ws: Any, error: Any) -> None:
+            log.error("CLOB WS error: %s", error)
+
+        def on_close(_ws: Any, code: Any, msg: Any) -> None:
+            ws_holder["ws"] = None
+            log.info("CLOB WS closed: %s %s", code, msg)
+
+        def heartbeat() -> None:
+            while not stop_event.is_set():
+                try:
+                    ws = ws_holder.get("ws")
+                    if ws is not None:
+                        ws.send(json.dumps({"type": "heartbeat"}))
+                        wanted = set(_wanted_ids())
+                        if wanted and wanted != subscribed_ids:
+                            _send_subscription(ws)
+                except Exception:
+                    pass
+                stop_event.wait(10)
+
+        while not stop_event.is_set():
+            ws_app = websocket.WebSocketApp(
+                ws_url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            hb = threading.Thread(target=heartbeat, name="clob-market-heartbeat", daemon=True)
+            hb.start()
+            ws_app.run_forever(ping_interval=30)
+            ws_holder["ws"] = None
+            if not stop_event.is_set():
+                log.info("CLOB WS: reconnecting in 5s")
+                stop_event.wait(5)
+
+    t = threading.Thread(target=_run, name="clob-market-ws", daemon=True)
+    t.start()
+    return t

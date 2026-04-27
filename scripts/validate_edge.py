@@ -90,6 +90,7 @@ CSV_COLUMNS = [
     "direction",
     "confidence",
     "volume_usdc",
+    "price_source",
     "result",
 ]
 
@@ -112,6 +113,10 @@ WINDOW_DURATION_MIN = float(os.getenv("WINDOW_DURATION_MIN", "5"))
 CSV_WRITE_RETRIES = 3
 
 log = logging.getLogger("validate_edge")
+MARKET_PRICES: dict[str, float] = {}
+OHLCV_BUFFER: dict[str, deque[dict[str, float]]] = {
+    asset: deque(maxlen=60) for asset in ASSET_MAP
+}
 
 
 def setup_logging() -> None:
@@ -219,20 +224,14 @@ def pick_regime_models(
     return lm.clf, lm.cal
 
 
-def build_feature_row_from_closes(closes: list[float], now: datetime) -> tuple[dict[str, float], str] | None:
-    """Replica lógica de features de models/train.py sobre velas ~5m; vol_zscore=0, vol_trend=1 (sin volumen en ticker)."""
-    if len(closes) < 55:
+def build_feature_row_from_ohlcv(
+    candles: list[dict[str, float]],
+    now: datetime,
+) -> tuple[dict[str, float], str] | None:
+    """Features sobre velas 5m OHLCV reales de Binance."""
+    if len(candles) < 55:
         return None
-    s = pd.Series(closes, dtype=np.float64, name="close")
-    df = pd.DataFrame(
-        {
-            "close": s,
-            "open": s,
-            "high": s,
-            "low": s,
-            "volume": 1.0,
-        }
-    )
+    df = pd.DataFrame(candles)
     df["ret_1"] = df["close"].pct_change(1)
     df["ret_3"] = df["close"].pct_change(3)
     df["ret_6"] = df["close"].pct_change(6)
@@ -247,8 +246,7 @@ def build_feature_row_from_closes(closes: list[float], now: datetime) -> tuple[d
     vs = df["volume"].rolling(20).std()
     df["vol_zscore"] = (df["volume"] - vm) / vs.replace(0, np.nan)
     df["vol_zscore"] = df["vol_zscore"].fillna(0.0)
-    df["vol_zscore"] = 0.0
-    df["vol_trend"] = 1.0
+    df["vol_trend"] = df["volume"] / df["volume"].shift(3)
     df["hour"] = now.hour
     df["dow"] = now.weekday()
     df["is_ny_open"] = 1 if 13 <= now.hour <= 16 else 0
@@ -304,6 +302,32 @@ def parse_outcome_prices(m: dict[str, Any]) -> list[float] | None:
         return None
 
 
+def parse_clob_token_ids(m: dict[str, Any]) -> list[str]:
+    raw = m.get("clobTokenIds")
+    parsed = parse_json_maybe(raw)
+    if not isinstance(parsed, (list, tuple)):
+        return []
+    out: list[str] = []
+    for x in parsed:
+        sx = str(x).strip()
+        if sx:
+            out.append(sx)
+    return out
+
+
+def get_clob_midpoint(token_id: str, session: requests.Session) -> float | None:
+    try:
+        r = session.get(
+            "https://clob.polymarket.com/midpoint",
+            params={"token_id": token_id},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return float(r.json()["mid"])
+    except Exception:
+        return None
+
+
 def get_condition_id(m: dict[str, Any]) -> str | None:
     cid = m.get("conditionId") or m.get("condition_id")
     if cid is None:
@@ -322,6 +346,51 @@ def fetch_binance_price(symbol: str, session: requests.Session, last_good: dict[
     except Exception as e:
         log.warning("Binance %s: %s — usando último precio conocido si existe", symbol, e)
         return last_good.get(symbol)
+
+
+def fetch_real_5m_ohlcv(symbol: str, session: requests.Session) -> list[dict[str, float]] | None:
+    try:
+        r = session.get(
+            f"{BINANCE_BASE_URL}/api/v3/klines",
+            params={"symbol": symbol, "interval": "5m", "limit": 60},
+            timeout=10,
+        )
+        r.raise_for_status()
+        raw = r.json()
+        if not isinstance(raw, list):
+            return None
+        out: list[dict[str, float]] = []
+        for c in raw:
+            out.append(
+                {
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "volume": float(c[5]),
+                }
+            )
+        return out
+    except Exception as e:
+        log.warning("fetch_real_5m_ohlcv %s: %s", symbol, e)
+        return None
+
+
+def ohlcv_worker(
+    display_sym: str,
+    binance_sym: str,
+    stop_event: threading.Event,
+    ohlcv_buffer: dict[str, deque[dict[str, float]]],
+    ohlcv_lock: threading.Lock,
+    session: requests.Session,
+) -> None:
+    while not stop_event.is_set():
+        candles = fetch_real_5m_ohlcv(binance_sym, session)
+        if candles:
+            with ohlcv_lock:
+                ohlcv_buffer[display_sym] = deque(candles, maxlen=60)
+            log.debug("OHLCV %s: %s candles", display_sym, len(candles))
+        stop_event.wait(300)
 
 
 def price_worker(
@@ -810,9 +879,14 @@ def run_main(hours: float | None, threshold: float) -> None:
 
     stop_event = threading.Event()
     tick_lock = threading.Lock()
+    ohlcv_lock = threading.Lock()
     price_symbols = list(ASSET_MAP.keys())
     raw_ticks: dict[str, deque[float]] = {s: deque(maxlen=RAW_TICK_MAXLEN) for s in price_symbols}
     closes_5m: dict[str, deque[float]] = {s: deque(maxlen=CLOSES_5M_MAXLEN) for s in price_symbols}
+    ohlcv_buffer = OHLCV_BUFFER
+    with ohlcv_lock:
+        for asset in ASSET_MAP:
+            ohlcv_buffer[asset] = deque(maxlen=60)
     tick_counters: dict[str, int] = {s: 0 for s in price_symbols}
     last_price: dict[str, float] = {}
     session = requests.Session()
@@ -905,8 +979,32 @@ def run_main(hours: float | None, threshold: float) -> None:
             int(BINANCE_POLL_SEC),
         )
 
+    for sym in price_symbols:
+        t_ohlcv = threading.Thread(
+            target=ohlcv_worker,
+            args=(
+                sym,
+                ASSET_MAP[sym]["binance"],
+                stop_event,
+                ohlcv_buffer,
+                ohlcv_lock,
+                session,
+            ),
+            name=f"ohlcv-{sym}",
+            daemon=True,
+        )
+        t_ohlcv.start()
+        threads.append(t_ohlcv)
+    log.info("OHLCV 5m real: hilos=%s (refresh cada 300s)", len(price_symbols))
+
     gamma_cache = GammaCache()
     stats = SessionStats()
+    market_prices = MARKET_PRICES
+    market_prices.clear()
+    clob_token_ids: list[str] = []
+    last_clob_token_set: set[str] = set()
+    clob_thread: threading.Thread | None = None
+    clob_ws_disabled = False
     window_open: dict[str, float] = {}
     pending_end: dict[str, tuple[str, float, datetime]] = {}
     daily_written_for: date | None = None
@@ -947,6 +1045,29 @@ def run_main(hours: float | None, threshold: float) -> None:
                             daily_written_for = yday
 
                     markets = fetch_gamma_markets(session, gamma_cache)
+                    token_ids_now: list[str] = []
+                    for m in markets:
+                        clob_ids = parse_clob_token_ids(m)
+                        if clob_ids:
+                            token_ids_now.append(clob_ids[0])  # Up token
+                    token_set_now = set(token_ids_now)
+                    if token_set_now != last_clob_token_set:
+                        clob_token_ids[:] = sorted(token_set_now)
+                        last_clob_token_set = token_set_now
+                        log.info("CLOB tokens activos: %s", len(clob_token_ids))
+                    if clob_thread is None and not clob_ws_disabled:
+                        try:
+                            clob_thread = polymarket_feed.clob_market_ws_bundle(
+                                stop_event,
+                                tick_lock,
+                                market_prices,
+                                clob_token_ids,
+                            )
+                            threads.append(clob_thread)
+                        except RuntimeError as e:
+                            log.error("%s — CLOB WS desactivado, se usará fallback", e)
+                            clob_ws_disabled = True
+
                     preview_lines: list[tuple[float, str]] = []
 
                     for m in markets:
@@ -988,14 +1109,28 @@ def run_main(hours: float | None, threshold: float) -> None:
                             if minutes_elapsed < 0 or minutes_elapsed >= WINDOW_DURATION_MIN:
                                 continue
 
-                            prices = parse_outcome_prices(m)
-                            if not prices:
-                                continue
-                            p_mercado = float(prices[0])
+                            clob_ids = parse_clob_token_ids(m)
+                            token_id_up = clob_ids[0] if clob_ids else None
+                            price_source = "gamma_fallback"
+                            clob_price: float | None = None
+                            if token_id_up:
+                                with tick_lock:
+                                    clob_price = market_prices.get(token_id_up)
+                                if clob_price is None:
+                                    # Warm-up/fallback rápido mientras llega WS.
+                                    clob_price = get_clob_midpoint(token_id_up, session)
+                            if clob_price is not None:
+                                p_mercado = float(clob_price)
+                                price_source = "clob"
+                            else:
+                                prices = parse_outcome_prices(m)
+                                p_mercado = float(prices[0]) if prices else 0.5
+                                log.debug("No CLOB price for %s, using Gamma fallback", token_id_up)
                             vol_usd = m.get("volume") or m.get("volumeNum") or ""
                             with tick_lock:
                                 px = last_price.get(asset)
-                                c5 = list(closes_5m[asset])
+                            with ohlcv_lock:
+                                candles = list(ohlcv_buffer.get(asset, []))
                             if px is None:
                                 log.debug("Sin precio aún para %s", asset)
                                 continue
@@ -1003,7 +1138,15 @@ def run_main(hours: float | None, threshold: float) -> None:
                                 window_open[cid] = float(px)
                             w0 = window_open[cid]
                             window_return = (float(px) - w0) / w0 if w0 else float("nan")
-                            vol_remaining = 0.0008 * np.sqrt(max(5.0 - minutes_elapsed, 0.1))
+                            VOL_PER_MIN: dict[str, float] = {
+                                "BTC": 0.0008,
+                                "ETH": 0.0010,
+                                "SOL": 0.0018,
+                                "XRP": 0.0015,
+                                "BNB": 0.0010,
+                            }
+                            asset_vol = VOL_PER_MIN.get(asset, 0.0010)
+                            vol_remaining = asset_vol * np.sqrt(max(5.0 - minutes_elapsed, 0.1))
                             if np.isfinite(window_return) and vol_remaining > 0:
                                 p_nearres = float(norm.cdf(window_return / vol_remaining))
                             else:
@@ -1012,11 +1155,11 @@ def run_main(hours: float | None, threshold: float) -> None:
                             p_modelo: float | None = None
                             gap_ml = float("nan")
                             vol_regime = ""
-                            built = build_feature_row_from_closes(c5, now)
+                            built = build_feature_row_from_ohlcv(candles, now)
                             if asset not in models:
                                 log.debug("Sin modelo ML para %s", asset)
                             elif built is None:
-                                log.debug("Features no listas %s (closes_5m=%s)", asset, len(c5))
+                                log.debug("Features no listas %s (ohlcv_5m=%s)", asset, len(candles))
                             else:
                                 feats, vol_regime = built
                                 try:
@@ -1081,6 +1224,7 @@ def run_main(hours: float | None, threshold: float) -> None:
                                 "direction": direction,
                                 "confidence": confidence,
                                 "volume_usdc": vol_usd,
+                                "price_source": price_source,
                                 "result": result,
                             }
                             append_signals_row(row)
