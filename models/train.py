@@ -357,20 +357,40 @@ def train_final_and_calibrate(
     m_va = mask_interval(idx, va_s, va_e)
     X_tr, y_tr = df5.loc[m_tr, FEATURES], df5.loc[m_tr, "target"].astype(int)
     X_va, y_va = df5.loc[m_va, FEATURES], df5.loc[m_va, "target"].astype(int)
+    print(
+        "DEBUG train_final ranges: "
+        f"tr={X_tr.index.min()}..{X_tr.index.max()} "
+        f"va={X_va.index.min()}..{X_va.index.max()}"
+    )
 
     final_clf = make_lgbm()
     final_clf.fit(X_tr, y_tr)
     raw_val = final_clf.predict_proba(X_va)[:, 1]
+    print(f"DEBUG train_final: X_tr={X_tr.shape} X_va={X_va.shape}")
+    print(f"DEBUG raw_val unique: {len(np.unique(raw_val.round(4)))}")
+    print(f"DEBUG raw_val range: {raw_val.min():.4f} - {raw_val.max():.4f}")
+    print(f"DEBUG y_va distribution: {y_va.mean():.4f}")
+
+    # Evitar ECE optimista: calibrar en primer tramo de val y medir en segundo tramo (temporal).
+    split = len(X_va) // 2
+    if split < 100 or (len(X_va) - split) < 100:
+        # Fallback robusto para datasets pequeños.
+        split = max(1, int(len(X_va) * 0.7))
+    raw_cal = raw_val[:split]
+    y_cal = y_va.values[:split]
+    raw_eval = raw_val[split:]
+    y_eval = y_va.values[split:]
+
     iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(raw_val, y_va.values)
-    cal_val = apply_calibrator(iso, raw_val)
-    ece = expected_calibration_error(y_va.values, cal_val)
+    iso.fit(raw_cal, y_cal)
+    cal_eval = apply_calibrator(iso, raw_eval)
+    ece = expected_calibration_error(y_eval, cal_eval)
 
     # Modelo final para despliegue: entrenado con todo el histórico.
     deploy_clf = clone(final_clf)
     X_all, y_all = df5[FEATURES], df5["target"].astype(int)
     deploy_clf.fit(X_all, y_all)
-    return deploy_clf, iso, y_va.values, cal_val, ece
+    return deploy_clf, iso, y_eval, cal_eval, ece
 
 
 def train_regime_pair(
