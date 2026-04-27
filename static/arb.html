@@ -48,7 +48,10 @@
             <span id="arb-running-badge"
               class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">STOPPED</span>
           </div>
-          <p class="text-xs text-slate-500 max-w-xl">Por defecto ninguna estrategia está activa. Activa las que quieras y pulsa Start.</p>
+          <p class="text-xs text-slate-500 max-w-xl">
+            Cada tarjeta: interruptor = estrategia <strong class="text-slate-400">habilitada</strong> (solo esas corren dentro del motor).
+            Start/Stop = proceso <strong class="text-slate-400">arb_engine</strong>. Con otra pestaña en detalle de estrategia, el estado se sincroniza al instante.
+          </p>
         </div>
         <div class="flex gap-2">
           <button type="button" onclick="arbStart()"
@@ -254,19 +257,54 @@
       }).join("");
     }
 
+    /** Sincroniza /arb y /arb/strategy/* en otras pestañas del mismo origen. */
+    function broadcastArbControlPlaneChanged() {
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          if (!window.__arbBus) window.__arbBus = new BroadcastChannel("predmarket_arb_control");
+          window.__arbBus.postMessage({ type: "arb_refresh", t: Date.now() });
+        }
+      } catch (e) {}
+      try {
+        localStorage.setItem("arb_control_plane_ts", String(Date.now()));
+      } catch (e) {}
+    }
+
+    function wireArbCrossTabSync() {
+      if (window.__arbCrossTabWired) return;
+      window.__arbCrossTabWired = true;
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          window.__arbBusListen = new BroadcastChannel("predmarket_arb_control");
+          window.__arbBusListen.addEventListener("message", () => {
+            refreshArbStatus();
+          });
+        }
+      } catch (e) {}
+      window.addEventListener("storage", (ev) => {
+        if (ev.key === "arb_control_plane_ts") refreshArbStatus();
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") refreshArbStatus();
+      });
+    }
+
     async function toggleStrategy(slug, currentlyEnabled) {
       const path = currentlyEnabled ? "disable" : "enable";
       await fetch("/api/arb/strategy/" + slug + "/" + path, { method: "POST" });
       await refreshArbStatus();
+      broadcastArbControlPlaneChanged();
     }
 
     async function arbStart() {
       await fetch("/api/arb/start", { method: "POST" });
       await refreshArbStatus();
+      broadcastArbControlPlaneChanged();
     }
     async function arbStop() {
       await fetch("/api/arb/stop", { method: "POST" });
       await refreshArbStatus();
+      broadcastArbControlPlaneChanged();
     }
 
     async function refreshArbStatus() {
@@ -326,6 +364,7 @@
     }
 
     document.addEventListener("DOMContentLoaded", () => {
+      wireArbCrossTabSync();
       renderCards({ strategies: [], dry_run: true, engine_running: false });
       refreshArbStatus();
       setInterval(refreshArbStatus, 8000);

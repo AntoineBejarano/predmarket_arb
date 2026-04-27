@@ -24,6 +24,11 @@
         <div>
           <h1 id="title-h1" class="text-2xl font-bold text-white tracking-tight">Estrategia</h1>
           <p id="title-sub" class="text-sm text-slate-400 mt-1">Detalle, paper PnL y log CSV</p>
+          <p class="text-xs text-slate-500 mt-2 max-w-lg">
+            <strong class="text-slate-400">Activada</strong> = esta estrategia en <code class="text-slate-500">strategy_state.json</code>.
+            <strong class="text-slate-400">Start / Stop</strong> = proceso <code class="text-slate-500">arb_engine</code> (todas las estrategias).
+            Los cambios se sincronizan con <a href="/arb" class="text-indigo-400 hover:underline">Arb (todas)</a> si tienes ambas pestañas abiertas.
+          </p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <span id="dry-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">DRY_RUN</span>
@@ -163,6 +168,44 @@
 
     let _enabled = false;
 
+    function broadcastArbControlPlaneChanged() {
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          if (!window.__arbBus) window.__arbBus = new BroadcastChannel("predmarket_arb_control");
+          window.__arbBus.postMessage({ type: "arb_refresh", t: Date.now() });
+        }
+      } catch (e) {}
+      try {
+        localStorage.setItem("arb_control_plane_ts", String(Date.now()));
+      } catch (e) {}
+    }
+
+    function wireArbCrossTabSync() {
+      if (window.__arbCrossTabWiredDetail) return;
+      window.__arbCrossTabWiredDetail = true;
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          window.__arbBusListenDetail = new BroadcastChannel("predmarket_arb_control");
+          window.__arbBusListenDetail.addEventListener("message", () => {
+            refreshStatus();
+            if (SLUG === "bundle_arb") loadBundleScan();
+          });
+        }
+      } catch (e) {}
+      window.addEventListener("storage", (ev) => {
+        if (ev.key === "arb_control_plane_ts") {
+          refreshStatus();
+          if (SLUG === "bundle_arb") loadBundleScan();
+        }
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          refreshStatus();
+          if (SLUG === "bundle_arb") loadBundleScan();
+        }
+      });
+    }
+
     async function refreshStatus() {
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
@@ -179,7 +222,7 @@
       }
       const rb = document.getElementById("run-badge");
       if (rb) {
-        rb.textContent = data.engine_running ? "● motor RUNNING" : "motor STOPPED";
+        rb.textContent = data.engine_running ? "● RUNNING" : "STOPPED";
         rb.className = "text-xs px-2 py-0.5 rounded-full " + (data.engine_running ? "bg-emerald-900/50 text-emerald-200" : "bg-slate-700 text-slate-400");
       }
 
@@ -212,15 +255,18 @@
       const path = _enabled ? "disable" : "enable";
       await fetch("/api/arb/strategy/" + SLUG + "/" + path, { method: "POST" });
       await refreshStatus();
+      broadcastArbControlPlaneChanged();
     }
 
     async function arbStart() {
       await fetch("/api/arb/start", { method: "POST" });
       await refreshStatus();
+      broadcastArbControlPlaneChanged();
     }
     async function arbStop() {
       await fetch("/api/arb/stop", { method: "POST" });
       await refreshStatus();
+      broadcastArbControlPlaneChanged();
     }
 
     function pushLiveLine(payload) {
@@ -351,6 +397,7 @@
     }
 
     document.addEventListener("DOMContentLoaded", () => {
+      wireArbCrossTabSync();
       refreshStatus();
       setInterval(refreshStatus, 6000);
       loadLog();
