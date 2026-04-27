@@ -316,13 +316,21 @@
       const s = j.scan || {};
       st.textContent = "Actualizado: " + (s.updated_at || "—") + " · resultado: " + (s.outcome || "—");
       const c = [
-        ["Páginas /markets leídas", s.pages_fetched],
-        ["Filas mercado en bucle (raw)", s.markets_raw_total],
+        ["BUNDLE_DISCOVERY", s.discovery_mode],
+        ["WS libro (BUNDLE_USE_WS)", s.use_ws],
+        ["Páginas descubrimiento (Gamma o simplified / pages CLOB full)", s.pages_fetched],
+        ["Filas mercado en bucle (raw / filas Gamma)", s.markets_raw_total],
         ["Mercados con libro analizado (scanned_books)", s.scanned_books],
+        ["Gamma: páginas / filas / tras outcomes", [s.gamma_pages, s.gamma_rows_total, s.gamma_after_outcomes].map((x) => (x != null ? x : "—")).join(" · ")],
+        ["Gamma: skip filtros cliente", s.gamma_skip_filters],
+        ["Simplified: páginas / filas / candidatos", [s.simplified_pages, s.simplified_rows_total, s.simplified_candidates].map((x) => (x != null ? x : "—")).join(" · ")],
+        ["Registry cache hit", s.registry_cache_hit],
+        ["CLOB validate calls / flags_ok / book_ok / fail", [s.clob_validate_calls, s.clob_flags_ok, s.clob_validate_ok, s.clob_validate_fail].map((x) => (x != null ? x : "—")).join(" / ")],
         ["skip: no accepting_orders", s.skip_not_accepting],
         ["skip: cerrados", s.skip_closed],
         ["skip: sin enable_order_book", s.skip_no_orderbook],
         ["skip: n tokens fuera de rango", s.skip_outcomes],
+        ["skip: neg_risk (BUNDLE_EXCLUDE_NEG_RISK)", s.skip_neg_risk],
         ["skip: libro incompleto / error", s.skip_bad_book],
         ["skip: buffer ejecución alto", s.skip_high_buffer],
         ["skip: poca liquidez al best ask", s.skip_insufficient_depth],

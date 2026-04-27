@@ -14,10 +14,13 @@ Fórmula:
 
 ## Datos de entrada
 
-- Polymarket CLOB REST: GET /markets → lista de mercados activos
-- Polymarket CLOB REST: GET /orderbook/{token_id} → best_ask por outcome
-- Polling interval: cada 10 segundos por mercado
-- Priorizar mercados con 2-3 outcomes (más frecuente la ineficiencia)
+- **Descubrimiento (env `BUNDLE_DISCOVERY`, default `gamma`):**
+  - `gamma` — `GET https://gamma-api.polymarket.com/markets?active=true&closed=false` (paginación offset/limit), luego `GET https://clob.polymarket.com/markets/{condition_id}` para flags operables y `clobTokenIds` fiables.
+  - `clob_simplified` — `GET /simplified-markets` con `next_cursor`.
+  - `clob_full` — listado legado `GET /markets` paginado (muchas filas históricas / no operables al inicio del cursor).
+- **Precios:** `GET /book?token_id=…` por pierna; opcional `BUNDLE_USE_WS=true` + WS `market` para snapshots en vivo (fallback REST).
+- Polling: `BUNDLE_POLL_INTERVAL` (default 10 s).
+- Priorizar mercados con 2-3 outcomes (orden interno + `BUNDLE_MAX_CANDIDATES_PER_CYCLE`).
 
 ## Lógica de ejecución
 

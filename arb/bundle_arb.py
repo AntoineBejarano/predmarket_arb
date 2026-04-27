@@ -1,7 +1,9 @@
 """Bundle arbitrage: ∑ best_ask < 1 (menos buffer y fees CLOB).
 
 Estrategia 1 del RUNBOOK strategies/bundle_arb/RUNBOOK.md:
-- CLOB GET /markets (solo mercados con libro habilitado) + GET /book por token_id.
+- Descubrimiento: Gamma (``active``/``closed``) o CLOB ``/simplified-markets`` (default: Gamma).
+- Validación operable: GET ``/markets/{condition_id}`` + flags robustos.
+- Precios: GET ``/book`` por token (opcional caché WS ``BUNDLE_USE_WS``).
 - ``sum_ask`` = suma de best_ask; ``execution_buffer_est`` = heurística por pierna (no es API Polymarket).
 - ``fees_est`` = comisión CLOB estimada sobre el nocional por pierna (GET /fee-rate).
 - ``edge_gross`` = 1 - sum_ask - execution_buffer_est; ``edge`` (neto) = edge_gross - fees_est.
@@ -19,6 +21,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from clients.poly_clob import PolyCLOBClient
+from clients.poly_markets import BundleCandidate, MarketsRegistry
+from clients.poly_parse import api_bool_true, clob_market_tradeable
+from clients.poly_ws_books import WSBookStore
 
 from arb.base import ArbStrategy
 
@@ -47,12 +52,12 @@ def _outcome_priority(n: int) -> int:
 def _market_mini(m: dict[str, Any]) -> dict[str, Any]:
     q = m.get("question") or m.get("title") or m.get("description") or ""
     return {
-        "condition_id": str(m.get("condition_id", "")),
+        "condition_id": str(m.get("condition_id") or m.get("conditionId") or ""),
         "question": str(q)[:160],
         "n_tokens": len(_market_token_ids(m)),
-        "accepting_orders": bool(m.get("accepting_orders")),
-        "closed": bool(m.get("closed")),
-        "enable_order_book": bool(m.get("enable_order_book")),
+        "accepting_orders": api_bool_true(m.get("accepting_orders") or m.get("acceptingOrders")),
+        "closed": api_bool_true(m.get("closed") or m.get("isClosed")),
+        "enable_order_book": api_bool_true(m.get("enable_order_book") or m.get("enableOrderBook")),
     }
 
 
@@ -98,13 +103,48 @@ class BundleArbStrategy(ArbStrategy):
         self._breaker = config.get("circuit_breaker")
         self._start_capital = float(config.get("start_capital", os.getenv("ARB_START_CAPITAL", "10000")))
         self._current_capital = float(config.get("current_capital", os.getenv("ARB_CURRENT_CAPITAL", "10000")))
+        self.discovery = str(
+            config.get("discovery", os.getenv("BUNDLE_DISCOVERY", "gamma"))
+        ).strip().lower()
+        self.use_ws = str(config.get("use_ws", os.getenv("BUNDLE_USE_WS", "false"))).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.max_candidates = int(
+            config.get("max_candidates_per_cycle", os.getenv("BUNDLE_MAX_CANDIDATES_PER_CYCLE", "120"))
+        )
+        self.exclude_neg_risk = str(
+            config.get("exclude_neg_risk", os.getenv("BUNDLE_EXCLUDE_NEG_RISK", "true"))
+        ).lower() in ("1", "true", "yes")
+        self._registry = MarketsRegistry.from_env(self.min_outcomes, self.max_outcomes)
+        self._ws_store: Optional[WSBookStore] = None
 
     async def _legs_snapshot(
-        self, poly: PolyCLOBClient, token_ids: list[str]
+        self,
+        poly: PolyCLOBClient,
+        token_ids: list[str],
+        book_store: Optional[WSBookStore] = None,
     ) -> tuple[Optional[list[float]], Optional[list[float]], Optional[str]]:
-        """Paraleliza GET /book; devuelve (best_asks, best_ask_notional_usdc por pierna, error)."""
+        """Paraleliza GET /book (o snapshot WS si disponible); devuelve (asks, notionals, error)."""
 
         async def one_leg(tid: str) -> tuple[str, Optional[float], Optional[float], Optional[str]]:
+            if book_store is not None:
+                snap = book_store.snapshot(tid)
+                if snap is not None:
+                    ba = snap.get("best_ask")
+                    if ba is not None:
+                        try:
+                            px = float(ba)
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            nom = snap.get("best_ask_notional_usdc")
+                            try:
+                                nom_f = float(nom) if nom is not None else None
+                            except (TypeError, ValueError):
+                                nom_f = None
+                            return tid, px, nom_f, None
             try:
                 ob = await asyncio.wait_for(poly.get_orderbook(tid), timeout=8.0)
             except asyncio.TimeoutError:
@@ -185,6 +225,64 @@ class BundleArbStrategy(ArbStrategy):
 
     async def run_once(self) -> None:
         empty = self._empty_row()
+        best: Optional[dict[str, Any]] = None
+        best_edge_net = -1e9
+        best_meta: Optional[dict[str, Any]] = None
+        scanned_books = 0
+        skipped_gas = 0
+        skipped_depth = 0
+        skipped_mid = 0
+        pages_fetched = 0
+        markets_raw_total = 0
+        skip_not_accepting = 0
+        skip_closed = 0
+        skip_no_orderbook = 0
+        skip_outcomes = 0
+        skip_bad_book = 0
+        skip_neg_risk = 0
+        eligible_samples: list[dict[str, Any]] = []
+        _MAX_ELIGIBLE_SAMPLE = 12
+        reg_diag: dict[str, Any] = {}
+        clob_validate_calls = 0
+        clob_validate_ok = 0
+        clob_validate_fail = 0
+        clob_flags_ok = 0
+        candidates: list[BundleCandidate] = []
+        discovery_mode = self.discovery
+        if discovery_mode not in ("gamma", "clob_simplified", "clob_full"):
+            discovery_mode = "gamma"
+
+        def _diag_merge(extra: dict[str, Any]) -> dict[str, Any]:
+            base = {
+                "discovery_mode": discovery_mode,
+                "use_ws": self.use_ws,
+                "pages_fetched": pages_fetched,
+                "markets_raw_total": markets_raw_total,
+                "scanned_books": scanned_books,
+                "skip_not_accepting": skip_not_accepting,
+                "skip_closed": skip_closed,
+                "skip_no_orderbook": skip_no_orderbook,
+                "skip_outcomes": skip_outcomes,
+                "skip_bad_book": skip_bad_book,
+                "skip_neg_risk": skip_neg_risk,
+                "skip_high_buffer": skipped_gas,
+                "skip_insufficient_depth": skipped_depth,
+                "skip_mid": skipped_mid,
+                "clob_validate_calls": clob_validate_calls,
+                "clob_validate_ok": clob_validate_ok,
+                "clob_validate_fail": clob_validate_fail,
+                "clob_flags_ok": clob_flags_ok,
+                "gamma_pages": reg_diag.get("gamma_pages"),
+                "gamma_rows_total": reg_diag.get("gamma_rows_total"),
+                "gamma_after_outcomes": reg_diag.get("gamma_after_outcomes"),
+                "gamma_skip_filters": reg_diag.get("gamma_skip_filters"),
+                "simplified_pages": reg_diag.get("simplified_pages"),
+                "simplified_rows_total": reg_diag.get("simplified_rows_total"),
+                "simplified_candidates": reg_diag.get("simplified_candidates"),
+                "registry_cache_hit": reg_diag.get("cache_hit"),
+            }
+            return {**base, **extra}
+
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
@@ -203,162 +301,301 @@ class BundleArbStrategy(ArbStrategy):
                 )
                 return
 
-        best: Optional[dict[str, Any]] = None
-        best_edge_net = -1e9
-        best_meta: Optional[dict[str, Any]] = None
-        scanned_books = 0
-        skipped_gas = 0
-        skipped_depth = 0
-        skipped_mid = 0
-        pages_fetched = 0
-        markets_raw_total = 0
-        skip_not_accepting = 0
-        skip_closed = 0
-        skip_no_orderbook = 0
-        skip_outcomes = 0
-        skip_bad_book = 0
-        eligible_samples: list[dict[str, Any]] = []
-        _MAX_ELIGIBLE_SAMPLE = 12
-
         try:
             async with PolyCLOBClient(
                 api_key=os.getenv("POLY_API_KEY", ""),
                 private_key=os.getenv("POLY_PRIVATE_KEY", ""),
                 dry_run=self.dry_run,
             ) as poly:
-                cursor = ""
-                for _ in range(self.max_pages):
-                    try:
-                        page = await asyncio.wait_for(
-                            poly.get_markets(limit=100, next_cursor=cursor),
-                            timeout=12.0,
-                        )
-                    except asyncio.TimeoutError:
+                ws_store: Optional[WSBookStore] = self._ws_store if self.use_ws else None
+
+                async def evaluate_after_tokens(vm: dict[str, Any], token_ids: list[str]) -> None:
+                    nonlocal best, best_edge_net, best_meta, scanned_books, skipped_gas, skipped_depth, skipped_mid, skip_bad_book
+                    n = len(token_ids)
+                    asks, noms, _book_err = await self._legs_snapshot(
+                        poly, token_ids, ws_store if self.use_ws else None
+                    )
+                    scanned_books += 1
+                    if asks is None:
+                        skip_bad_book += 1
+                        return
+
+                    execution_buffer_est = self.gas_per_leg * n
+                    if execution_buffer_est > self.max_gas_per_tx:
+                        skipped_gas += 1
+                        return
+
+                    size_target = self.max_size
+                    per_leg = size_target / max(n, 1)
+                    depth_ok = True
+                    for nom in noms:
+                        if nom is None or math.isnan(nom) or nom < per_leg - 1e-6:
+                            depth_ok = False
+                            break
+                    if not depth_ok:
+                        skipped_depth += 1
+                        return
+
+                    fee_bpss = await asyncio.gather(*[poly.get_fee_rate_bps(t) for t in token_ids])
+                    fees_est_val = sum(per_leg * (float(bps) / 10000.0) for bps in fee_bpss)
+
+                    total = sum(asks)
+                    edge_gross = 1.0 - total - execution_buffer_est
+                    edge_net = edge_gross - fees_est_val
+
+                    mid_label = ""
+                    mids: list[Optional[float]] = []
+                    if self.mid_max_dev > 0:
+                        mids = await asyncio.gather(*[poly.get_midpoint(t) for t in token_ids])
+                        ok_mid, mid_label = self._passes_mid_dev(asks, mids)
+                        if not ok_mid:
+                            skipped_mid += 1
+                            return
+                    else:
+                        mid_label = ""
+
+                    cid = str(vm.get("condition_id") or vm.get("conditionId") or "")
+                    row_base = {
+                        "market_id": cid,
+                        "n_outcomes": str(n),
+                        "sum_ask": f"{total:.6f}",
+                        "execution_buffer_est": f"{execution_buffer_est:.6f}",
+                        "fees_est": f"{fees_est_val:.6f}",
+                        "edge_gross": f"{edge_gross:.6f}",
+                        "edge": f"{edge_net:.6f}",
+                        "mid_dev_max": mid_label,
+                    }
+
+                    if edge_net > best_edge_net:
+                        best_edge_net = edge_net
+                        best_meta = {
+                            "token_ids": token_ids,
+                            "asks": asks,
+                            "noms": noms,
+                            "fee_bpss": fee_bpss,
+                            **row_base,
+                        }
+                        if edge_net > self.min_edge:
+                            best = {
+                                **row_base,
+                                "action": "SIGNAL",
+                                "reason": (
+                                    f"edge_net {edge_net:.4f} > min_edge {self.min_edge} "
+                                    f"(edge_gross={edge_gross:.4f}, sum_ask={total:.4f}, "
+                                    f"execution_buffer_est={execution_buffer_est:.4f} heuristic not on-chain gas; "
+                                    f"fees_est from CLOB /fee-rate)"
+                                ),
+                                "size_usdc": str(size_target),
+                                "order_ids": "",
+                            }
+
+                if discovery_mode in ("gamma", "clob_simplified"):
+                    reg_mode = "gamma" if discovery_mode == "gamma" else "clob_simplified"
+                    candidates, reg_diag = await self._registry.get_candidates(reg_mode, poly, force_refresh=False)
+                    if discovery_mode == "gamma":
+                        markets_raw_total = int(reg_diag.get("gamma_rows_total") or 0)
+                        pages_fetched = int(reg_diag.get("gamma_pages") or 0)
+                    else:
+                        markets_raw_total = int(reg_diag.get("simplified_rows_total") or 0)
+                        pages_fetched = int(reg_diag.get("simplified_pages") or 0)
+
+                    if not candidates:
                         await self.log_signal_async(
                             {
-                                "action": "ERROR:API_TIMEOUT",
-                                "reason": "CLOB /markets timeout",
+                                "action": "SKIP:NO_ELIGIBLE_DISCOVERY",
+                                "reason": (
+                                    f"BUNDLE_DISCOVERY={discovery_mode}: 0 candidatos tras filtros registry "
+                                    f"(rows_total={markets_raw_total})"
+                                ),
                                 **empty,
                             }
                         )
                         self._persist_scan_diag(
-                            {
-                                "outcome": "ERROR:API_TIMEOUT",
-                                "pages_fetched": pages_fetched,
-                                "markets_raw_total": markets_raw_total,
-                                "help": "Timeout en GET /markets; revisa red o sube timeout.",
-                            }
+                            _diag_merge(
+                                {
+                                    "outcome": "SKIP:NO_ELIGIBLE_DISCOVERY",
+                                    "eligible_sample": eligible_samples,
+                                    "help": (
+                                        "Gamma/simplified no devolvió mercados que pasen filtros de outcomes/liquidez. "
+                                        "Revisa BUNDLE_MIN_LIQUIDITY_USD, BUNDLE_MIN_VOLUME_24H, BUNDLE_GAMMA_MAX_PAGES."
+                                    ),
+                                }
+                            )
                         )
                         return
 
-                    pages_fetched += 1
-                    markets = list(page.get("data") or [])
-                    markets.sort(
-                        key=lambda m: (
-                            _outcome_priority(len(m.get("tokens") or [])),
-                            str(m.get("condition_id", "")),
-                        )
+                    candidates.sort(
+                        key=lambda c: (_outcome_priority(len(c.token_ids)), c.condition_id)
                     )
+                    candidates = candidates[: self.max_candidates]
 
-                    for m in markets:
-                        markets_raw_total += 1
-                        if not m.get("accepting_orders"):
-                            skip_not_accepting += 1
+                    if self.use_ws:
+                        if self._ws_store is None:
+                            self._ws_store = WSBookStore(poly)
+                        ws_flat: list[str] = []
+                        for c in candidates[:50]:
+                            ws_flat.extend(c.token_ids)
+                        await self._ws_store.ensure_subscription(ws_flat)
+                        ws_store = self._ws_store
+                        await asyncio.sleep(min(float(os.getenv("BUNDLE_WS_WARMUP_SEC", "0.35")), 2.0))
+
+                    for cand in candidates:
+                        clob_validate_calls += 1
+                        vm = await poly.get_market(cand.condition_id)
+                        if not isinstance(vm, dict) or vm.get("error"):
+                            clob_validate_fail += 1
                             continue
-                        if m.get("closed"):
-                            skip_closed += 1
-                            continue
-                        if not m.get("enable_order_book"):
-                            skip_no_orderbook += 1
+                        ok_flags, reason = clob_market_tradeable(vm)
+                        if not ok_flags:
+                            clob_validate_fail += 1
+                            if reason == "not_accepting":
+                                skip_not_accepting += 1
+                            elif reason == "closed":
+                                skip_closed += 1
+                            elif reason == "no_orderbook":
+                                skip_no_orderbook += 1
                             continue
 
-                        token_ids = _market_token_ids(m)
+                        clob_flags_ok += 1
+                        token_ids = _market_token_ids(vm)
                         n = len(token_ids)
                         if n < self.min_outcomes or n > self.max_outcomes:
                             skip_outcomes += 1
                             continue
 
+                        if self.exclude_neg_risk:
+                            try:
+                                if await poly.get_neg_risk(token_ids[0]):
+                                    skip_neg_risk += 1
+                                    continue
+                            except Exception:
+                                pass
+
+                        clob_validate_ok += 1
                         if len(eligible_samples) < _MAX_ELIGIBLE_SAMPLE:
-                            eligible_samples.append(_market_mini(m))
+                            eligible_samples.append(_market_mini(vm))
 
-                        asks, noms, _book_err = await self._legs_snapshot(poly, token_ids)
-                        scanned_books += 1
-                        if asks is None:
-                            skip_bad_book += 1
-                            continue
+                        await evaluate_after_tokens(vm, token_ids)
 
-                        execution_buffer_est = self.gas_per_leg * n
-                        if execution_buffer_est > self.max_gas_per_tx:
-                            skipped_gas += 1
-                            continue
-
-                        size_target = self.max_size
-                        per_leg = size_target / max(n, 1)
-                        depth_ok = True
-                        for nom in noms:
-                            if nom is None or math.isnan(nom) or nom < per_leg - 1e-6:
-                                depth_ok = False
-                                break
-                        if not depth_ok:
-                            skipped_depth += 1
-                            continue
-
-                        fee_bpss = await asyncio.gather(*[poly.get_fee_rate_bps(t) for t in token_ids])
-                        fees_est_val = sum(per_leg * (float(bps) / 10000.0) for bps in fee_bpss)
-
-                        total = sum(asks)
-                        edge_gross = 1.0 - total - execution_buffer_est
-                        edge_net = edge_gross - fees_est_val
-
-                        mid_label = ""
-                        mids: list[Optional[float]] = []
-                        if self.mid_max_dev > 0:
-                            mids = await asyncio.gather(*[poly.get_midpoint(t) for t in token_ids])
-                            ok_mid, mid_label = self._passes_mid_dev(asks, mids)
-                            if not ok_mid:
-                                skipped_mid += 1
-                                continue
-                        else:
-                            mid_label = ""
-
-                        cid = str(m.get("condition_id", ""))
-                        row_base = {
-                            "market_id": cid,
-                            "n_outcomes": str(n),
-                            "sum_ask": f"{total:.6f}",
-                            "execution_buffer_est": f"{execution_buffer_est:.6f}",
-                            "fees_est": f"{fees_est_val:.6f}",
-                            "edge_gross": f"{edge_gross:.6f}",
-                            "edge": f"{edge_net:.6f}",
-                            "mid_dev_max": mid_label,
-                        }
-
-                        if edge_net > best_edge_net:
-                            best_edge_net = edge_net
-                            best_meta = {
-                                "token_ids": token_ids,
-                                "asks": asks,
-                                "noms": noms,
-                                "fee_bpss": fee_bpss,
-                                **row_base,
-                            }
-                            if edge_net > self.min_edge:
-                                best = {
-                                    **row_base,
-                                    "action": "SIGNAL",
-                                    "reason": (
-                                        f"edge_net {edge_net:.4f} > min_edge {self.min_edge} "
-                                        f"(edge_gross={edge_gross:.4f}, sum_ask={total:.4f}, "
-                                        f"execution_buffer_est={execution_buffer_est:.4f} heuristic not on-chain gas; "
-                                        f"fees_est from CLOB /fee-rate)"
-                                    ),
-                                    "size_usdc": str(size_target),
-                                    "order_ids": "",
+                else:
+                    cursor = ""
+                    for _ in range(self.max_pages):
+                        try:
+                            page = await asyncio.wait_for(
+                                poly.get_markets(limit=100, next_cursor=cursor),
+                                timeout=12.0,
+                            )
+                        except asyncio.TimeoutError:
+                            await self.log_signal_async(
+                                {
+                                    "action": "ERROR:API_TIMEOUT",
+                                    "reason": "CLOB /markets timeout",
+                                    **empty,
                                 }
+                            )
+                            self._persist_scan_diag(
+                                _diag_merge(
+                                    {
+                                        "outcome": "ERROR:API_TIMEOUT",
+                                        "help": "Timeout en GET /markets; revisa red o sube timeout.",
+                                    }
+                                )
+                            )
+                            return
 
-                    cursor = page.get("next_cursor") or ""
-                    if not cursor:
-                        break
+                        pages_fetched += 1
+                        markets = list(page.get("data") or [])
+                        markets.sort(
+                            key=lambda m: (
+                                _outcome_priority(len(m.get("tokens") or [])),
+                                str(m.get("condition_id", "")),
+                            )
+                        )
+
+                        for m in markets:
+                            markets_raw_total += 1
+                            ok_flags, reason = clob_market_tradeable(m)
+                            if not ok_flags:
+                                if reason == "not_accepting":
+                                    skip_not_accepting += 1
+                                elif reason == "closed":
+                                    skip_closed += 1
+                                elif reason == "no_orderbook":
+                                    skip_no_orderbook += 1
+                                continue
+
+                            token_ids = _market_token_ids(m)
+                            n = len(token_ids)
+                            if n < self.min_outcomes or n > self.max_outcomes:
+                                skip_outcomes += 1
+                                continue
+
+                            if self.exclude_neg_risk:
+                                try:
+                                    if await poly.get_neg_risk(token_ids[0]):
+                                        skip_neg_risk += 1
+                                        continue
+                                except Exception:
+                                    pass
+
+                            clob_validate_ok += 1
+                            if len(eligible_samples) < _MAX_ELIGIBLE_SAMPLE:
+                                eligible_samples.append(_market_mini(m))
+
+                            await evaluate_after_tokens(m, token_ids)
+
+                        cursor = page.get("next_cursor") or ""
+                        if not cursor:
+                            break
+
+                if (
+                    discovery_mode in ("gamma", "clob_simplified")
+                    and candidates
+                    and clob_validate_calls > 0
+                    and clob_flags_ok == 0
+                ):
+                    await self.log_signal_async(
+                        {
+                            "action": "SKIP:NO_ELIGIBLE_CLOB",
+                            "reason": (
+                                f"CLOB /markets/{{id}}: 0 mercados con flags operables tras {clob_validate_calls} "
+                                f"GET (errores HTTP o !accepting_orders / closed / !enable_order_book)"
+                            ),
+                            **empty,
+                        }
+                    )
+                    self._persist_scan_diag(
+                        _diag_merge(
+                            {
+                                "outcome": "SKIP:NO_ELIGIBLE_CLOB",
+                                "eligible_sample": eligible_samples,
+                                "help": (
+                                    "Hubo candidatos en descubrimiento pero ninguno pasó accepting_orders + "
+                                    "enable_order_book + !closed en CLOB."
+                                ),
+                            }
+                        )
+                    )
+                    return
+
+                if scanned_books > 0 and skip_bad_book == scanned_books and best_meta is None:
+                    await self.log_signal_async(
+                        {
+                            "action": "SKIP:NO_BOOK",
+                            "reason": "Todos los libros analizados carecían de best_ask o error en /book",
+                            **empty,
+                        }
+                    )
+                    self._persist_scan_diag(
+                        _diag_merge(
+                            {
+                                "outcome": "SKIP:NO_BOOK",
+                                "eligible_sample": eligible_samples,
+                                "help": "Revisa liquidez o mercados sin asks en el CLOB.",
+                            }
+                        )
+                    )
+                    return
 
                 if best is not None and best_meta is not None:
                     row = dict(best)
@@ -395,29 +632,20 @@ class BundleArbStrategy(ArbStrategy):
                             row["order_ids"] = ""
                     await self.log_signal_async(row)
                     self._persist_scan_diag(
-                        {
-                            "outcome": row.get("action", ""),
-                            "pages_fetched": pages_fetched,
-                            "markets_raw_total": markets_raw_total,
-                            "scanned_books": scanned_books,
-                            "skip_not_accepting": skip_not_accepting,
-                            "skip_closed": skip_closed,
-                            "skip_no_orderbook": skip_no_orderbook,
-                            "skip_outcomes": skip_outcomes,
-                            "skip_bad_book": skip_bad_book,
-                            "skip_high_buffer": skipped_gas,
-                            "skip_insufficient_depth": skipped_depth,
-                            "skip_mid": skipped_mid,
-                            "best_edge_net": best_edge_net,
-                            "min_edge": self.min_edge,
-                            "max_size_usdc": self.max_size,
-                            "eligible_sample": eligible_samples,
-                            "best_market": best_meta.get("market_id") if best_meta else None,
-                            "help": (
-                                "Último ciclo encontró oportunidad que pasó filtros (libro, profundidad, fees, mid opcional). "
-                                "Ver contadores para el universo escaneado en GET /markets."
-                            ),
-                        }
+                        _diag_merge(
+                            {
+                                "outcome": row.get("action", ""),
+                                "best_edge_net": best_edge_net,
+                                "min_edge": self.min_edge,
+                                "max_size_usdc": self.max_size,
+                                "eligible_sample": eligible_samples,
+                                "best_market": best_meta.get("market_id") if best_meta else None,
+                                "help": (
+                                    "Oportunidad que pasó descubrimiento + validación CLOB + libro, profundidad, fees, mid. "
+                                    f"BUNDLE_DISCOVERY={discovery_mode}."
+                                ),
+                            }
+                        )
                     )
                     return
 
@@ -443,76 +671,67 @@ class BundleArbStrategy(ArbStrategy):
                         }
                     )
                     self._persist_scan_diag(
-                        {
-                            "outcome": "SKIP:LOW_EDGE",
-                            "pages_fetched": pages_fetched,
-                            "markets_raw_total": markets_raw_total,
-                            "scanned_books": scanned_books,
-                            "skip_not_accepting": skip_not_accepting,
-                            "skip_closed": skip_closed,
-                            "skip_no_orderbook": skip_no_orderbook,
-                            "skip_outcomes": skip_outcomes,
-                            "skip_bad_book": skip_bad_book,
-                            "skip_high_buffer": skipped_gas,
-                            "skip_insufficient_depth": skipped_depth,
-                            "skip_mid": skipped_mid,
-                            "best_edge_net": best_edge_net,
-                            "min_edge": self.min_edge,
-                            "best_market": best_meta.get("market_id"),
-                            "eligible_sample": eligible_samples,
-                            "help": (
-                                "Había al menos un mercado con libro válido pero el mejor edge_net "
-                                f"({best_edge_net:.4f}) no superó BUNDLE_MIN_EDGE ({self.min_edge})."
-                            ),
-                        }
+                        _diag_merge(
+                            {
+                                "outcome": "SKIP:LOW_EDGE",
+                                "best_edge_net": best_edge_net,
+                                "min_edge": self.min_edge,
+                                "best_market": best_meta.get("market_id"),
+                                "eligible_sample": eligible_samples,
+                                "help": (
+                                    "Había al menos un mercado con libro válido pero el mejor edge_net "
+                                    f"({best_edge_net:.4f}) no superó BUNDLE_MIN_EDGE ({self.min_edge})."
+                                ),
+                            }
+                        )
                     )
                     return
 
+                if discovery_mode == "clob_full" and markets_raw_total == 0:
+                    final_outcome = "SKIP:NO_MARKETS"
+                elif discovery_mode == "clob_full" and scanned_books == 0 and markets_raw_total > 0:
+                    final_outcome = "SKIP:NO_ELIGIBLE_PREFILTER"
+                else:
+                    final_outcome = "SKIP:NO_ELIGIBLE_IN_SCAN"
+
                 await self.log_signal_async(
                     {
-                        "action": "SKIP:NO_MARKETS",
+                        "action": final_outcome,
                         "reason": (
-                            f"no bundle candidate in {self.max_pages} pages "
+                            f"{final_outcome}: BUNDLE_DISCOVERY={discovery_mode} "
                             f"(book_ok={scanned_books}, skip_high_buffer={skipped_gas}, "
-                            f"skip_insufficient_depth={skipped_depth}, skip_mid={skipped_mid}; "
-                            f"raw={markets_raw_total}, !accepting={skip_not_accepting}, closed={skip_closed}, "
+                            f"skip_insufficient_depth={skipped_depth}, skip_mid={skipped_mid}, "
+                            f"skip_neg_risk={skip_neg_risk}; raw={markets_raw_total}, "
+                            f"!accepting={skip_not_accepting}, closed={skip_closed}, "
                             f"!orderbook={skip_no_orderbook}, outcomes={skip_outcomes}, bad_book={skip_bad_book})"
                         ),
                         **empty,
                     }
                 )
                 self._persist_scan_diag(
-                    {
-                        "outcome": "SKIP:NO_MARKETS",
-                        "pages_fetched": pages_fetched,
-                        "markets_raw_total": markets_raw_total,
-                        "scanned_books": scanned_books,
-                        "skip_not_accepting": skip_not_accepting,
-                        "skip_closed": skip_closed,
-                        "skip_no_orderbook": skip_no_orderbook,
-                        "skip_outcomes": skip_outcomes,
-                        "skip_bad_book": skip_bad_book,
-                        "skip_high_buffer": skipped_gas,
-                        "skip_insufficient_depth": skipped_depth,
-                        "skip_mid": skipped_mid,
-                        "best_edge_net": None if best_edge_net < -1e8 else best_edge_net,
-                        "min_edge": self.min_edge,
-                        "max_size_usdc": self.max_size,
-                        "mid_max_dev": self.mid_max_dev,
-                        "eligible_sample": eligible_samples,
-                        "params": {
-                            "max_pages": self.max_pages,
-                            "min_outcomes": self.min_outcomes,
-                            "max_outcomes": self.max_outcomes,
-                        },
-                        "help": (
-                            "Origen de datos: CLOB https://clob.polymarket.com/markets (paginación). "
-                            "Cada fila `markets.data[]` es un mercado; bundle solo considera los que pasan filtros "
-                            "(ver contadores). Luego GET /book por token para sumar best_ask y comprobar profundidad "
-                            f"≥ size_usdc/n ({self.max_size} USDC / n piernas). "
-                            "Si casi todo cae en skip_insufficient_depth, baja BUNDLE_MAX_SIZE_USDC o asume poco liquidez al mejor ask."
-                        ),
-                    }
+                    _diag_merge(
+                        {
+                            "outcome": final_outcome,
+                            "best_edge_net": None if best_edge_net < -1e8 else best_edge_net,
+                            "min_edge": self.min_edge,
+                            "max_size_usdc": self.max_size,
+                            "mid_max_dev": self.mid_max_dev,
+                            "eligible_sample": eligible_samples,
+                            "params": {
+                                "max_pages": self.max_pages,
+                                "min_outcomes": self.min_outcomes,
+                                "max_outcomes": self.max_outcomes,
+                                "max_candidates_per_cycle": self.max_candidates,
+                            },
+                            "help": (
+                                "Descubrimiento vía BUNDLE_DISCOVERY (gamma=servidor Gamma activos; "
+                                "clob_simplified=/simplified-markets; clob_full=GET /markets paginado). "
+                                "Validación operable con GET /markets/{condition_id}. "
+                                f"Luego GET /book por token; profundidad ≥ {self.max_size} USDC / n piernas. "
+                                "SKIP:NO_ELIGIBLE_PREFILTER = muchas filas CLOB pero ninguna pasó flags+outcomes."
+                            ),
+                        }
+                    )
                 )
         except Exception as e:
             await self.log_signal_async(
@@ -523,11 +742,11 @@ class BundleArbStrategy(ArbStrategy):
                 }
             )
             self._persist_scan_diag(
-                {
-                    "outcome": "ERROR:API_ERROR",
-                    "error": str(e)[:300],
-                    "pages_fetched": pages_fetched,
-                    "markets_raw_total": markets_raw_total,
-                    "eligible_sample": eligible_samples,
-                }
+                _diag_merge(
+                    {
+                        "outcome": "ERROR:API_ERROR",
+                        "error": str(e)[:300],
+                        "eligible_sample": eligible_samples,
+                    }
+                )
             )

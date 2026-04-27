@@ -9,6 +9,7 @@ from collections import deque
 from typing import Any, Deque, Optional
 
 from clients.poly_clob import PolyCLOBClient
+from clients.poly_parse import clob_market_tradeable
 
 from arb.base import ArbStrategy
 
@@ -113,7 +114,8 @@ class MarketMakerStrategy(ArbStrategy):
                 for _ in range(self.max_pages):
                     page = await asyncio.wait_for(poly.get_markets(limit=80, next_cursor=cursor), timeout=12.0)
                     for m in page.get("data") or []:
-                        if not m.get("accepting_orders") or m.get("closed") or not m.get("enable_order_book"):
+                        ok_m, _ = clob_market_tradeable(m)
+                        if not ok_m:
                             continue
                         tokens = m.get("tokens") or []
                         if len(tokens) != 2:

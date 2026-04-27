@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Callable, List, Optional, Union
 
 import aiohttp
@@ -30,6 +31,11 @@ class PolyCLOBClient:
         self.private_key = private_key.strip()
         self.dry_run = dry_run
         self._session: Optional[aiohttp.ClientSession] = None
+        self._last_req_mono: float = 0.0
+        self._tick_cache: dict[str, tuple[float, str]] = {}
+        self._neg_cache: dict[str, tuple[float, bool]] = {}
+        self._fee_cache: dict[str, tuple[float, int]] = {}
+        self._meta_ttl_sec: float = float(os.getenv("MARKET_META_CACHE_TTL_SEC", "600"))
 
     async def __aenter__(self) -> PolyCLOBClient:
         self._session = aiohttp.ClientSession(
@@ -48,6 +54,40 @@ class PolyCLOBClient:
             raise RuntimeError("PolyCLOBClient must be used with async context manager")
         return self._session
 
+    @property
+    def http_session(self) -> aiohttp.ClientSession:
+        """Sesión aiohttp compartida (p. ej. descubrimiento Gamma con el mismo cliente)."""
+        return self._require_session()
+
+    async def _clob_throttle(self) -> None:
+        rps = float(os.getenv("CLOB_RATE_LIMIT_RPS", "0") or "0")
+        if rps <= 0:
+            return
+        interval = 1.0 / max(rps, 0.01)
+        now = time.monotonic()
+        wait = interval - (now - self._last_req_mono)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_req_mono = time.monotonic()
+
+    async def _public_get_json(self, url: str, params: Optional[dict[str, str]] = None) -> Any:
+        """GET público CLOB con throttle + reintentos ante 429/5xx."""
+        max_retries = max(0, int(os.getenv("CLOB_RETRY_MAX", "3")))
+        base_ms = float(os.getenv("CLOB_RETRY_BASE_MS", "200"))
+        sess = self._require_session()
+        attempt = 0
+        while True:
+            await self._clob_throttle()
+            async with sess.get(url, params=params or None) as resp:
+                text = await resp.text()
+                if resp.status in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    attempt += 1
+                    await asyncio.sleep((base_ms / 1000.0) * (2 ** (attempt - 1)))
+                    continue
+                if resp.status != 200:
+                    raise RuntimeError(f"CLOB GET {url} HTTP {resp.status}: {text[:500]}")
+                return json.loads(text)
+
     def _chain_id(self) -> int:
         return int(os.getenv("POLYGON_CHAIN_ID", "137"))
 
@@ -58,93 +98,107 @@ class PolyCLOBClient:
 
     async def get_markets(self, limit: int = 100, next_cursor: str = "") -> dict[str, Any]:
         """GET /markets — lista paginada; retorna {data, next_cursor, ...}."""
-        sess = self._require_session()
         params: dict[str, str] = {"limit": str(limit)}
         if next_cursor:
             params["next_cursor"] = next_cursor
-        url = f"{CLOB_REST}/markets"
-        async with sess.get(url, params=params) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"CLOB /markets HTTP {resp.status}: {text[:500]}")
-            return json.loads(text)
+        data = await self._public_get_json(f"{CLOB_REST}/markets", params)
+        return data if isinstance(data, dict) else {}
+
+    async def get_simplified_markets(self, next_cursor: str = "") -> dict[str, Any]:
+        """GET /simplified-markets — payload compacto con tokens y flags."""
+        params: dict[str, str] = {}
+        if next_cursor:
+            params["next_cursor"] = next_cursor
+        lim = os.getenv("BUNDLE_SIMPLIFIED_LIMIT", "").strip()
+        if lim.isdigit():
+            params["limit"] = lim
+        data = await self._public_get_json(f"{CLOB_REST}/simplified-markets", params or None)
+        return data if isinstance(data, dict) else {}
+
+    async def get_sampling_markets(self) -> dict[str, Any]:
+        """GET /sampling-markets — subset con rewards / mercados muestreados."""
+        data = await self._public_get_json(f"{CLOB_REST}/sampling-markets", None)
+        return data if isinstance(data, dict) else {}
 
     async def get_orderbook(self, token_id: str) -> dict[str, Any]:
         """GET /book?token_id=… — bids[], asks[], best_bid, best_ask si hay libro."""
         sess = self._require_session()
         url = f"{CLOB_REST}/book"
-        async with sess.get(url, params={"token_id": token_id}) as resp:
-            text = await resp.text()
-            data = json.loads(text)
-            if isinstance(data, dict) and data.get("error"):
-                return data
-            if resp.status != 200:
-                return {"error": f"HTTP {resp.status}", "raw": text[:500]}
-            bids = data.get("bids") or []
-            asks = data.get("asks") or []
-            best_bid = _best_price_side(bids, is_bid=True)
-            best_ask = _best_price_side(asks, is_bid=False)
-            out = dict(data)
-            out["best_bid"] = best_bid
-            out["best_ask"] = best_ask
-            if best_ask is not None:
-                sz = _size_at_price(asks, best_ask)
-                out["best_ask_size"] = sz
-                if sz is not None:
-                    out["best_ask_notional_usdc"] = float(best_ask) * float(sz)
+        params = {"token_id": token_id}
+        max_retries = max(0, int(os.getenv("CLOB_RETRY_MAX", "3")))
+        base_ms = float(os.getenv("CLOB_RETRY_BASE_MS", "200"))
+        attempt = 0
+        while True:
+            await self._clob_throttle()
+            async with sess.get(url, params=params) as resp:
+                text = await resp.text()
+                if resp.status in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    attempt += 1
+                    await asyncio.sleep((base_ms / 1000.0) * (2 ** (attempt - 1)))
+                    continue
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    return {"error": "json_decode", "raw": text[:500]}
+                if isinstance(data, dict) and data.get("error"):
+                    return data
+                if resp.status != 200:
+                    return {"error": f"HTTP {resp.status}", "raw": text[:500]}
+                bids = data.get("bids") or []
+                asks = data.get("asks") or []
+                best_bid = _best_price_side(bids, is_bid=True)
+                best_ask = _best_price_side(asks, is_bid=False)
+                out = dict(data)
+                out["best_bid"] = best_bid
+                out["best_ask"] = best_ask
+                if best_ask is not None:
+                    sz = _size_at_price(asks, best_ask)
+                    out["best_ask_size"] = sz
+                    if sz is not None:
+                        out["best_ask_notional_usdc"] = float(best_ask) * float(sz)
+                    else:
+                        out["best_ask_notional_usdc"] = None
                 else:
+                    out["best_ask_size"] = None
                     out["best_ask_notional_usdc"] = None
-            else:
-                out["best_ask_size"] = None
-                out["best_ask_notional_usdc"] = None
-            return out
+                return out
 
     async def get_midpoint(self, token_id: str) -> Optional[float]:
         """GET /midpoint?token_id=… — precio medio CLOB (público)."""
-        sess = self._require_session()
-        url = f"{CLOB_REST}/midpoint"
-        async with sess.get(url, params={"token_id": token_id}) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                return None
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                return None
-            if not isinstance(data, dict):
-                return None
-            mid = data.get("mid")
-            if mid is None:
-                return None
-            try:
-                return float(mid)
-            except (TypeError, ValueError):
-                return None
+        try:
+            data = await self._public_get_json(f"{CLOB_REST}/midpoint", {"token_id": token_id})
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        mid = data.get("mid")
+        if mid is None:
+            return None
+        try:
+            return float(mid)
+        except (TypeError, ValueError):
+            return None
 
     async def get_price(self, token_id: str, side: str = "buy") -> Optional[float]:
         """GET /price?token_id=…&side=buy|sell (público)."""
-        sess = self._require_session()
-        url = f"{CLOB_REST}/price"
         s = side.strip().lower()
         if s not in ("buy", "sell"):
             s = "buy"
-        async with sess.get(url, params={"token_id": token_id, "side": s}) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                return None
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                return None
-            if not isinstance(data, dict):
-                return None
-            px = data.get("price") or data.get("p")
-            if px is None:
-                return None
-            try:
-                return float(px)
-            except (TypeError, ValueError):
-                return None
+        try:
+            data = await self._public_get_json(
+                f"{CLOB_REST}/price", {"token_id": token_id, "side": s}
+            )
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        px = data.get("price") or data.get("p")
+        if px is None:
+            return None
+        try:
+            return float(px)
+        except (TypeError, ValueError):
+            return None
 
     async def get_open_orders(
         self,
@@ -197,45 +251,51 @@ class PolyCLOBClient:
 
     async def get_market(self, market_id: str) -> dict[str, Any]:
         """GET /markets/{condition_id} — metadata de un mercado."""
-        sess = self._require_session()
         mid = market_id.strip()
-        url = f"{CLOB_REST}/markets/{mid}"
-        async with sess.get(url) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                return {"error": f"HTTP {resp.status}", "raw": text[:500]}
-            return json.loads(text)
+        try:
+            return await self._public_get_json(f"{CLOB_REST}/markets/{mid}", None)
+        except Exception as e:
+            return {"error": str(e)[:200]}
 
     async def get_tick_size(self, token_id: str) -> str:
-        sess = self._require_session()
-        async with sess.get(f"{CLOB_REST}/tick-size", params={"token_id": token_id}) as resp:
-            text = await resp.text()
-            data = json.loads(text)
-            if resp.status != 200:
-                raise RuntimeError(f"tick-size HTTP {resp.status}: {text[:300]}")
-            return str(data.get("minimum_tick_size") or data.get("tick_size") or "0.01")
+        now = time.monotonic()
+        hit = self._tick_cache.get(token_id)
+        if hit and hit[0] > now:
+            return hit[1]
+        data = await self._public_get_json(f"{CLOB_REST}/tick-size", {"token_id": token_id})
+        if not isinstance(data, dict):
+            raise RuntimeError("tick-size: invalid JSON")
+        tick = str(data.get("minimum_tick_size") or data.get("tick_size") or "0.01")
+        self._tick_cache[token_id] = (now + self._meta_ttl_sec, tick)
+        return tick
 
     async def get_neg_risk(self, token_id: str) -> bool:
-        sess = self._require_session()
-        async with sess.get(f"{CLOB_REST}/neg-risk", params={"token_id": token_id}) as resp:
-            text = await resp.text()
-            data = json.loads(text)
-            if resp.status != 200:
-                raise RuntimeError(f"neg-risk HTTP {resp.status}: {text[:300]}")
-            return bool(data.get("neg_risk", False))
+        now = time.monotonic()
+        hit = self._neg_cache.get(token_id)
+        if hit and hit[0] > now:
+            return hit[1]
+        data = await self._public_get_json(f"{CLOB_REST}/neg-risk", {"token_id": token_id})
+        if not isinstance(data, dict):
+            raise RuntimeError("neg-risk: invalid JSON")
+        neg = bool(data.get("neg_risk", False))
+        self._neg_cache[token_id] = (now + self._meta_ttl_sec, neg)
+        return neg
 
     async def get_fee_rate_bps(self, token_id: str) -> int:
-        sess = self._require_session()
-        async with sess.get(f"{CLOB_REST}/fee-rate", params={"token_id": token_id}) as resp:
-            text = await resp.text()
-            data = json.loads(text)
-            if resp.status != 200:
-                return 0
-            v = data.get("base_fee")
-            try:
-                return int(v) if v is not None else 0
-            except (TypeError, ValueError):
-                return 0
+        now = time.monotonic()
+        hit = self._fee_cache.get(token_id)
+        if hit and hit[0] > now:
+            return hit[1]
+        data = await self._public_get_json(f"{CLOB_REST}/fee-rate", {"token_id": token_id})
+        if not isinstance(data, dict):
+            return 0
+        v = data.get("base_fee")
+        try:
+            bps = int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            bps = 0
+        self._fee_cache[token_id] = (now + self._meta_ttl_sec, bps)
+        return bps
 
     async def place_order(self, token_id: str, side: str, price: float, size_usdc: float) -> dict[str, Any]:
         """POST /order — firma EIP-712 vía py-order-utils + cabeceras L2. Requiere DRY_RUN=false y credenciales."""

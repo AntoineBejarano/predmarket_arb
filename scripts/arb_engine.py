@@ -60,6 +60,10 @@ async def main() -> None:
         "poll_interval": float(os.getenv("BUNDLE_POLL_INTERVAL", "10")),
         "min_edge": float(os.getenv("BUNDLE_MIN_EDGE", "0.025")),
         "max_size_usdc": float(os.getenv("BUNDLE_MAX_SIZE_USDC", "300")),
+        "discovery": os.getenv("BUNDLE_DISCOVERY", "gamma").strip().lower(),
+        "use_ws": os.getenv("BUNDLE_USE_WS", "false").lower() in ("1", "true", "yes"),
+        "max_candidates_per_cycle": int(os.getenv("BUNDLE_MAX_CANDIDATES_PER_CYCLE", "120")),
+        "exclude_neg_risk": os.getenv("BUNDLE_EXCLUDE_NEG_RISK", "true").lower() in ("1", "true", "yes"),
     }
     config_cross = {
         **base_cap,
