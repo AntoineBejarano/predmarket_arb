@@ -319,6 +319,7 @@ def clob_market_ws_bundle(
     def _run() -> None:
         ws_holder: dict[str, Any] = {"ws": None}
         subscribed_ids: set[str] = set()
+        first_price_logged: set[str] = set()
 
         def _wanted_ids() -> list[str]:
             # token_ids se comparte desde validate_edge; hacemos copia para evitar carreras.
@@ -347,39 +348,70 @@ def clob_market_ws_bundle(
                 log.warning("CLOB WS: fallo al suscribir: %s", e)
 
         def on_message(_ws: Any, message: Any) -> None:
-            try:
-                if isinstance(message, bytes):
-                    message = message.decode("utf-8", errors="replace")
-                data = json.loads(message)
-                if not isinstance(data, dict):
-                    return
-                event_type = data.get("event_type")
-                asset_id = str(data.get("asset_id", ""))
-                if not asset_id:
-                    return
+            # Skip binary frames and empty/control messages.
+            if not message:
+                return
+            if isinstance(message, bytes):
+                return
+            if len(message) < 2:
+                return
 
+            try:
+                data = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                return
+
+            if not isinstance(data, dict):
+                return
+
+            event_type = data.get("event_type")
+            if not event_type:
+                log.debug("CLOB WS non-event message: %s", str(data)[:100])
+                return
+
+            asset_id = str(data.get("asset_id", ""))
+
+            try:
                 if event_type == "book":
                     bids = data.get("bids", [])
                     asks = data.get("asks", [])
-                    if bids and asks:
+                    if bids and asks and asset_id:
                         mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
                         with tick_lock:
+                            is_first = asset_id not in market_prices
                             market_prices[asset_id] = mid
+                        if is_first and asset_id not in first_price_logged:
+                            first_price_logged.add(asset_id)
+                            log.info("CLOB WS: first price %s=%.4f", asset_id[:16], mid)
+                        log.debug("CLOB book %s: mid=%.4f", asset_id[:8], mid)
                 elif event_type == "price_change":
                     for change in data.get("price_changes", []):
                         bid = change.get("best_bid")
                         ask = change.get("best_ask")
                         if bid and ask:
                             mid = (float(bid) + float(ask)) / 2.0
+                            aid = str(change.get("asset_id", asset_id))
+                            if not aid:
+                                continue
                             with tick_lock:
-                                market_prices[asset_id] = mid
+                                is_first = aid not in market_prices
+                                market_prices[aid] = mid
+                            if is_first and aid not in first_price_logged:
+                                first_price_logged.add(aid)
+                                log.info("CLOB WS: first price %s=%.4f", aid[:16], mid)
+                            log.debug("CLOB price_change %s: mid=%.4f", aid[:8], mid)
                 elif event_type == "last_trade_price":
                     price = data.get("price")
-                    if price:
+                    if price and asset_id:
                         with tick_lock:
+                            is_first = asset_id not in market_prices
                             market_prices.setdefault(asset_id, float(price))
+                        if is_first and asset_id not in first_price_logged:
+                            first_price_logged.add(asset_id)
+                            log.info("CLOB WS: first price %s=%.4f", asset_id[:16], float(price))
             except Exception as e:
-                log.error("CLOB WS message error: %s", e)
+                log.warning("CLOB WS processing error: %s | data: %s", e, str(data)[:200])
+                log.debug("CLOB WS skip: %s", e)
 
         def on_error(_ws: Any, error: Any) -> None:
             log.error("CLOB WS error: %s", error)
