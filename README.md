@@ -2,21 +2,37 @@
 
 Paper-trading / edge-validation stack for Polymarket-style **5-minute crypto Up or Down** markets. It compares market-implied probabilities (Gamma API) with an ML model (LightGBM + isotonic calibration) and a NearRes heuristic. **There is no trading or wallet**—only public API reads and CSV logs.
 
-For deploy and day-to-day ops notes (Spanish), see [`CLAUDE.md`](CLAUDE.md).
+For deploy and day-to-day ops notes (Spanish), see [CLAUDE.md](CLAUDE.md).
 
 ---
 
 ## What you get in this repo
 
-| Piece | Role |
-|--------|------|
-| `scripts/api.py` | FastAPI: dashboard at `/`, JSON `/api/status`, START/STOP worker, SSE `/api/signals/live`, `/health` for Railway |
-| `scripts/validate_edge.py` | Long-running worker: Binance + Gamma, writes `logs/signals.csv` under `DATA_DIR` |
-| `static/dashboard.html` | Vanilla UI + Tailwind CDN |
-| `models/train.py` | Training pipeline; saves PKL under `models/saved/` |
-| `models/saved/*.pkl` | Committed so Railway/local can run the validator without retraining |
+| Piece                      | Role                                                                                                             |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `scripts/api.py`           | FastAPI: dashboard at `/`, JSON `/api/status`, START/STOP worker, SSE `/api/signals/live`, `/health` for Railway |
+| `scripts/validate_edge.py` | Long-running worker: Binance + Gamma, writes `logs/signals.csv` under `DATA_DIR`                                 |
+| `static/dashboard.html`    | Vanilla UI + Tailwind CDN                                                                                        |
+| `models/train.py`          | Training pipeline; saves PKL under `models/saved/`                                                               |
+| `models/saved/*.pkl`       | Committed so Railway/local can run the validator without retraining                                              |
 
 Train models before expecting ML columns in `logs/signals.csv`; without PKL files, NearRes and market logging still run.
+
+---
+
+## Committed analysis reports
+
+These files are **tracked in git** (see `.gitignore` exceptions). Start here if you fork the repo and want numbers without re-running pipelines.
+
+| File | What it is |
+|------|----------------|
+| [reports/compact_feature_spec.md](reports/compact_feature_spec.md) | Feature dictionary for the compact exogenous join, naming, and anti-leakage rules. |
+| [reports/compact_baseline_freeze.json](reports/compact_baseline_freeze.json) | Saved LightGBM + isotonic vs **majority baseline** on recent 5m history (per asset, same label as training). |
+| [reports/compact_eval_report.md](reports/compact_eval_report.md) | Human-readable summary: logistic baseline vs baseline + compact exogenous features (time-series CV). |
+| [reports/compact_eval_report.json](reports/compact_eval_report.json) | Same evaluation as structured JSON (means, stds, deltas per asset). |
+| [reports/compact_go_no_go.json](reports/compact_go_no_go.json) | Conservative **GO / NO-GO** gate derived from `compact_eval_report.json` (stricter than the in-script `GO_CANDIDATE` label). |
+
+The **Compact exogenous experiment** section below ties these together with how they were produced and how to reproduce them.
 
 ---
 
@@ -45,7 +61,7 @@ Environment: copy `.env.example` → `.env`. Important variables include `DATA_D
 
 The supervised label in `models/train.py` is the **next** 5m candle being “green” in the sense used in the codebase:
 
-**`target = (close.shift(-1) >= open.shift(-1))`**
+**target:** `(close.shift(-1) >= open.shift(-1))` in pandas terms on the 5m frame.
 
 i.e. whether the **following** bar’s close is at or above that bar’s open—not a 15m horizon or same-bar direction unless you change the code. Any offline analysis or new features should stay aligned with this definition to avoid silent train/serve skew.
 
@@ -61,14 +77,14 @@ A **disk-light** pipeline was added to pull **Binance Data Vision** UM aggregate
 2. `scripts/build_exogenous_features.py` — outputs `data/raw/exogenous/compact_5m/{ASSET}.parquet`.
 3. `scripts/evaluate_compact_vs_baseline.py` — logistic regression + time-series CV; writes `reports/compact_eval_report.{json,md}`.
 4. `scripts/freeze_baseline_compact.py` — compares **saved** model vs majority baseline on recent history → `reports/compact_baseline_freeze.json`.
-5. `scripts/compact_go_no_go.py` — conservative gate from the eval JSON → `reports/compact_go_no_go.json`.
+5. `scripts/compact_go_no_go.py` — conservative gate from the eval JSON → [reports/compact_go_no_go.json](reports/compact_go_no_go.json).
 
-Feature definitions and anti-leakage notes: `reports/compact_feature_spec.md`.
+Feature definitions and anti-leakage notes: [reports/compact_feature_spec.md](reports/compact_feature_spec.md).
 
 ### Findings (snapshot from committed reports, 2026-04-27)
 
-- **Saved model vs majority** (last ~6 months of 5m bars, same target as training): small positive edge on BTC/ETH/SOL/XRP; **BNB slightly negative** vs majority. See `reports/compact_baseline_freeze.json`.
-- **Exogenous “compact” features vs logistic baseline** on the evaluated window: mixed per asset; `evaluate_compact_vs_baseline.py` may label a run `GO_CANDIDATE` when compact wins a 60% majority of assets, but **`compact_go_no_go.json` applies a stricter rule** (≥60% wins **and** mean CV delta ≥ **0.003**). With that rule the recorded decision is **NO-GO** (mean delta slightly negative). See `reports/compact_go_no_go.json`.
+- **Saved model vs majority** (last ~6 months of 5m bars, same target as training): small positive edge on BTC/ETH/SOL/XRP; **BNB slightly negative** vs majority. See [reports/compact_baseline_freeze.json](reports/compact_baseline_freeze.json).
+- **Exogenous “compact” features vs logistic baseline** on the evaluated window: mixed per asset; `evaluate_compact_vs_baseline.py` may label a run `GO_CANDIDATE` when compact wins a 60% majority of assets, but **compact_go_no_go.json** applies a stricter rule (≥60% wins **and** mean CV delta ≥ **0.003**). With that rule the recorded decision is **NO-GO** (mean delta slightly negative). See [reports/compact_go_no_go.json](reports/compact_go_no_go.json).
 - **Polymarket history**: API responses depend on slug and time range; for some historical windows the join had **no overlapping Polymarket mid** with the spot window used in one build—treat `poly_*` columns as optional and validate coverage before relying on them.
 
 Raw downloaded data for this experiment was **removed from the workspace** on purpose; reproduce by re-running the download scripts after `download_datasets.py`.
@@ -77,9 +93,9 @@ Raw downloaded data for this experiment was **removed from the workspace** on pu
 
 ## Data policy (forks / CI)
 
-- **`data/raw/`, `data/zips/`, `data/features/`** are gitignored—do not commit large parquets or zips.
+- **`data/raw/`**, **`data/zips/`**, **`data/features/`** are gitignored—do not commit large parquets or zips.
 - **`logs/`** is gitignored.
-- **`reports/`**: bulky exploration outputs (e.g. PNG from `scripts/explore_data.py`) stay local. **Committed** artefacts are only the compact analysis files listed in `.gitignore` negation rules (`compact_*`, `compact_feature_spec.md`).
+- **`reports/`**: bulky exploration outputs (e.g. PNG from `scripts/explore_data.py`) stay local. **Committed** artefacts are the compact analysis files in the table above (see `.gitignore` negation rules).
 
 ---
 
@@ -98,7 +114,7 @@ Set `PORT` in the service environment to match the listening port. Docker image 
 
 1. Read `CLAUDE.md` for process architecture and log interpretation.
 2. Re-download data with `download_datasets.py`, then optional exogenous scripts above.
-3. Use `reports/compact_*` as the baseline narrative for the exogenous experiment; extend with new features, targets, or walk-forward design as needed.
+3. Read [Committed analysis reports](#committed-analysis-reports) and open the linked files under `reports/`; extend with new features, targets, or walk-forward design as needed.
 4. Keep train/serve feature names aligned with `models/train.py` and the live validator.
 
 Pull requests should **not** add raw datasets; attach methodology and numbers in `reports/` or short markdown only when it helps reviewers.
