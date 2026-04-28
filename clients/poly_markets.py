@@ -299,6 +299,13 @@ class MarketsRegistry:
         min_vol24 = float(os.getenv("BUNDLE_MIN_VOLUME_24H", "0"))
         assume_first_yes = api_bool_true(os.getenv("BUNDLE_ASSUME_FIRST_TOKEN_IS_YES", "false"))
         do_audit = api_bool_true(os.getenv("BUNDLE_DISCOVERY_AUDIT", "false"))
+        dry_run_env = os.getenv("DRY_RUN")
+        if dry_run_env is None:
+            audit_on_empty_default = False
+        else:
+            audit_on_empty_default = api_bool_true(dry_run_env)
+        audit_on_empty = api_bool_true(os.getenv("BUNDLE_DISCOVERY_AUDIT_ON_EMPTY", str(audit_on_empty_default).lower()))
+        audit_trace = api_bool_true(os.getenv("BUNDLE_DISCOVERY_AUDIT_TRACE_EVENTS", "false"))
         audit_limit = max(1, int(os.getenv("BUNDLE_DISCOVERY_AUDIT_LIMIT", "100")))
         raw_samples_limit = max(1, int(os.getenv("BUNDLE_DISCOVERY_AUDIT_RAW_SAMPLES", "20")))
         max_samples_per_reason = min(5, raw_samples_limit)
@@ -315,7 +322,10 @@ class MarketsRegistry:
 
         diag: dict[str, Any] = {
             "events_pages": 0,
+            "events_seen_total": 0,
             "events_raw": 0,
+            "audit_events_sample_cap": audit_limit,
+            "audit_events_sampled": 0,
             "skip_not_negrisk": 0,
             "skip_augmented": 0,
             "skip_date": 0,
@@ -352,6 +362,7 @@ class MarketsRegistry:
         reject_counter: Counter[str] = Counter()
         samples_by_reason: dict[str, list[dict[str, Any]]] = defaultdict(list)
         sample_total = 0
+        events_for_sample_cap = 0
         built: list[NegRiskBundleCandidate] = []
         relaxed_counts: dict[str, int] = {
             "base": 0,
@@ -362,7 +373,7 @@ class MarketsRegistry:
             "allow_assume_first_yes": 0,
         }
 
-        def _record_reject(
+        def _reject(
             *,
             ev: dict[str, Any],
             child: Optional[dict[str, Any]],
@@ -371,10 +382,11 @@ class MarketsRegistry:
             parser_error: str = "",
             parsed_outcomes: Optional[list[Any]] = None,
             parsed_clob_token_ids: Optional[list[Any]] = None,
+            record_sample: bool,
         ) -> None:
-            nonlocal sample_total
+            nonlocal sample_total, events_for_sample_cap
             reject_counter[reject_reason] += 1
-            if not do_audit:
+            if not record_sample:
                 return
             if sample_total >= raw_samples_limit:
                 return
@@ -410,6 +422,7 @@ class MarketsRegistry:
 
         cursor: str = ""
         base = f"{GAMMA_API_URL}/events/keyset"
+        last_next_cursor: str = ""
 
         for _page in range(self.gamma_events_max_pages):
             params: dict[str, str] = {
@@ -439,16 +452,30 @@ class MarketsRegistry:
             for ev in events:
                 if not isinstance(ev, dict):
                     continue
-                if diag["events_raw"] >= audit_limit:
-                    break
-                diag["events_raw"] += 1
-                funnel["raw_events"] += 1
+                diag["events_seen_total"] += 1
+                diag["events_raw"] = diag["events_seen_total"]
+                funnel["raw_events"] = diag["events_seen_total"]
+                capture_samples = do_audit or (audit_on_empty and diag["candidates_built"] == 0)
+                if do_audit:
+                    sample_this_event = True
+                elif capture_samples:
+                    sample_this_event = audit_trace or (events_for_sample_cap < audit_limit)
+                else:
+                    sample_this_event = False
+                if sample_this_event:
+                    events_for_sample_cap += 1
                 eid = _event_id(ev)
                 if eid:
                     funnel["with_event_id"] += 1
                 else:
                     diag["skip_no_event_id"] += 1
-                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="missing_event_id")
+                    _reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="event_filter",
+                        reject_reason="missing_event_id",
+                        record_sample=sample_this_event,
+                    )
                     continue
 
                 neg_v = ev.get("negRisk")
@@ -466,23 +493,47 @@ class MarketsRegistry:
 
                 if require_negrisk and not api_bool_true(neg_v):
                     diag["skip_not_negrisk"] += 1
-                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="not_negrisk")
+                    _reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="event_filter",
+                        reject_reason="not_negrisk",
+                        record_sample=sample_this_event,
+                    )
                     continue
                 if effective_skip_augmented and is_augmented:
                     diag["skip_augmented"] += 1
-                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="augmented_skipped")
+                    _reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="event_filter",
+                        reject_reason="augmented_skipped",
+                        record_sample=sample_this_event,
+                    )
                     continue
                 funnel["strict_negrisk_non_augmented"] += 1
 
                 end_dt = _parse_end_date(ev)
                 if end_dt is None:
                     diag["skip_date"] += 1
-                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="date_filter")
+                    _reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="event_filter",
+                        reject_reason="date_filter",
+                        record_sample=sample_this_event,
+                    )
                     continue
                 days = (end_dt - now).total_seconds() / 86400.0
                 if days < min_days or days > max_days:
                     diag["skip_date"] += 1
-                    _record_reject(ev=ev, child=None, reject_stage="event_filter", reject_reason="date_filter")
+                    _reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="event_filter",
+                        reject_reason="date_filter",
+                        record_sample=sample_this_event,
+                    )
                     continue
                 funnel["date_valid"] += 1
 
@@ -490,25 +541,38 @@ class MarketsRegistry:
                     eliq = _float_field(ev, "liquidityClob", "liquidityNum", "liquidity")
                     if eliq is None or eliq < min_liq_clob:
                         diag["skip_event_liquidity"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=None,
                             reject_stage="strict_filter",
                             reject_reason="low_event_liquidity",
+                            record_sample=sample_this_event,
                         )
                         continue
                 if min_vol24 > 0:
                     ev24 = _float_field(ev, "volume24hr", "volume24Hr", "volume24HR")
                     if ev24 is None or ev24 < min_vol24:
                         diag["skip_event_volume"] += 1
-                        _record_reject(ev=ev, child=None, reject_stage="strict_filter", reject_reason="low_event_volume")
+                        _reject(
+                            ev=ev,
+                            child=None,
+                            reject_stage="strict_filter",
+                            reject_reason="low_event_volume",
+                            record_sample=sample_this_event,
+                        )
                         continue
 
                 children = _extract_children_from_event(ev)
                 if children:
                     funnel["has_children_or_markets"] += 1
                 else:
-                    _record_reject(ev=ev, child=None, reject_stage="child_extract", reject_reason="no_children")
+                    _reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="child_extract",
+                        reject_reason="no_children",
+                        record_sample=sample_this_event,
+                    )
                     continue
                 funnel["children_total"] += len(children)
 
@@ -517,38 +581,42 @@ class MarketsRegistry:
                 for child in children:
                     if not api_bool_true(child.get("active")):
                         diag["skip_child_tradability"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_extract",
                             reject_reason="inactive",
+                            record_sample=sample_this_event,
                         )
                         continue
                     if api_bool_true(child.get("closed")) or api_bool_true(child.get("isClosed")):
                         diag["skip_child_tradability"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_extract",
                             reject_reason="closed",
+                            record_sample=sample_this_event,
                         )
                         continue
                     if api_bool_true(child.get("archived")):
                         diag["skip_child_tradability"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_extract",
                             reject_reason="archived",
+                            record_sample=sample_this_event,
                         )
                         continue
                     if api_bool_true(child.get("restricted")):
                         diag["skip_child_tradability"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_extract",
                             reject_reason="restricted",
+                            record_sample=sample_this_event,
                         )
                         continue
                     acc = child.get("acceptingOrders")
@@ -556,11 +624,12 @@ class MarketsRegistry:
                         acc = child.get("accepting_orders")
                     if acc is not None and not api_bool_true(acc):
                         diag["skip_child_tradability"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_extract",
                             reject_reason="not_accepting",
+                            record_sample=sample_this_event,
                         )
                         continue
                     eob = child.get("enableOrderBook")
@@ -568,11 +637,12 @@ class MarketsRegistry:
                         eob = child.get("enable_order_book")
                     if eob is not None and not api_bool_true(eob):
                         diag["skip_child_tradability"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_extract",
                             reject_reason="no_orderbook",
+                            record_sample=sample_this_event,
                         )
                         continue
                     has_any_active_child = True
@@ -580,11 +650,12 @@ class MarketsRegistry:
 
                     cid = gamma_condition_id(child)
                     if not cid:
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_extract",
                             reject_reason="missing_condition_id",
+                            record_sample=sample_this_event,
                         )
                         continue
                     funnel["children_with_condition_id"] += 1
@@ -593,37 +664,40 @@ class MarketsRegistry:
                     clob_raw = child.get("clobTokenIds") or child.get("clob_token_ids")
                     parsed_outcomes, out_err = parse_json_list_maybe(outcomes_raw)
                     if parsed_outcomes is None:
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_parse",
                             reject_reason="malformed_outcomes",
                             parser_error=out_err or "",
+                            record_sample=sample_this_event,
                         )
                         continue
                     funnel["children_with_outcomes"] += 1
 
                     parsed_tokens, tok_err = parse_json_list_maybe(clob_raw)
                     if parsed_tokens is None:
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_parse",
                             reject_reason="malformed_clob_token_ids",
                             parser_error=tok_err or "",
                             parsed_outcomes=parsed_outcomes,
+                            record_sample=sample_this_event,
                         )
                         continue
                     funnel["children_with_clob_token_ids"] += 1
 
                     if len(parsed_outcomes) != len(parsed_tokens):
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="child_parse",
                             reject_reason="length_mismatch",
                             parsed_outcomes=parsed_outcomes,
                             parsed_clob_token_ids=parsed_tokens,
+                            record_sample=sample_this_event,
                         )
                         continue
                     funnel["children_with_aligned_outcomes_tokens"] += 1
@@ -635,13 +709,14 @@ class MarketsRegistry:
                     )
                     if yid is None:
                         diag["skip_yes_token"] += 1
-                        _record_reject(
+                        _reject(
                             ev=ev,
                             child=child,
                             reject_stage="yes_extract",
                             reject_reason=yes_reason or "no_yes_outcome",
                             parsed_outcomes=parsed_outcomes,
                             parsed_clob_token_ids=parsed_tokens,
+                            record_sample=sample_this_event,
                         )
                         continue
                     funnel["children_with_yes_token"] += 1
@@ -659,11 +734,12 @@ class MarketsRegistry:
                     legs.append(leg)
 
                 if not has_any_active_child:
-                    _record_reject(
+                    _reject(
                         ev=ev,
                         child=None,
                         reject_stage="child_extract",
                         reject_reason="no_children",
+                        record_sample=sample_this_event,
                     )
                     continue
 
@@ -672,7 +748,13 @@ class MarketsRegistry:
                     funnel["events_with_candidate_legs"] += 1
                 if n < self.min_outcomes or n > self.max_outcomes:
                     diag["skip_outcomes_range"] += 1
-                    _record_reject(ev=ev, child=None, reject_stage="strict_filter", reject_reason="too_many_outcomes")
+                    _reject(
+                        ev=ev,
+                        child=None,
+                        reject_stage="strict_filter",
+                        reject_reason="too_many_outcomes",
+                        record_sample=sample_this_event,
+                    )
                     continue
 
                 end_raw = str(ev.get("endDate") or ev.get("end_date") or "")[:40]
@@ -698,7 +780,8 @@ class MarketsRegistry:
                     if assume_first_yes:
                         relaxed_counts["allow_assume_first_yes"] += 1
 
-            cursor = str(payload.get("next_cursor") or "").strip()
+            last_next_cursor = str(payload.get("next_cursor") or "").strip()
+            cursor = last_next_cursor
             if not cursor:
                 break
 
@@ -720,10 +803,18 @@ class MarketsRegistry:
         if relaxed_diag:
             diag["relaxed_counts"] = relaxed_counts
         diag["events_with_negRisk_true_and_non_augmented"] = funnel["strict_negrisk_non_augmented"]
+        diag["audit_events_sampled"] = events_for_sample_cap
+        diag["pagination"] = {
+            "events_pages": diag.get("events_pages"),
+            "gamma_events_limit": self.gamma_events_limit,
+            "gamma_events_max_pages": self.gamma_events_max_pages,
+            "next_cursor_present": bool(last_next_cursor),
+        }
 
         audit_path = _logs_dir() / "negrisk_discovery_audit.json"
         reject_path = _logs_dir() / "negrisk_discovery_reject_samples.json"
-        if do_audit:
+        write_audit_files = do_audit or (audit_on_empty and diag["candidates_built"] == 0)
+        if write_audit_files:
             audit_obj = {
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "config": {
@@ -732,12 +823,18 @@ class MarketsRegistry:
                     "BUNDLE_ALLOW_AUGMENTED_NEGRISK": allow_aug_env,
                     "BUNDLE_SKIP_AUGMENTED": skip_aug_env,
                     "effective_skip_augmented": effective_skip_augmented,
+                    "BUNDLE_DISCOVERY_AUDIT": str(bool(do_audit)).lower(),
+                    "BUNDLE_DISCOVERY_AUDIT_ON_EMPTY": str(bool(audit_on_empty)).lower(),
+                    "BUNDLE_DISCOVERY_AUDIT_TRACE_EVENTS": str(bool(audit_trace)).lower(),
+                    "BUNDLE_DISCOVERY_AUDIT_LIMIT": str(audit_limit),
                     "BUNDLE_MIN_DAYS_TO_EXPIRY": os.getenv("BUNDLE_MIN_DAYS_TO_EXPIRY", "14"),
                     "BUNDLE_MAX_DAYS_TO_EXPIRY": os.getenv("BUNDLE_MAX_DAYS_TO_EXPIRY", "365"),
                     "BUNDLE_GAMMA_EVENTS_MAX_PAGES": os.getenv("BUNDLE_GAMMA_EVENTS_MAX_PAGES", "20"),
                     "BUNDLE_MAX_OUTCOMES": os.getenv("BUNDLE_MAX_OUTCOMES", ""),
                     "BUNDLE_MAX_OUTCOMES_LIVE": os.getenv("BUNDLE_MAX_OUTCOMES_LIVE", ""),
                 },
+                "pagination": diag.get("pagination"),
+                "events_seen_total": diag.get("events_seen_total"),
                 "funnel": funnel,
                 "top_reject_reasons": top_reject_reasons,
             }

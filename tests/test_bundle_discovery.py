@@ -245,6 +245,19 @@ class _FakeSession:
         return _FakeResponse(self._payload)
 
 
+class _FakeSessionPages:
+    """Sesión fake que devuelve una página distinta en cada GET (orden fijo)."""
+
+    def __init__(self, pages: list[dict[str, Any]]):
+        self._pages = pages
+        self._i = 0
+
+    def get(self, *args, **kwargs) -> _FakeResponse:
+        payload = self._pages[min(self._i, len(self._pages) - 1)]
+        self._i += 1
+        return _FakeResponse(payload)
+
+
 class TestGammaEventsDiscoveryAudit(unittest.IsolatedAsyncioTestCase):
     async def test_valid_event_builds_candidate(self) -> None:
         event = {
@@ -399,3 +412,63 @@ class TestGammaEventsDiscoveryAudit(unittest.IsolatedAsyncioTestCase):
             lm = js["samples_by_reason"].get("length_mismatch", [])
             self.assertLessEqual(len(lm), 5)
             self.assertLessEqual(js.get("sample_count", 0), 7)
+
+    async def test_audit_limit_does_not_stop_event_scan(self) -> None:
+        def _ev(i: int) -> dict[str, Any]:
+            return {
+                "id": f"e{i}",
+                "slug": f"e{i}",
+                "negRisk": False,
+                "negRiskAugmented": False,
+                "endDate": "2099-01-01T00:00:00Z",
+                "markets": [],
+            }
+
+        page1 = {"events": [_ev(i) for i in range(60)], "next_cursor": "c1"}
+        page2 = {"events": [_ev(i + 60) for i in range(60)], "next_cursor": ""}
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=2, gamma_events_limit=60)
+        env = {
+            "BUNDLE_DISCOVERY_AUDIT": "false",
+            "BUNDLE_DISCOVERY_AUDIT_LIMIT": "100",
+            "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
+            "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            _cands, diag = await reg.discover_gamma_events_keyset(_FakeSessionPages([page1, page2]))
+        self.assertEqual(diag.get("events_seen_total"), 120)
+        self.assertEqual(diag.get("skip_not_negrisk"), 120)
+
+    async def test_audit_on_empty_writes_files_without_full_audit_flag(self) -> None:
+        ev = {
+            "id": "evt-empty",
+            "slug": "evt-empty",
+            "negRisk": True,
+            "negRiskAugmented": False,
+            "endDate": "2099-01-01T00:00:00Z",
+            "markets": [
+                {
+                    "conditionId": "c1",
+                    "active": True,
+                    "closed": False,
+                    "restricted": True,
+                    "outcomes": ["Yes", "No"],
+                    "clobTokenIds": ["y1", "n1"],
+                }
+            ],
+        }
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=10)
+        payload = {"events": [ev], "next_cursor": ""}
+        with tempfile.TemporaryDirectory() as td:
+            env = {
+                "DATA_DIR": td,
+                "DRY_RUN": "true",
+                "BUNDLE_DISCOVERY_AUDIT": "false",
+                "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
+                "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                cands, diag = await reg.discover_gamma_events_keyset(_FakeSession(payload))
+            self.assertEqual(len(cands), 0)
+            self.assertTrue(diag.get("discovery_audit_path"))
+            audit_p = os.path.join(td, "logs", "negrisk_discovery_audit.json")
+            self.assertTrue(os.path.isfile(audit_p))

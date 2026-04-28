@@ -503,7 +503,11 @@ class BundleArbStrategy(ArbStrategy):
                 "simplified_candidates": reg_diag.get("simplified_candidates"),
                 "registry_cache_hit": reg_diag.get("cache_hit"),
                 "events_pages": reg_diag.get("events_pages"),
+                "events_seen_total": reg_diag.get("events_seen_total"),
                 "events_raw": reg_diag.get("events_raw"),
+                "pagination": reg_diag.get("pagination"),
+                "audit_events_sample_cap": reg_diag.get("audit_events_sample_cap"),
+                "audit_events_sampled": reg_diag.get("audit_events_sampled"),
                 "skip_not_negrisk": reg_diag.get("skip_not_negrisk"),
                 "skip_augmented": reg_diag.get("skip_augmented"),
                 "skip_date": reg_diag.get("skip_date"),
@@ -653,7 +657,7 @@ class BundleArbStrategy(ArbStrategy):
                         markets_raw_total = int(reg_diag.get("gamma_rows_total") or 0)
                         pages_fetched = int(reg_diag.get("gamma_pages") or 0)
                     elif discovery_mode == "gamma_events":
-                        markets_raw_total = int(reg_diag.get("events_raw") or 0)
+                        markets_raw_total = int(reg_diag.get("events_seen_total") or reg_diag.get("events_raw") or 0)
                         pages_fetched = int(reg_diag.get("events_pages") or 0)
                     else:
                         markets_raw_total = int(reg_diag.get("simplified_rows_total") or 0)
@@ -674,7 +678,7 @@ class BundleArbStrategy(ArbStrategy):
                                 "action": "SKIP:NO_ELIGIBLE_DISCOVERY",
                                 "reason": (
                                     f"BUNDLE_DISCOVERY={discovery_mode}: 0 candidatos tras filtros registry "
-                                    f"(rows_total={markets_raw_total})"
+                                    f"(events_seen_total={markets_raw_total})"
                                 ),
                                 **empty,
                             }

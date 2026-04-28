@@ -334,15 +334,17 @@
         ["WS libro (BUNDLE_USE_WS)", s.use_ws],
         ["VWAP (BUNDLE_USE_VWAP)", s.use_vwap],
         ["Páginas descubrimiento (Gamma o simplified / pages CLOB full)", s.pages_fetched],
-        ["Filas mercado en bucle (raw / filas Gamma)", s.markets_raw_total],
+        ["Eventos Gamma vistos (keyset) / alias filas bucle", [s.events_seen_total, s.markets_raw_total].map((x) => (x != null ? x : "—")).join(" · ")],
         ["Mercados con libro analizado (scanned_books)", s.scanned_books],
         ["Gamma: páginas / filas / tras outcomes", [s.gamma_pages, s.gamma_rows_total, s.gamma_after_outcomes].map((x) => (x != null ? x : "—")).join(" · ")],
         ["Gamma: skip filtros cliente", s.gamma_skip_filters],
         ["Simplified: páginas / filas / candidatos", [s.simplified_pages, s.simplified_rows_total, s.simplified_candidates].map((x) => (x != null ? x : "—")).join(" · ")],
         [
-          "Gamma events: páginas / eventos raw / built / cap",
-          [s.events_pages, s.events_raw, s.candidates_built, s.candidates_after_cap].map((x) => (x != null ? x : "—")).join(" · "),
+          "Gamma events: páginas / eventos vistos (events_seen_total) / built / cap",
+          [s.events_pages, s.events_seen_total != null ? s.events_seen_total : s.events_raw, s.candidates_built, s.candidates_after_cap].map((x) => (x != null ? x : "—")).join(" · "),
         ],
+        ["Gamma events: paginación (next_cursor)", s.pagination ? JSON.stringify(s.pagination) : "—"],
+        ["Gamma events: audit sample cap / eventos muestreados", [s.audit_events_sample_cap, s.audit_events_sampled].map((x) => (x != null ? x : "—")).join(" · ")],
         [
           "Gamma events: skip negrisk / augmented / fecha / child / yes / outcomes",
           [
