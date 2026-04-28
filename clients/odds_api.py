@@ -57,8 +57,9 @@ def normalize_team_label(s: str) -> str:
     return s
 
 
-# Odds API nombres largos → nicknames tipo Gamma (expandir según necesidad).
-_TEAM_ALIAS_MAP: dict[str, str] = {
+# Odds API nombres largos → nicknames tipo Gamma (Odds largo / Gamma corto).
+_ALIAS_MAP: dict[str, str] = {
+    # NBA
     "los angeles lakers": "lakers",
     "los angeles clippers": "clippers",
     "golden state warriors": "warriors",
@@ -71,6 +72,24 @@ _TEAM_ALIAS_MAP: dict[str, str] = {
     "dallas mavericks": "mavericks",
     "oklahoma city thunder": "thunder",
     "minnesota timberwolves": "timberwolves",
+    "san antonio spurs": "spurs",
+    "new orleans pelicans": "pelicans",
+    "memphis grizzlies": "grizzlies",
+    "sacramento kings": "kings",
+    "portland trail blazers": "blazers",
+    "utah jazz": "jazz",
+    "indiana pacers": "pacers",
+    "chicago bulls": "bulls",
+    "cleveland cavaliers": "cavaliers",
+    "detroit pistons": "pistons",
+    "toronto raptors": "raptors",
+    "charlotte hornets": "hornets",
+    "washington wizards": "wizards",
+    "atlanta hawks": "hawks",
+    "orlando magic": "magic",
+    "brooklyn nets": "nets",
+    "philadelphia 76ers": "76ers",
+    # EPL
     "arsenal fc": "arsenal",
     "chelsea fc": "chelsea",
     "manchester city": "man city",
@@ -79,10 +98,28 @@ _TEAM_ALIAS_MAP: dict[str, str] = {
     "newcastle united": "newcastle",
     "west ham united": "west ham",
     "nottingham forest": "nottm forest",
+    "wolverhampton wanderers": "wolves",
+    "brighton & hove albion": "brighton",
+    "brighton and hove albion": "brighton",
+    "brentford fc": "brentford",
+    "fulham fc": "fulham",
+    "everton fc": "everton",
+    "leicester city": "leicester",
+    "ipswich town": "ipswich",
+    "southampton fc": "southampton",
+    "crystal palace": "crystal palace",
+    "bournemouth fc": "bournemouth",
     "aston villa": "aston villa",
+    "liverpool fc": "liverpool",
 }
 
-_CLUB_SUFFIXES = (" fc", " cf", " sc", " ac", " bc")
+_CLUB_SUFFIXES: tuple[str, ...] = tuple(
+    sorted(
+        (" fc", " cf", " sc", " ac", " bc", " afc", " fk", " if", " bk"),
+        key=len,
+        reverse=True,
+    )
+)
 
 
 def _strip_club_suffixes(t: str) -> str:
@@ -99,27 +136,55 @@ def _strip_club_suffixes(t: str) -> str:
 
 def normalize_team_for_match(s: str) -> str:
     """
-    Normaliza nombre de equipo Odds o Gamma para comparar: alias NBA/EPL,
-    luego sufijos de club (FC, SC, …).
+    Normaliza para matching Odds ↔ Gamma:
+    1) lowercase + espacios (normalize_team_label),
+    2) strip sufijos de club al final,
+    3) lookup en _ALIAS_MAP,
+    4) fallback última palabra.
     """
     t = normalize_team_label(s)
     if not t:
         return ""
-    if t in _TEAM_ALIAS_MAP:
-        return _TEAM_ALIAS_MAP[t]
     t = _strip_club_suffixes(t)
-    if t in _TEAM_ALIAS_MAP:
-        return _TEAM_ALIAS_MAP[t]
-    return t
+    if t in _ALIAS_MAP:
+        return _ALIAS_MAP[t]
+    parts = t.split()
+    return parts[-1] if parts else ""
+
+
+def levenshtein(a: str, b: str) -> int:
+    """Distancia de Levenshtein (DP O(nm)); strings cortos de equipos."""
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            ins, delete, sub = cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)
+            cur.append(min(ins, delete, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _team_match_normalized_tokens(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    aw = a.split()[-1] if a.split() else a
+    bw = b.split()[-1] if b.split() else b
+    return (
+        a == b
+        or a in b
+        or b in a
+        or levenshtein(a, b) < 3
+        or aw == bw
+    )
 
 
 def normalized_strings_match(a: str, b: str) -> bool:
-    """Match tras normalize_team_for_match: igualdad, substring en cualquier sentido, o Levenshtein < 3."""
-    if not a or not b:
-        return False
-    if a == b or a in b or b in a:
-        return True
-    return levenshtein(a, b) < 3
+    """Misma lógica que teams_match_odds_gamma sobre tokens ya normalizados (p. ej. blobs)."""
+    return _team_match_normalized_tokens(a, b)
 
 
 _BLOB_VS_SPLIT = re.compile(r"\s+(?:vs\.?|v|@)\s+|\s+[-–]\s+", re.IGNORECASE)
@@ -163,33 +228,22 @@ def odds_team_matches_gamma_blob(odds_team: str, blob: str) -> bool:
     return normalized_strings_match(n_o, n_single)
 
 
-def teams_match_odds_gamma(odds_team: str, gamma_label: str) -> bool:
+def _teams_match_odds_gamma_impl(odds_name: str, gamma_name: str) -> bool:
+    """Implementación base: dos nombres ya acotados a un equipo."""
+    a = normalize_team_for_match(odds_name)
+    b = normalize_team_for_match(gamma_name)
+    return _team_match_normalized_tokens(a, b)
+
+
+def teams_match_odds_gamma(odds_name: str, gamma_name: str) -> bool:
     """
     True si el equipo Odds API y el label Gamma (outcome corto o texto largo) coinciden.
     Textos con varios equipos (p. ej. título con \"vs\") comparan por segmentos.
     """
-    chunks = _gamma_blob_team_chunks(gamma_label)
+    chunks = _gamma_blob_team_chunks(gamma_name)
     if len(chunks) >= 2:
-        return odds_team_matches_gamma_blob(odds_team, gamma_label)
-    a = normalize_team_for_match(odds_team)
-    b = normalize_team_for_match(gamma_label)
-    return normalized_strings_match(a, b)
-
-
-def levenshtein(a: str, b: str) -> int:
-    """Distancia de Levenshtein (DP O(nm)); strings cortos de equipos."""
-    if len(a) < len(b):
-        a, b = b, a
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            ins, delete, sub = cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)
-            cur.append(min(ins, delete, sub))
-        prev = cur
-    return prev[-1]
+        return odds_team_matches_gamma_blob(odds_name, gamma_name)
+    return _teams_match_odds_gamma_impl(odds_name, gamma_name)
 
 
 async def get_sports(session: aiohttp.ClientSession, *, api_key: Optional[str] = None) -> list[dict[str, Any]]:
