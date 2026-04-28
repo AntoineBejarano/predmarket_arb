@@ -16,15 +16,8 @@ import aiohttp
 from aiohttp import WSMsgType
 
 from arb.base import ArbStrategy
-from clients.odds_api import (
-    find_odds_event_matching_teams,
-    get_odds,
-    implied_prob,
-    odds_api_key,
-    odds_team_matches_gamma_blob,
-    remove_vig,
-    teams_match_odds_gamma,
-)
+from clients.odds_api import odds_team_matches_gamma_blob, teams_match_odds_gamma
+from clients.odds_api_io import OddsApiIo, OddsEvent, find_event_matching_teams, remove_vig as remove_vig_decimal
 from clients.poly_clob import PolyCLOBClient
 from clients.poly_markets import GAMMA_API_URL
 from clients.poly_parse import api_bool_true, clob_market_tradeable, parse_json_list_maybe, parse_outcomes_list
@@ -379,41 +372,13 @@ def _pick_best_market_in_event(
     return min(candidates, key=sort_key)
 
 
-def _extract_pinnacle_two_way(event: dict[str, Any]) -> Optional[tuple[str, float, str, float]]:
-    """(home_name, dec_home, away_name, dec_away) desde mercado h2h Pinnacle."""
-    home_team = str(event.get("home_team") or "")
-    away_team = str(event.get("away_team") or "")
-    for bk in event.get("bookmakers") or []:
-        if str(bk.get("key") or "") != "pinnacle":
-            continue
-        for mk in bk.get("markets") or []:
-            if str(mk.get("key") or "") != "h2h":
-                continue
-            outs = mk.get("outcomes") or []
-            by_name: dict[str, float] = {}
-            for o in outs:
-                if not isinstance(o, dict):
-                    continue
-                nm = str(o.get("name") or "").strip()
-                try:
-                    px = float(o.get("price"))
-                except (TypeError, ValueError):
-                    continue
-                if nm:
-                    by_name[nm] = px
-
-            def pick_price(team_full: str) -> Optional[float]:
-                if team_full in by_name:
-                    return by_name[team_full]
-                tl = team_full.lower()
-                for k, v in by_name.items():
-                    if tl in k.lower() or k.lower() in tl:
-                        return v
-                return None
-
-            ph, pa = pick_price(home_team), pick_price(away_team)
-            if ph is not None and pa is not None:
-                return home_team, ph, away_team, pa
+def _align_odds_io_to_game(ev: OddsEvent, game: OpenPolymarketGame) -> Optional[tuple[str, float, str, float]]:
+    """(nombre lado Poly home, decimal, nombre lado Poly away, decimal) alineado con game.home/game.away."""
+    gh, ga = (game.home or "").strip(), (game.away or "").strip()
+    if teams_match_odds_gamma(gh, ev.home) and teams_match_odds_gamma(ga, ev.away):
+        return ev.home, ev.home_odds, ev.away, ev.away_odds
+    if teams_match_odds_gamma(gh, ev.away) and teams_match_odds_gamma(ga, ev.home):
+        return ev.away, ev.away_odds, ev.home, ev.home_odds
     return None
 
 
@@ -517,6 +482,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._shutdown = asyncio.Event()
         self._cycle_seq = 0
+        self._odds_client = OddsApiIo()
 
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
@@ -542,6 +508,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._state_manager = state_manager
         self._shutdown.clear()
         self._ws_task = asyncio.create_task(self._ws_runner(), name="latency_arb_sports_ws")
+        if self._odds_client.ws_enabled:
+            raw_io_sports = os.getenv("ODDS_API_IO_SPORTS", "tennis,table-tennis")
+            io_sports = [s.strip() for s in str(raw_io_sports).split(",") if s.strip()]
+            self._odds_client.start_ws_stream(sports=io_sports)
         try:
             while True:
                 try:
@@ -576,6 +546,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 await asyncio.sleep(interval)
         finally:
             self._shutdown.set()
+            await self._odds_client.stop_ws_stream()
             if self._ws_task:
                 self._ws_task.cancel()
                 try:
@@ -725,48 +696,39 @@ class LatencyArbSportsStrategy(ArbStrategy):
             self._cycle_seq += 1
             seq = self._cycle_seq
             open_games = await self._fetch_open_polymarket_sports(sess)
-            odds_fetched: set[str] = set()
-            pinnacle_matched = 0
+            odds_keys_loaded: set[str] = set()
+            reference_matched = 0
             csv_rows = 0
-            odds_events_by_key: dict[str, list[dict[str, Any]]] = {}
+            odds_events_by_key: dict[str, list[OddsEvent]] = {}
 
             for game in open_games:
                 odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug)
                 if odds_key is None:
                     continue
                 if odds_key not in odds_events_by_key:
-                    try:
-                        odds_events_by_key[odds_key] = await get_odds(
-                            sess,
-                            odds_key,
-                            regions=self.regions,
-                            markets="h2h",
-                            bookmakers="pinnacle",
-                            api_key=odds_api_key(),
-                        )
-                        odds_fetched.add(odds_key)
-                    except Exception as e:
-                        log.warning("[latency_arb_sports] odds fetch %s: %s", odds_key, e)
-                        odds_events_by_key[odds_key] = []
+                    if not self._odds_client.ws_enabled:
+                        await self._odds_client.refresh_rest_cache(sess, odds_key)
+                    odds_events_by_key[odds_key] = self._odds_client.get_cached_odds(odds_key)
+                    odds_keys_loaded.add(odds_key)
                 events_list = odds_events_by_key.get(odds_key) or []
-                odds_ev = find_odds_event_matching_teams(events_list, game.home, game.away)
+                odds_ev = find_event_matching_teams(events_list, game.home, game.away)
                 if odds_ev is None:
                     continue
-                pinnacle_matched += 1
+                reference_matched += 1
                 st = await self._process_matched_poly_odds(sess, clob, game, odds_key, odds_ev)
                 csv_rows += st["csv_rows"]
 
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
-                "open_poly_games=%s odds_keys_fetched=%s pinnacle_matched=%s csv_rows=%s "
+                "open_poly_games=%s odds_io_keys=%s reference_matched=%s csv_rows=%s "
                 "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s",
                 seq,
                 self.regions,
                 self.min_edge,
                 self.max_stake,
                 len(open_games),
-                len(odds_fetched),
-                pinnacle_matched,
+                len(odds_keys_loaded),
+                reference_matched,
                 csv_rows,
                 self._discovery_fetch_ttl_sec(),
                 self._is_in_active_window(open_games),
@@ -779,16 +741,15 @@ class LatencyArbSportsStrategy(ArbStrategy):
         clob: PolyCLOBClient,
         game: OpenPolymarketGame,
         odds_sport_key: str,
-        odds_event: dict[str, Any],
+        odds_event: OddsEvent,
     ) -> dict[str, int]:
         acc = {"csv_rows": 0}
-        tw = _extract_pinnacle_two_way(odds_event)
+        tw = _align_odds_io_to_game(odds_event, game)
         if tw is None:
             return acc
         odds_home, dec_h, odds_away, dec_a = tw
-        p_h_raw = implied_prob(dec_h)
-        p_a_raw = implied_prob(dec_a)
-        p_h_fair, p_a_fair, _ = remove_vig(p_h_raw, p_a_raw, None)
+        ddraw = odds_event.draw_odds if odds_event.draw_odds and odds_event.draw_odds > 0 else None
+        p_h_fair, p_a_fair, _ = remove_vig_decimal(dec_h, dec_a, ddraw)
         g = _open_game_to_gamma_row(game, odds_sport_key)
         tok_h, tok_a = _map_outcomes_to_tokens(g, odds_home, odds_away)
         if not tok_h or not tok_a:
