@@ -472,3 +472,82 @@ class TestGammaEventsDiscoveryAudit(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(diag.get("discovery_audit_path"))
             audit_p = os.path.join(td, "logs", "negrisk_discovery_audit.json")
             self.assertTrue(os.path.isfile(audit_p))
+
+    async def test_keyset_query_uses_native_filters(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class _Cap:
+            def get(self, *_a, **kw):  # noqa: ANN001
+                captured["params"] = dict(kw.get("params") or {})
+                return _FakeResponse({"events": [], "next_cursor": ""})
+
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=11)
+        env = {
+            "BUNDLE_DISCOVERY_AUDIT": "false",
+            "BUNDLE_MIN_DAYS_TO_EXPIRY": "3",
+            "BUNDLE_MAX_DAYS_TO_EXPIRY": "90",
+            "BUNDLE_MIN_LIQUIDITY_CLOB": "150",
+            "BUNDLE_MIN_VOLUME_24H": "25",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            _, diag = await reg.discover_gamma_events_keyset(_Cap())
+        p = captured["params"]
+        self.assertEqual(p.get("closed"), "false")
+        self.assertEqual(p.get("limit"), "11")
+        self.assertNotIn("active", p)
+        self.assertIn("end_date_min", p)
+        self.assertIn("end_date_max", p)
+        self.assertEqual(float(p["liquidity_min"]), 150.0)
+        self.assertEqual(float(p["volume_min"]), 25.0)
+        qf = diag.get("events_keyset_query_base")
+        self.assertIsInstance(qf, dict)
+        self.assertEqual(qf.get("closed"), "false")
+        self.assertNotIn("next_cursor", qf)
+
+    async def test_keyset_legacy_active_opt_in(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class _Cap:
+            def get(self, *_a, **kw):  # noqa: ANN001
+                captured["params"] = dict(kw.get("params") or {})
+                return _FakeResponse({"events": [], "next_cursor": ""})
+
+        reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=5)
+        env = {
+            "BUNDLE_DISCOVERY_AUDIT": "false",
+            "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
+            "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
+            "BUNDLE_GAMMA_KEYSET_LEGACY_ACTIVE": "true",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            await reg.discover_gamma_events_keyset(_Cap())
+        self.assertEqual(captured["params"].get("active"), "true")
+
+    async def test_discover_gamma_markets_native_query(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class _Cap:
+            def get(self, url, **kw):  # noqa: ANN001
+                captured["url"] = url
+                captured["params"] = dict(kw.get("params") or {})
+                return _FakeResponse([])
+
+        reg = MarketsRegistry(
+            min_outcomes=2,
+            max_outcomes=5,
+            gamma_max_pages=1,
+            gamma_limit=20,
+            min_liquidity_usd=1000.0,
+            min_volume_24h=500.0,
+            min_hours_to_resolution=48.0,
+        )
+        await reg.discover_gamma(_Cap())
+        self.assertTrue(str(captured["url"]).endswith("/markets"))
+        p = captured["params"]
+        self.assertEqual(p.get("closed"), "false")
+        self.assertEqual(p.get("limit"), 20)
+        self.assertEqual(p.get("offset"), 0)
+        self.assertNotIn("active", p)
+        self.assertEqual(p.get("liquidity_num_min"), 1000.0)
+        self.assertEqual(p.get("volume_num_min"), 500.0)
+        self.assertIn("end_date_min", p)

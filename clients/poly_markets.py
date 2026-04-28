@@ -132,6 +132,25 @@ def _parse_end_date(m: dict[str, Any]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def _gamma_query_datetime_utc(dt: datetime) -> str:
+    """ISO-8601 UTC con sufijo ``Z`` para query params documentados en Gamma."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    s = dt.isoformat(timespec="seconds")
+    return s.replace("+00:00", "Z")
+
+
+def _diag_query_params(params: dict[str, str]) -> dict[str, str]:
+    """Copia de params para logs/diag (acorta cursores)."""
+    out = dict(params)
+    cur = out.get("next_cursor") or ""
+    if len(cur) > 24:
+        out["next_cursor"] = f"{cur[:12]}…({len(cur)} chars)"
+    return out
+
+
 def _logs_dir() -> Path:
     base = Path(os.getenv("DATA_DIR", ".")).resolve()
     out = base / "logs"
@@ -225,7 +244,7 @@ class MarketsRegistry:
         return True, ""
 
     async def discover_gamma(self, session: aiohttp.ClientSession) -> tuple[list[BundleCandidate], dict[str, Any]]:
-        """GET Gamma ``/markets`` con active/closed/archived."""
+        """GET Gamma ``/markets`` con filtros documentados (``closed``, liquidez/volumen, ``end_date_*``)."""
         diag: dict[str, Any] = {
             "gamma_pages": 0,
             "gamma_rows_total": 0,
@@ -233,18 +252,30 @@ class MarketsRegistry:
             "gamma_skip_filters": 0,
             "gamma_skip_no_cid": 0,
             "gamma_skip_no_tokens": 0,
+            "gamma_markets_query_base": {},
         }
         out: list[BundleCandidate] = []
         offset = 0
         base = f"{GAMMA_API_URL}/markets"
+        legacy_active = api_bool_true(os.getenv("BUNDLE_GAMMA_MARKETS_LEGACY_ACTIVE", "false"))
         for page in range(self.gamma_max_pages):
             params: dict[str, str | int] = {
-                "active": "true",
                 "closed": "false",
-                "archived": "false",
                 "limit": self.gamma_limit,
                 "offset": offset,
             }
+            if legacy_active:
+                params["active"] = "true"
+                params["archived"] = "false"
+            if self.min_liquidity_usd > 0:
+                params["liquidity_num_min"] = self.min_liquidity_usd
+            if self.min_volume_24h > 0:
+                params["volume_num_min"] = self.min_volume_24h
+            if self.min_hours_to_resolution > 0:
+                min_end = datetime.now(timezone.utc) + timedelta(hours=self.min_hours_to_resolution)
+                params["end_date_min"] = _gamma_query_datetime_utc(min_end)
+            if page == 0:
+                diag["gamma_markets_query_base"] = {k: str(v) for k, v in params.items() if k != "offset"}
             async with session.get(base, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 text = await resp.text()
                 if resp.status != 200:
@@ -287,7 +318,8 @@ class MarketsRegistry:
         self, session: aiohttp.ClientSession
     ) -> tuple[list[NegRiskBundleCandidate], dict[str, Any]]:
         """
-        GET Gamma ``/events/keyset`` (active, closed=false) con cursores.
+        GET Gamma ``/events/keyset`` con filtros nativos documentados (``closed``,
+        ``end_date_min``/``max``, ``liquidity_min``, ``volume_min``) y cursores.
         Filtra negRisk, fechas sobre ``endDate`` del evento, hijos tradeables con token YES.
         """
         now = datetime.now(timezone.utc)
@@ -324,6 +356,7 @@ class MarketsRegistry:
             "events_pages": 0,
             "events_seen_total": 0,
             "events_raw": 0,
+            "events_keyset_query_base": {},
             "audit_events_sample_cap": audit_limit,
             "audit_events_sampled": 0,
             "skip_not_negrisk": 0,
@@ -423,15 +456,29 @@ class MarketsRegistry:
         cursor: str = ""
         base = f"{GAMMA_API_URL}/events/keyset"
         last_next_cursor: str = ""
+        legacy_keyset_active = api_bool_true(os.getenv("BUNDLE_GAMMA_KEYSET_LEGACY_ACTIVE", "false"))
+        end_native_min = now + timedelta(days=min_days)
+        end_native_max = now + timedelta(days=max_days)
 
-        for _page in range(self.gamma_events_max_pages):
+        for page_i in range(self.gamma_events_max_pages):
             params: dict[str, str] = {
-                "active": "true",
                 "closed": "false",
                 "limit": str(self.gamma_events_limit),
+                "end_date_min": _gamma_query_datetime_utc(end_native_min),
+                "end_date_max": _gamma_query_datetime_utc(end_native_max),
             }
+            if legacy_keyset_active:
+                params["active"] = "true"
+            if min_liq_clob > 0:
+                params["liquidity_min"] = str(min_liq_clob)
+            if min_vol24 > 0:
+                params["volume_min"] = str(min_vol24)
             if cursor:
                 params["next_cursor"] = cursor
+            if page_i == 0:
+                diag["events_keyset_query_base"] = _diag_query_params(
+                    {k: v for k, v in params.items() if k != "next_cursor"}
+                )
             async with session.get(
                 base, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
