@@ -20,8 +20,13 @@ from clients.odds_api import teams_match_odds_gamma
 
 log = logging.getLogger("odds_api_io")
 
-# LAB — sustituir por ODDS_API_IO_KEY en prod; preferir variable de entorno
-_ODDS_API_IO_KEY_LAB = "647c2e8972c62f827b54f98b759982ea2b6d891be25b49c2a746a6f1ed4dd360"
+# Valores embebidos (p. ej. Railway sin env). `os.getenv("ODDS_API_IO_*")` sigue pudiendo sobreescribir en local.
+ODDS_API_IO_KEY_EMBEDDED = "647c2e8972c62f827b54f98b759982ea2b6d891be25b49c2a746a6f1ed4dd360"
+ODDS_API_IO_WS_EMBEDDED = True
+ODDS_API_IO_CACHE_TTL_EMBEDDED = 60
+ODDS_API_IO_BOOKMAKERS_EMBEDDED = "betfair_ex,sharp_exchange"
+ODDS_API_IO_MARKETS_EMBEDDED = "ML"
+ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis"
 
 BASE_REST = "https://api.odds-api.io/v3"
 WS_BASE = "wss://api.odds-api.io/v3/ws"
@@ -47,10 +52,6 @@ _POLY_ODDS_KEY_TO_IO_SPORT: dict[str, str] = {
 }
 
 _WS_BACKOFF_SEC = (2, 4, 8, 16, 30)
-
-
-def _env_bool(name: str, default: str) -> bool:
-    return os.getenv(name, default).strip().lower() == "true"
 
 
 @dataclass
@@ -204,13 +205,14 @@ def _oddsevents_from_odds_payload(
 
 class OddsApiIo:
     def __init__(self) -> None:
-        self.api_key = (os.getenv("ODDS_API_IO_KEY") or _ODDS_API_IO_KEY_LAB).strip()
-        self.ws_enabled = _env_bool("ODDS_API_IO_WS", "true")
-        self.cache_ttl = int(os.getenv("ODDS_API_IO_CACHE_TTL", "60"))
-        raw_bk = os.getenv("ODDS_API_IO_BOOKMAKERS", "betfair_ex,sharp_exchange")
+        self.api_key = (os.getenv("ODDS_API_IO_KEY") or ODDS_API_IO_KEY_EMBEDDED).strip()
+        _raw_ws = os.getenv("ODDS_API_IO_WS")
+        self.ws_enabled = ODDS_API_IO_WS_EMBEDDED if _raw_ws is None else _raw_ws.strip().lower() == "true"
+        self.cache_ttl = int(os.getenv("ODDS_API_IO_CACHE_TTL") or ODDS_API_IO_CACHE_TTL_EMBEDDED)
+        raw_bk = os.getenv("ODDS_API_IO_BOOKMAKERS") or ODDS_API_IO_BOOKMAKERS_EMBEDDED
         self.bookmakers_csv = ",".join(b.strip() for b in raw_bk.split(",") if b.strip())
         self._wanted_bookies_lower = frozenset(b.strip().lower() for b in self.bookmakers_csv.split(",") if b.strip())
-        self.markets_ws = os.getenv("ODDS_API_IO_MARKETS", "ML").strip() or "ML"
+        self.markets_ws = (os.getenv("ODDS_API_IO_MARKETS") or ODDS_API_IO_MARKETS_EMBEDDED).strip() or "ML"
         self._lock = asyncio.Lock()
         self._ws_odds_cache: dict[str, dict[str, OddsEvent]] = {}
         self._rest_cache: dict[str, tuple[float, list[OddsEvent]]] = {}
@@ -226,7 +228,7 @@ class OddsApiIo:
         self._ws_cancel.clear()
         clean = [s.strip() for s in sports if s.strip()]
         if not clean:
-            clean = [s.strip() for s in os.getenv("ODDS_API_IO_SPORTS", "tennis,table-tennis").split(",") if s.strip()]
+            clean = [s.strip() for s in ODDS_API_IO_SPORTS_EMBEDDED.split(",") if s.strip()]
         self._ws_runner_task = asyncio.create_task(self._ws_runner_loop(clean), name="odds_api_io_ws")
 
     async def stop_ws_stream(self) -> None:

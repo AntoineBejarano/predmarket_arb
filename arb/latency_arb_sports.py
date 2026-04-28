@@ -17,7 +17,13 @@ from aiohttp import WSMsgType
 
 from arb.base import ArbStrategy
 from clients.odds_api import odds_team_matches_gamma_blob, teams_match_odds_gamma
-from clients.odds_api_io import OddsApiIo, OddsEvent, find_event_matching_teams, remove_vig as remove_vig_decimal
+from clients.odds_api_io import (
+    ODDS_API_IO_SPORTS_EMBEDDED,
+    OddsApiIo,
+    OddsEvent,
+    find_event_matching_teams,
+    remove_vig as remove_vig_decimal,
+)
 from clients.poly_clob import PolyCLOBClient
 from clients.poly_markets import GAMMA_API_URL
 from clients.poly_parse import api_bool_true, clob_market_tradeable, parse_json_list_maybe, parse_outcomes_list
@@ -33,13 +39,24 @@ _DEFAULT_HEADERS = {
 
 MIN_DISCOVERY_TTL_SEC = 300
 
+# Defaults embebidos si Railway (u otro) no define env; `os.getenv` sigue pudiendo sobreescribir en local.
+_EMBEDDED_LATENCY_SPORTS_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
+_EMBEDDED_LATENCY_MIN_EDGE = "0.03"
+_EMBEDDED_LATENCY_MAX_STAKE_USDC = "50"
+_EMBEDDED_LATENCY_REGIONS = "eu"
+_EMBEDDED_LATENCY_POLL_INTERVAL = "5"
+_EMBEDDED_LATENCY_POLL_INTERVAL_ACTIVE = "2"
+_EMBEDDED_LATENCY_DISCOVERY_TTL = "300"
+_EMBEDDED_LATENCY_DISCOVERY_TTL_ACTIVE = "30"
+_EMBEDDED_LATENCY_WINDOW_HOURS_BEFORE = "3"
+
 # Gamma /events con ?sport= no filtra de forma fiable; usamos series_id del GET /sports nativo.
 GAMMA_SPORTS_META_TTL_SEC = 3600.0
 
 POLY_SLUG_TO_ODDS_KEY: dict[str, str] = {
-    "wta": "tennis_wta",
-    "atp": "tennis_atp",
-    "wttmen": "tabletennis_wtt",
+    "wta": "tennis",
+    "atp": "tennis",
+    "wttmen": "table-tennis",
     "nba": "basketball_nba",
     "nhl": "icehockey_nhl",
     "mlb": "baseball_mlb",
@@ -49,6 +66,17 @@ POLY_SLUG_TO_ODDS_KEY: dict[str, str] = {
     "epl": "soccer_epl",
     "nfl": "americanfootball_nfl",
 }
+
+# Claves que espera clients.odds_api_io.poly_odds_key_to_io_sport (valores POLY arriba = slugs IO).
+_ODDS_IO_CLIENT_POLY_KEY: dict[str, str] = {
+    "tennis": "tennis_wta",
+    "table-tennis": "tabletennis_wtt",
+}
+
+
+def _client_poly_key_for_odds_io(odds_key: str) -> str:
+    k = odds_key.strip()
+    return _ODDS_IO_CLIENT_POLY_KEY.get(k, k)
 
 
 @dataclass
@@ -452,14 +480,22 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
     def __init__(self, config: dict[str, Any], dry_run: bool = True) -> None:
         super().__init__(config, dry_run=dry_run)
-        raw_slugs = os.getenv("LATENCY_SPORTS_POLY_SLUGS", "epl,nba,nfl,ucl,uel,nhl")
+        raw_slugs = os.getenv("LATENCY_SPORTS_POLY_SLUGS") or _EMBEDDED_LATENCY_SPORTS_POLY_SLUGS
         self.poly_slugs = [s.strip().lower() for s in str(raw_slugs).split(",") if s.strip()]
-        self.min_edge = float(config.get("min_edge", os.getenv("LATENCY_SPORTS_MIN_EDGE", "0.03")))
-        self.max_stake = float(config.get("max_stake_usdc", os.getenv("LATENCY_SPORTS_MAX_STAKE_USDC", "50")))
-        self.regions = os.getenv("LATENCY_SPORTS_REGIONS", "eu").strip()
-        self.poll_interval = float(config.get("poll_interval", os.getenv("LATENCY_SPORTS_POLL_INTERVAL", "5")))
-        self.poll_interval_active = float(os.getenv("LATENCY_SPORTS_POLL_INTERVAL_ACTIVE", "2"))
-        ttl_raw = float(os.getenv("LATENCY_SPORTS_DISCOVERY_TTL", "300"))
+        self.min_edge = float(
+            config.get("min_edge", os.getenv("LATENCY_SPORTS_MIN_EDGE") or _EMBEDDED_LATENCY_MIN_EDGE)
+        )
+        self.max_stake = float(
+            config.get("max_stake_usdc", os.getenv("LATENCY_SPORTS_MAX_STAKE_USDC") or _EMBEDDED_LATENCY_MAX_STAKE_USDC)
+        )
+        self.regions = (os.getenv("LATENCY_SPORTS_REGIONS") or _EMBEDDED_LATENCY_REGIONS).strip()
+        self.poll_interval = float(
+            config.get("poll_interval", os.getenv("LATENCY_SPORTS_POLL_INTERVAL") or _EMBEDDED_LATENCY_POLL_INTERVAL)
+        )
+        self.poll_interval_active = float(
+            os.getenv("LATENCY_SPORTS_POLL_INTERVAL_ACTIVE") or _EMBEDDED_LATENCY_POLL_INTERVAL_ACTIVE
+        )
+        ttl_raw = float(os.getenv("LATENCY_SPORTS_DISCOVERY_TTL") or _EMBEDDED_LATENCY_DISCOVERY_TTL)
         if ttl_raw < MIN_DISCOVERY_TTL_SEC:
             log.warning(
                 "[latency_arb_sports] LATENCY_SPORTS_DISCOVERY_TTL clamped to %ss (was %s)",
@@ -467,8 +503,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 ttl_raw,
             )
         self.discovery_ttl = max(MIN_DISCOVERY_TTL_SEC, ttl_raw)
-        self.discovery_ttl_active = float(os.getenv("LATENCY_SPORTS_DISCOVERY_TTL_ACTIVE", "30"))
-        self.window_hours_before = float(os.getenv("LATENCY_SPORTS_WINDOW_HOURS_BEFORE", "3"))
+        self.discovery_ttl_active = float(
+            os.getenv("LATENCY_SPORTS_DISCOVERY_TTL_ACTIVE") or _EMBEDDED_LATENCY_DISCOVERY_TTL_ACTIVE
+        )
+        self.window_hours_before = float(
+            os.getenv("LATENCY_SPORTS_WINDOW_HOURS_BEFORE") or _EMBEDDED_LATENCY_WINDOW_HOURS_BEFORE
+        )
         self._window_past_hours = 2.0
         self._breaker = config.get("circuit_breaker")
         self._start_capital = float(config.get("start_capital", os.getenv("ARB_START_CAPITAL", "10000")))
@@ -489,7 +529,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         poly_key = POLY_SLUG_TO_ODDS_KEY.get(str(sport_slug).strip().lower())
         if not poly_key:
             return []
-        return self._odds_client.get_cached_odds(poly_key)
+        return self._odds_client.get_cached_odds(_client_poly_key_for_odds_io(poly_key))
 
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
@@ -516,7 +556,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._shutdown.clear()
         self._ws_task = asyncio.create_task(self._ws_runner(), name="latency_arb_sports_ws")
         if self._odds_client.ws_enabled:
-            raw_io_sports = os.getenv("ODDS_API_IO_SPORTS", "tennis,table-tennis")
+            raw_io_sports = os.getenv("ODDS_API_IO_SPORTS") or ODDS_API_IO_SPORTS_EMBEDDED
             io_sports = [s.strip() for s in str(raw_io_sports).split(",") if s.strip()]
             self._odds_client.start_ws_stream(sports=io_sports)
         try:
@@ -714,8 +754,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     continue
                 if odds_key not in odds_events_by_key:
                     if not self._odds_client.ws_enabled:
-                        await self._odds_client.refresh_rest_cache(sess, odds_key)
-                    odds_events_by_key[odds_key] = self._odds_client.get_cached_odds(odds_key)
+                        await self._odds_client.refresh_rest_cache(sess, _client_poly_key_for_odds_io(odds_key))
+                    odds_events_by_key[odds_key] = self._odds_client.get_cached_odds(
+                        _client_poly_key_for_odds_io(odds_key)
+                    )
                     odds_keys_loaded.add(odds_key)
                 events_list = odds_events_by_key.get(odds_key) or []
                 odds_ev = find_event_matching_teams(events_list, game.home, game.away)
