@@ -483,6 +483,13 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._shutdown = asyncio.Event()
         self._cycle_seq = 0
         self._odds_client = OddsApiIo()
+        self._ref_debug_done = False
+
+    def _get_odds_for_sport(self, sport_slug: str) -> list[OddsEvent]:
+        poly_key = POLY_SLUG_TO_ODDS_KEY.get(str(sport_slug).strip().lower())
+        if not poly_key:
+            return []
+        return self._odds_client.get_cached_odds(poly_key)
 
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
@@ -717,6 +724,23 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 reference_matched += 1
                 st = await self._process_matched_poly_odds(sess, clob, game, odds_key, odds_ev)
                 csv_rows += st["csv_rows"]
+
+            if (
+                not self._ref_debug_done
+                and len(open_games) > 0
+                and len(odds_keys_loaded) > 0
+            ):
+                for game in open_games[:5]:
+                    odds_events = self._get_odds_for_sport(game.sport_slug)
+                    preview = [f"{ev.home} vs {ev.away}" for ev in odds_events[:3]]
+                    log.info(
+                        "[REF_DEBUG] game='%s vs %s' sport=%s odds_io_events=%s",
+                        game.home,
+                        game.away,
+                        game.sport_slug,
+                        preview,
+                    )
+                self._ref_debug_done = True
 
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
