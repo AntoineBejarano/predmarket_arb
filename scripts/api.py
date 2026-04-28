@@ -69,6 +69,20 @@ STRATEGY_SLUGS = [
 ]
 ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SLUGS}
 BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
+LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snapshots.csv"
+LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
+
+
+def _read_latency_sports_cycle_metrics() -> dict[str, Any]:
+    """Último ciclo escrito por latency_arb_sports (motor); vacío si no hay archivo."""
+    p = LATENCY_SPORTS_CYCLE_METRICS_JSON
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
 
 
 def signals_path() -> Path:
@@ -628,15 +642,24 @@ def _read_arb_csv_tail(path: Path, n: int = 200) -> list[dict[str, Any]]:
     return rows[-n:]
 
 
+def _csv_ts_date_utc(ts: Any) -> str:
+    """YYYY-MM-DD en UTC a partir de columna ts (ISO)."""
+    s = str(ts or "").strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return ""
+
+
 def _csv_stats_today(path: Path) -> dict[str, Any]:
     today = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
-    rows = _read_arb_csv_tail(path, n=5000)
-    today_rows = [r for r in rows if str(r.get("ts", "")).startswith(today)]
+    rows = _read_arb_csv_tail(path, n=15000)
+    today_rows = [r for r in rows if _csv_ts_date_utc(r.get("ts")) == today]
 
     signals = [r for r in today_rows if r.get("action") == "SIGNAL"]
     executed = [r for r in today_rows if r.get("action") == "EXECUTED"]
     skips = [r for r in today_rows if str(r.get("action", "")).startswith("SKIP")]
     errors = [r for r in today_rows if str(r.get("action", "")).startswith("ERROR")]
+    skip_below_min = [r for r in today_rows if r.get("action") == "SKIP:BELOW_MIN_EDGE"]
 
     edges: list[float] = []
     for r in today_rows:
@@ -652,6 +675,7 @@ def _csv_stats_today(path: Path) -> dict[str, Any]:
         "signals_today": len(signals),
         "executed_today": len(executed),
         "skips_today": len(skips),
+        "skip_below_min_edge_today": len(skip_below_min),
         "errors_today": len(errors),
         "skip_rate": round(len(skips) / max(len(today_rows), 1), 3),
         "avg_edge_today": round(sum(edges) / len(edges), 4) if edges else None,
@@ -738,19 +762,25 @@ async def arb_status() -> dict[str, Any]:
         cap = float(st.get("fict_capital_eur") or 1000)
         cum = float(st.get("fict_pnl_cumulative_eur") or 0)
         roi = cum / cap if cap > 0 else 0.0
-        strategies.append(
-            {
-                "slug": slug,
-                "enabled": st.get("enabled", False),
-                "fict_capital_eur": cap,
-                "fict_pnl_cumulative_eur": round(cum, 6),
-                "fict_trades": int(st.get("fict_trades") or 0),
-                "fict_roi": round(roi, 6),
-                "fict_last_stake_eur": st.get("fict_last_stake_eur"),
-                "fict_last_pnl_est_eur": st.get("fict_last_pnl_est_eur"),
-                **stats,
-            }
-        )
+        row: dict[str, Any] = {
+            "slug": slug,
+            "enabled": st.get("enabled", False),
+            "fict_capital_eur": cap,
+            "fict_pnl_cumulative_eur": round(cum, 6),
+            "fict_trades": int(st.get("fict_trades") or 0),
+            "fict_roi": round(roi, 6),
+            "fict_last_stake_eur": st.get("fict_last_stake_eur"),
+            "fict_last_pnl_est_eur": st.get("fict_last_pnl_est_eur"),
+            **stats,
+        }
+        if slug == "latency_arb_sports":
+            m = _read_latency_sports_cycle_metrics()
+            if m:
+                row["open_poly_games"] = m.get("open_poly_games")
+                row["reference_matched"] = m.get("reference_matched")
+                row["ws_cache_size"] = m.get("ws_cache_size")
+                row["cycle_metrics_updated_at"] = m.get("updated_at")
+        strategies.append(row)
     running = False
     with _arb_lock:
         if _arb_proc is not None and _arb_proc.poll() is None:
@@ -808,6 +838,21 @@ async def arb_strategy_log(
     if action:
         rows = [r for r in rows if str(r.get("action", "")).startswith(action)]
     return rows[-limit:]
+
+
+@app.get("/api/arb/strategy/{slug}/snapshots")
+async def arb_strategy_snapshots(
+    slug: str,
+    limit: int = Query(200, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """Últimas filas de ``latency_arb_sports_snapshots.csv`` (solo estrategia sports). Orden: más reciente primero."""
+    if slug != "latency_arb_sports":
+        raise HTTPException(status_code=404, detail="Snapshots only available for latency_arb_sports")
+    if not LATENCY_ARB_SPORTS_SNAPSHOTS_CSV.is_file():
+        return []
+    rows = _read_arb_csv_tail(LATENCY_ARB_SPORTS_SNAPSHOTS_CSV, n=max(limit, 500))
+    tail = rows[-limit:] if len(rows) > limit else rows
+    return list(reversed(tail))
 
 
 @app.get("/api/arb/strategy/{slug}/scan")

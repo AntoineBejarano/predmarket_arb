@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -31,6 +34,39 @@ from clients.poly_parse import api_bool_true, clob_market_tradeable, parse_json_
 log = logging.getLogger("latency_arb_sports")
 
 SPORTS_WS_URL = "wss://sports-api.polymarket.com/ws"
+
+# CSV de análisis (una fila por partido y ciclo con mids); columnas betfair_* = cuotas/probs del book IO (p. ej. Betfair) alineadas a Poly home/away.
+_SNAPSHOT_CSV_COLUMNS: list[str] = [
+    "snapshot_at",
+    "game",
+    "delta_home",
+    "delta_away",
+    "poly_mid_home",
+    "poly_mid_away",
+    "betfair_prob_home",
+    "betfair_prob_away",
+    "betfair_home_odds",
+    "betfair_away_odds",
+    "betfair_updated_at",
+    "ts",
+    "home",
+    "away",
+    "sport",
+    "match_set",
+    "match_score",
+]
+
+
+def _latency_snapshots_csv_path() -> Path:
+    return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "latency_arb_sports_snapshots.csv"
+
+
+def _env_snapshot_csv_enabled() -> bool:
+    raw = os.getenv("LATENCY_SPORTS_SNAPSHOT_CSV")
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() not in ("false", "0", "no", "off")
+
 
 _DEFAULT_HEADERS = {
     "User-Agent": "predmarket-arb/latency-arb-sports (aiohttp; +https://github.com)",
@@ -361,7 +397,11 @@ def _gamma_event_usable(ev: dict[str, Any]) -> bool:
 
 def _event_matches_odds_teams(ev: dict[str, Any], home_odds: str, away_odds: str) -> bool:
     """Evento Gamma cuyo title/slug menciona ambos equipos (orden irrelevante)."""
-    blob = ((ev.get("title") or "") + " " + (ev.get("slug") or "")).strip()
+    title = str(ev.get("title") or "").strip()
+    if ":" in title:
+        title = title.rsplit(":", 1)[-1].strip()
+    slug = str(ev.get("slug") or "").strip()
+    blob = (title + " " + slug).strip()
     if len(blob) < 3:
         return False
     return odds_team_matches_gamma_blob(home_odds, blob) and odds_team_matches_gamma_blob(away_odds, blob)
@@ -524,6 +564,57 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._cycle_seq = 0
         self._odds_client = OddsApiIo()
         self._ref_debug_done = False
+        self._cache_debug_done = False
+        self._snapshot_csv_enabled = _env_snapshot_csv_enabled()
+        self._snapshot_csv_path = _latency_snapshots_csv_path()
+        self._snapshot_csv_lock = threading.Lock()
+
+    def _ws_snapshot_match_fields(self, game: OpenPolymarketGame) -> tuple[str, str]:
+        """Best-effort desde sports WS cache (esquema variable); vacío si no hay datos."""
+        blob = self._ws_cache.get(game.sport_slug)
+        if not isinstance(blob, dict):
+            return "", ""
+        for ks, kc in (("match_set", "match_score"), ("matchSet", "matchScore")):
+            if ks in blob or kc in blob:
+                return str(blob.get(ks) or ""), str(blob.get(kc) or "")
+        inner = blob.get("game")
+        if isinstance(inner, dict):
+            for ks, kc in (("match_set", "match_score"), ("matchSet", "matchScore")):
+                if ks in inner or kc in inner:
+                    return str(inner.get(ks) or ""), str(inner.get(kc) or "")
+        return "", ""
+
+    def _append_latency_snapshot_row(self, row: dict[str, Any]) -> None:
+        if not self._snapshot_csv_enabled:
+            return
+        out = {k: "" if row.get(k) is None else str(row.get(k)) for k in _SNAPSHOT_CSV_COLUMNS}
+        path = self._snapshot_csv_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._snapshot_csv_lock:
+                new_file = not path.is_file()
+                with open(path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=_SNAPSHOT_CSV_COLUMNS, extrasaction="ignore")
+                    if new_file:
+                        w.writeheader()
+                    w.writerow(out)
+        except Exception as e:
+            log.warning("[latency_arb_sports] snapshot csv append: %s", e)
+
+    def _write_cycle_metrics_json(self, open_poly_games: int, reference_matched: int, ws_cache_size: int) -> None:
+        """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
+        try:
+            path = Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "latency_arb_sports_cycle_metrics.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "open_poly_games": int(open_poly_games),
+                "reference_matched": int(reference_matched),
+                "ws_cache_size": int(ws_cache_size),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            log.debug("[latency_arb_sports] cycle metrics json: %s", e)
 
     def _get_odds_for_sport(self, sport_slug: str) -> list[OddsEvent]:
         poly_key = POLY_SLUG_TO_ODDS_KEY.get(str(sport_slug).strip().lower())
@@ -682,7 +773,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "series_id": int(series_id) if str(series_id).isdigit() else series_id,
                 "active": "true",
                 "closed": "false",
-                "limit": 100,
+                "limit": 200,
+                "order": "createdAt",
+                "ascending": "false",
             }
             try:
                 async with session.get(url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)) as resp:
@@ -743,6 +836,16 @@ class LatencyArbSportsStrategy(ArbStrategy):
             self._cycle_seq += 1
             seq = self._cycle_seq
             open_games = await self._fetch_open_polymarket_sports(sess)
+            if seq == 1 and not self._cache_debug_done:
+                self._cache_debug_done = True
+                odds_key = POLY_SLUG_TO_ODDS_KEY.get("atp", "atp")
+                cached = self._odds_client.get_cached_odds(odds_key)
+                log.info(
+                    "[CACHE_DEBUG] odds_key=%s cached_count=%s ws_cache_raw=%s",
+                    odds_key,
+                    len(cached),
+                    list(self._odds_client._ws_odds_cache.keys())[:3],
+                )
             odds_keys_loaded: set[str] = set()
             reference_matched = 0
             csv_rows = 0
@@ -803,6 +906,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self.dry_run,
                 len(self._odds_client._ws_odds_cache),
             )
+            self._write_cycle_metrics_json(len(open_games), reference_matched, len(self._odds_client._ws_odds_cache))
 
     async def _process_matched_poly_odds(
         self,
@@ -823,16 +927,63 @@ class LatencyArbSportsStrategy(ArbStrategy):
         tok_h, tok_a = _map_outcomes_to_tokens(g, odds_home, odds_away)
         if not tok_h or not tok_a:
             return acc
+
+        async def _resolve_mid(tid: str) -> Optional[float]:
+            m = await clob.get_midpoint(tid)
+            if m is not None:
+                return float(m)
+            ob = await clob.get_orderbook(tid)
+            bb, ba = ob.get("best_bid"), ob.get("best_ask")
+            if bb is not None and ba is not None:
+                return (float(bb) + float(ba)) / 2.0
+            return None
+
+        mid_h_val = await _resolve_mid(tok_h)
+        mid_a_val = await _resolve_mid(tok_a)
+        if mid_h_val is not None and mid_a_val is not None:
+            edge_home = float(p_h_fair) - float(mid_h_val)
+            edge_away = float(p_a_fair) - float(mid_a_val)
+            log.info(
+                "[MATCH_OK] poly='%s vs %s' odds_io='%s vs %s' edge_home=%.4f edge_away=%.4f",
+                game.home,
+                game.away,
+                odds_event.home,
+                odds_event.away,
+                edge_home,
+                edge_away,
+            )
+            snap_ts = datetime.now(timezone.utc).isoformat()
+            game_label = (game.raw_title or "").strip() or f"{game.home} vs {game.away}"
+            mset, mscr = self._ws_snapshot_match_fields(game)
+            self._append_latency_snapshot_row(
+                {
+                    "snapshot_at": snap_ts,
+                    "ts": snap_ts,
+                    "game": game_label,
+                    "home": game.home,
+                    "away": game.away,
+                    "sport": game.sport_slug,
+                    "delta_home": f"{edge_home:.10f}".rstrip("0").rstrip("."),
+                    "delta_away": f"{edge_away:.10f}".rstrip("0").rstrip("."),
+                    "poly_mid_home": f"{float(mid_h_val):.10f}".rstrip("0").rstrip("."),
+                    "poly_mid_away": f"{float(mid_a_val):.10f}".rstrip("0").rstrip("."),
+                    "betfair_prob_home": f"{float(p_h_fair):.10f}".rstrip("0").rstrip("."),
+                    "betfair_prob_away": f"{float(p_a_fair):.10f}".rstrip("0").rstrip("."),
+                    "betfair_home_odds": f"{float(dec_h):.10f}".rstrip("0").rstrip("."),
+                    "betfair_away_odds": f"{float(dec_a):.10f}".rstrip("0").rstrip("."),
+                    "betfair_updated_at": str(odds_event.updated_at or ""),
+                    "match_set": mset,
+                    "match_score": mscr,
+                }
+            )
+
         for side_label, token_id, p_fair in (
             ("YES", tok_h, p_h_fair),
             ("NO", tok_a, p_a_fair),
         ):
-            mid = await clob.get_midpoint(token_id)
+            mid: Optional[float] = mid_h_val if token_id == tok_h else mid_a_val
             if mid is None:
-                ob = await clob.get_orderbook(token_id)
-                bb, ba = ob.get("best_bid"), ob.get("best_ask")
-                if bb is not None and ba is not None:
-                    mid = (float(bb) + float(ba)) / 2.0
+                mid = await _resolve_mid(token_id)
             if mid is None:
                 continue
             clob_read_at = datetime.utcnow().isoformat()
@@ -856,11 +1007,29 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 clob_read_at,
             )
             raw_edge = float(p_fair) - float(mid)
-            if abs(raw_edge) < self.min_edge:
-                continue
             edge_mag = abs(raw_edge)
+            if edge_mag < self.min_edge:
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:BELOW_MIN_EDGE",
+                        "reason": f"|edge|={edge_mag:.4f}<min_edge={self.min_edge:.4f}_side={side_label}_raw={raw_edge:.4f}",
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge": f"{edge_mag:.6f}",
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                    }
+                )
+                acc["csv_rows"] += 1
+                continue
             buy_side = "BUY"
-            if raw_edge < 0:
+            if raw_edge < 0:  # edge >= min_edge pero dirección desfavorable para BUY
                 await self.log_signal_async(
                     {
                         "action": "SKIP:LOW_EDGE",

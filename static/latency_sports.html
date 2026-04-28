@@ -33,8 +33,8 @@
       </div>
     </header>
 
-    <section class="grid grid-cols-2 md:grid-cols-4 gap-3">
-      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+    <section class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-7 gap-2 md:gap-3">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase">Estrategia</p>
         <div class="mt-2 flex items-center gap-2">
           <button type="button" id="btn-toggle" onclick="toggleEnabled()"
@@ -44,18 +44,33 @@
           <span id="toggle-label" class="text-xs text-slate-400">—</span>
         </div>
       </div>
-      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase">Capital paper</p>
-        <p id="k-cap" class="font-mono text-lg text-indigo-200 mt-1">—</p>
+        <p id="k-cap" class="font-mono text-base md:text-lg text-indigo-200 mt-1">—</p>
       </div>
-      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase">PnL acum. (est.)</p>
-        <p id="k-pnl" class="font-mono text-lg mt-1">—</p>
+        <p id="k-pnl" class="font-mono text-base md:text-lg mt-1">—</p>
       </div>
-      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase">ROI · ops</p>
-        <p id="k-roi" class="font-mono text-lg text-slate-200 mt-1">—</p>
+        <p id="k-roi" class="font-mono text-base md:text-lg text-slate-200 mt-1">—</p>
         <p id="k-trades" class="text-xs text-slate-500 mt-0.5">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
+        <p class="text-xs text-slate-500 uppercase leading-tight">Partidos monitorizados</p>
+        <p id="k-open-poly" class="font-mono text-base md:text-lg text-cyan-300/90 mt-1">—</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">open_poly_games</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
+        <p class="text-xs text-slate-500 uppercase leading-tight">WS cache size</p>
+        <p id="k-ws-cache" class="font-mono text-base md:text-lg text-cyan-300/90 mt-1">—</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">odds-api.io</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
+        <p class="text-xs text-slate-500 uppercase leading-tight">Reference matched</p>
+        <p id="k-ref-matched" class="font-mono text-base md:text-lg text-cyan-300/90 mt-1">—</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">último ciclo</p>
       </div>
     </section>
 
@@ -150,9 +165,12 @@
       const pnl = s.fict_pnl_cumulative_eur;
       const elPnl = document.getElementById("k-pnl");
       elPnl.textContent = pnl != null ? Number(pnl).toFixed(4) : "—";
-      elPnl.className = "font-mono text-lg mt-1 " + ((pnl || 0) >= 0 ? "text-emerald-400" : "text-red-400");
+      elPnl.className = "font-mono text-base md:text-lg mt-1 " + ((pnl || 0) >= 0 ? "text-emerald-400" : "text-red-400");
       document.getElementById("k-roi").textContent = s.fict_roi != null ? (Number(s.fict_roi) * 100).toFixed(2) + "%" : "—";
       document.getElementById("k-trades").textContent = s.fict_trades != null ? "Ops: " + s.fict_trades : "—";
+      document.getElementById("k-open-poly").textContent = s.open_poly_games != null ? String(s.open_poly_games) : "—";
+      document.getElementById("k-ws-cache").textContent = s.ws_cache_size != null ? String(s.ws_cache_size) : "—";
+      document.getElementById("k-ref-matched").textContent = s.reference_matched != null ? String(s.reference_matched) : "—";
       const btn = document.getElementById("btn-toggle");
       const knob = document.getElementById("toggle-knob");
       btn.className =
