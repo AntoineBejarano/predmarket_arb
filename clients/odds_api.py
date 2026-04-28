@@ -108,6 +108,8 @@ _ALIAS_MAP: dict[str, str] = {
     "ipswich town": "ipswich",
     "southampton fc": "southampton",
     "crystal palace": "crystal palace",
+    "afc bournemouth": "bournemouth",
+    "bournemouth": "bournemouth",
     "bournemouth fc": "bournemouth",
     "aston villa": "aston villa",
     "liverpool fc": "liverpool",
@@ -134,18 +136,41 @@ def _strip_club_suffixes(t: str) -> str:
     return out
 
 
+_CLUB_PREFIXES: tuple[str, ...] = tuple(
+    sorted(
+        ("afc ", "fc ", "cf ", "as ", "ac ", "ss ", "us "),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _strip_club_prefixes(t: str) -> str:
+    out = (t or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        for pre in _CLUB_PREFIXES:
+            if out.startswith(pre):
+                out = out[len(pre) :].lstrip()
+                changed = True
+    return out
+
+
 def normalize_team_for_match(s: str) -> str:
     """
     Normaliza para matching Odds ↔ Gamma:
     1) lowercase + espacios (normalize_team_label),
     2) strip sufijos de club al final,
-    3) lookup en _ALIAS_MAP,
-    4) fallback última palabra.
+    3) strip prefijos de club al inicio,
+    4) lookup en _ALIAS_MAP,
+    5) fallback última palabra.
     """
     t = normalize_team_label(s)
     if not t:
         return ""
     t = _strip_club_suffixes(t)
+    t = _strip_club_prefixes(t)
     if t in _ALIAS_MAP:
         return _ALIAS_MAP[t]
     parts = t.split()
