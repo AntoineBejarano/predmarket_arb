@@ -662,6 +662,27 @@ def _csv_stats_today(path: Path) -> dict[str, Any]:
     }
 
 
+def _warn_if_experimental_enabled_in_state_but_env_off() -> None:
+    """Evita confusión en Railway: toggles ON en JSON no cargan estrategias sin env."""
+    if os.getenv("ENABLE_EXPERIMENTAL", "false").lower() in ("true", "1", "yes"):
+        return
+    experimental_slugs = ("combinatorial_arb", "term_structure", "latency_arb", "latency_arb_sports")
+    try:
+        p = REPO_ROOT / "data" / "strategy_state.json"
+        if not p.is_file():
+            return
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        bad = [s for s in experimental_slugs if (raw.get(s) or {}).get("enabled")]
+        if bad:
+            log.warning(
+                "[api] Hay estrategias enabled en strategy_state.json que el motor NO ejecutará "
+                "porque ENABLE_EXPERIMENTAL=false: %s. Añade ENABLE_EXPERIMENTAL=true al servicio y redeploy.",
+                ", ".join(bad),
+            )
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+
+
 def _arb_engine_start() -> tuple[bool, Optional[int], Optional[str]]:
     global _arb_proc
     with _arb_lock:
@@ -678,6 +699,7 @@ def _arb_engine_start() -> tuple[bool, Optional[int], Optional[str]]:
                 start_new_session=True,
             )
             log.info("POST /api/arb/start -> arb_engine pid=%s", _arb_proc.pid)
+            _warn_if_experimental_enabled_in_state_but_env_off()
             return True, _arb_proc.pid, None
         except OSError as e:
             _arb_proc = None

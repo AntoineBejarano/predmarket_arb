@@ -111,6 +111,11 @@ async def main() -> None:
         ]
 
     log.info("Arrancando %s estrategias. DRY_RUN=%s ENABLE_EXPERIMENTAL=%s", len(strategies), DRY_RUN, ENABLE_EXPERIMENTAL)
+    if not ENABLE_EXPERIMENTAL:
+        log.info(
+            "[arb_engine] ENABLE_EXPERIMENTAL=false: solo bundle_arb, cross_exchange, market_maker. "
+            "Para combinatorial_arb, term_structure, latency_arb o latency_arb_sports, define ENABLE_EXPERIMENTAL=true (p. ej. en Railway)."
+        )
     await asyncio.gather(*(s.run_loop(state_mgr) for s in strategies))
 
 

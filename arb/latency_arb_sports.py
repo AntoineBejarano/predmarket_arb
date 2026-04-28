@@ -390,6 +390,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._ws_cache: dict[str, dict[str, Any]] = {}
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._shutdown = asyncio.Event()
+        self._cycle_seq = 0
 
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
@@ -474,12 +475,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 break
             await asyncio.sleep(3.0)
 
-    async def _maybe_refresh_gamma(self, session: aiohttp.ClientSession) -> None:
+    async def _maybe_refresh_gamma(self, session: aiohttp.ClientSession) -> bool:
+        """Refresca Gamma si venció TTL. Devuelve True si hubo GET a Gamma."""
         import time as time_mod
 
         now = time_mod.monotonic()
         if now - self._last_gamma_fetch < self.discovery_ttl and self._gamma_by_sport:
-            return
+            remain = self.discovery_ttl - (now - self._last_gamma_fetch)
+            log.info(
+                "[latency_arb_sports] gamma cache hit (siguiente refresh en ~%.0fs, ttl=%.0fs)",
+                remain,
+                self.discovery_ttl,
+            )
+            return False
         rows = await _fetch_gamma_sports_markets(
             session,
             self.sports_keys,
@@ -492,7 +500,15 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 by[r.sport_key].append(r)
         self._gamma_by_sport = by
         self._last_gamma_fetch = now
-        log.info("[latency_arb_sports] gamma discovery: %s markets across sports", len(rows))
+        by_counts = {k: len(v) for k, v in by.items()}
+        log.info(
+            "[latency_arb_sports] gamma refresh: total=%s by_sport=%s pages<=%s tag_id=%s",
+            len(rows),
+            by_counts,
+            self.gamma_max_pages,
+            self.gamma_tag_id or "(none)",
+        )
+        return True
 
     async def _poll_cycle(self, state_manager: Any) -> None:
         if self._breaker:
@@ -524,7 +540,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
             private_key=os.getenv("POLY_PRIVATE_KEY", ""),
             dry_run=self.dry_run,
         ) as clob:
-            await self._maybe_refresh_gamma(sess)
+            self._cycle_seq += 1
+            seq = self._cycle_seq
+            gamma_refreshed = await self._maybe_refresh_gamma(sess)
+            gamma_total = sum(len(v) for v in self._gamma_by_sport.values())
+            odds_counts: dict[str, int] = {}
+            pinnacle_events = 0
+            gamma_matched = 0
+            csv_rows = 0
             for sport_key in self.sports_keys:
                 try:
                     events = await get_odds(
@@ -537,9 +560,32 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     )
                 except Exception as e:
                     log.warning("[latency_arb_sports] odds fetch %s: %s", sport_key, e)
+                    odds_counts[sport_key] = -1
                     continue
+                odds_counts[sport_key] = len(events)
                 for ev in events:
-                    await self._process_event(sess, clob, sport_key, ev)
+                    st = await self._process_event(sess, clob, sport_key, ev)
+                    pinnacle_events += st["pinnacle"]
+                    gamma_matched += st["gamma_match"]
+                    csv_rows += st["csv_rows"]
+            log.info(
+                "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
+                "gamma_refreshed=%s gamma_total=%s gamma_by_sport=%s ws_slugs_cached=%s "
+                "odds_events=%s pinnacle_h2h=%s gamma_matched_events=%s csv_rows=%s dry_run=%s",
+                seq,
+                self.regions,
+                self.min_edge,
+                self.max_stake,
+                gamma_refreshed,
+                gamma_total,
+                {k: len(v) for k, v in self._gamma_by_sport.items()},
+                len(self._ws_cache),
+                odds_counts,
+                pinnacle_events,
+                gamma_matched,
+                csv_rows,
+                self.dry_run,
+            )
 
     async def _process_event(
         self,
@@ -547,20 +593,23 @@ class LatencyArbSportsStrategy(ArbStrategy):
         clob: PolyCLOBClient,
         sport_key: str,
         event: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, int]:
+        acc = {"pinnacle": 0, "gamma_match": 0, "csv_rows": 0}
         tw = _extract_pinnacle_two_way(event)
         if tw is None:
-            return
+            return acc
+        acc["pinnacle"] = 1
         odds_home, dec_h, odds_away, dec_a = tw
         p_h_raw = implied_prob(dec_h)
         p_a_raw = implied_prob(dec_a)
         p_h_fair, p_a_fair, _ = remove_vig(p_h_raw, p_a_raw, None)
         g = _match_gamma_for_event(event, sport_key, self._gamma_by_sport)
         if g is None:
-            return
+            return acc
+        acc["gamma_match"] = 1
         tok_h, tok_a = _map_outcomes_to_tokens(g, odds_home, odds_away)
         if not tok_h or not tok_a:
-            return
+            return acc
         for side_label, token_id, p_fair in (
             ("YES", tok_h, p_h_fair),
             ("NO", tok_a, p_a_fair),
@@ -597,6 +646,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "status": "SKIP",
                     }
                 )
+                acc["csv_rows"] += 1
                 continue
             size = float(self.max_stake)
             status = "SIGNAL"
@@ -638,3 +688,5 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "status": status,
                 }
             )
+            acc["csv_rows"] += 1
+        return acc
