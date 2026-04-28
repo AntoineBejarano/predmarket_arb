@@ -43,7 +43,7 @@ _DEFAULT_HEADERS = {
     "Accept": "application/json",
 }
 
-# Claves de POLY_SLUG_TO_ODDS_KEY (The Odds API) → slug deporte en odds-api.io
+# Claves Odds / POLY → slug deporte odds-api.io (REST + resolución get_cached_odds)
 _POLY_ODDS_KEY_TO_IO_SPORT: dict[str, str] = {
     "tennis_wta": "tennis",
     "tennis_atp": "tennis",
@@ -57,6 +57,19 @@ _POLY_ODDS_KEY_TO_IO_SPORT: dict[str, str] = {
     "soccer_epl": "football",
     "americanfootball_nfl": "american-football",
 }
+
+ODDS_KEY_TO_IO_SPORT: dict[str, str] = {
+    "tennis_wta": "tennis",
+    "tennis_atp": "tennis",
+    "tennis": "tennis",
+    "table-tennis": "table-tennis",
+    "tabletennis_wtt": "table-tennis",
+    "basketball_nba": "basketball",
+    "soccer_epl": "football",
+    "soccer_uefa_champs_league": "football",
+}
+for _odds_k, _io_slug in _POLY_ODDS_KEY_TO_IO_SPORT.items():
+    ODDS_KEY_TO_IO_SPORT.setdefault(_odds_k, _io_slug)
 
 _WS_BACKOFF_SEC = (2, 4, 8, 16, 30)
 
@@ -118,15 +131,7 @@ def find_event_matching_teams(
 
 
 def poly_odds_key_to_io_sport(poly_odds_key: str) -> Optional[str]:
-    return _POLY_ODDS_KEY_TO_IO_SPORT.get(poly_odds_key.strip())
-
-
-def _io_sports_matching_poly_key(poly_odds_key: str) -> set[str]:
-    """Slugs API que deben incluirse al filtrar filas para una clave tipo tennis_wta."""
-    s = poly_odds_key_to_io_sport(poly_odds_key)
-    if s:
-        return {s}
-    return set()
+    return ODDS_KEY_TO_IO_SPORT.get(poly_odds_key.strip())
 
 
 def _parse_ml_odds_row(raw: dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -259,17 +264,14 @@ class OddsApiIo:
             pass
         self._ws_runner_task = None
 
-    def get_cached_odds(self, poly_sport: str) -> list[OddsEvent]:
+    def get_cached_odds(self, sport: str) -> list[OddsEvent]:
         """Solo lectura de caché; en REST la caché se rellena vía refresh_rest_cache."""
+        k = sport.strip()
+        sport_slug = ODDS_KEY_TO_IO_SPORT.get(k, k).strip().lower()
         if self.ws_enabled:
-            if not poly_odds_key_to_io_sport(poly_sport.strip()):
-                return []
-            return self._flatten_ws_cache_for_poly_key(poly_sport)
-        io_sport = poly_odds_key_to_io_sport(poly_sport)
-        if not io_sport:
-            return []
+            return self._flatten_ws_cache_io_sport(sport_slug)
         now = time.monotonic()
-        row = self._rest_cache.get(io_sport)
+        row = self._rest_cache.get(sport_slug)
         if not row:
             return []
         ts, events = row
@@ -277,12 +279,12 @@ class OddsApiIo:
             return []
         return list(events)
 
-    def _flatten_ws_cache_for_poly_key(self, poly_sport: str) -> list[OddsEvent]:
-        want_sports = _io_sports_matching_poly_key(poly_sport)
+    def _flatten_ws_cache_io_sport(self, sport_slug: str) -> list[OddsEvent]:
+        sl = sport_slug.strip().casefold()
         acc: list[OddsEvent] = []
         for _eid, by_bk in self._ws_odds_cache.items():
             for ev in by_bk.values():
-                if ev.sport in want_sports or (not ev.sport and len(want_sports) == 1):
+                if (ev.sport or "").strip().casefold() == sl:
                     acc.append(ev)
         acc.sort(key=lambda e: (self._bookie_priority(e.bookie), e.event_id))
         return acc
