@@ -86,6 +86,16 @@ def remove_vig(
     return _remove_vig_probs(ph, pa, pd)
 
 
+def normalize_name_order(name: str) -> str:
+    """Convierte 'Mensik, Jakub' → 'jakub mensik' (apellido, nombre → nombre apellido)."""
+    name = name.strip().lower()
+    if "," in name:
+        parts = [p.strip() for p in name.split(",", 1)]
+        if len(parts) == 2 and parts[0] and parts[1]:
+            name = f"{parts[1]} {parts[0]}"
+    return name
+
+
 def find_event_matching_teams(
     events: list[OddsEvent],
     poly_home: str,
@@ -95,9 +105,11 @@ def find_event_matching_teams(
     if not ph or not pa:
         return None
     for ev in events:
-        oh, oa = (ev.home or "").strip(), (ev.away or "").strip()
-        if not oh or not oa:
+        oh_raw, oa_raw = (ev.home or "").strip(), (ev.away or "").strip()
+        if not oh_raw or not oa_raw:
             continue
+        oh = normalize_name_order(oh_raw)
+        oa = normalize_name_order(oa_raw)
         if (teams_match_odds_gamma(ph, oh) and teams_match_odds_gamma(pa, oa)) or (
             teams_match_odds_gamma(ph, oa) and teams_match_odds_gamma(pa, oh)
         ):
