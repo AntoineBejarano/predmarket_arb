@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -24,7 +25,7 @@ from clients.odds_api import (
 )
 from clients.poly_clob import PolyCLOBClient
 from clients.poly_markets import GAMMA_API_URL
-from clients.poly_parse import clob_market_tradeable, parse_json_list_maybe, parse_outcomes_list
+from clients.poly_parse import api_bool_true, clob_market_tradeable, parse_json_list_maybe, parse_outcomes_list
 
 log = logging.getLogger("latency_arb_sports")
 
@@ -36,13 +37,6 @@ _DEFAULT_HEADERS = {
 }
 
 MIN_DISCOVERY_TTL_SEC = 300
-
-# Keywords por sport_key (Odds API) para filtrar mercados Gamma por texto
-SPORT_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "soccer_epl": ("epl", "premier league", "premier league ", "english premier"),
-    "basketball_nba": ("nba",),
-    "americanfootball_nfl": ("nfl",),
-}
 
 
 @dataclass
@@ -114,21 +108,6 @@ def _parse_commence_from_question(question: str, ref: datetime) -> Optional[date
     return None
 
 
-def _infer_sport_key_from_market(m: dict[str, Any], sports_order: list[str]) -> Optional[str]:
-    blob = (
-        (m.get("question") or "")
-        + " "
-        + (m.get("slug") or "")
-        + " "
-        + (m.get("description") or "")
-    ).lower()
-    for sk in sports_order:
-        for kw in SPORT_KEYWORDS.get(sk, ()):
-            if kw in blob:
-                return sk
-    return None
-
-
 def _outcome_token_pairs(m: dict[str, Any]) -> list[tuple[str, str]]:
     outs = parse_outcomes_list(m)
     raw_tok = m.get("clobTokenIds") or m.get("clob_token_ids")
@@ -190,48 +169,61 @@ def _gamma_row_from_market(m: dict[str, Any], sport_key: str, ref: datetime) -> 
     )
 
 
-async def _fetch_gamma_sports_markets(
-    session: aiohttp.ClientSession,
-    sports_order: list[str],
-    *,
-    tag_id: str = "",
-    max_pages: int = 8,
-    limit: int = 100,
-) -> list[GammaSportMarket]:
-    base = f"{GAMMA_API_URL}/markets"
-    rows: list[GammaSportMarket] = []
-    seen: set[str] = set()
-    for page in range(max(1, max_pages)):
-        offset = page * limit
-        params: dict[str, str | int] = {"closed": "false", "limit": limit, "offset": offset}
-        if tag_id.strip().isdigit():
-            params["tag_id"] = int(tag_id.strip())
-        async with session.get(
-            base, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
-        ) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                log.warning("[latency_arb_sports] Gamma HTTP %s: %s", resp.status, text[:200])
-                break
-            chunk = json.loads(text)
-        if not isinstance(chunk, list) or not chunk:
-            break
-        now_hint = datetime.now(timezone.utc)
-        for m in chunk:
-            if not isinstance(m, dict):
-                continue
-            ok, _why = clob_market_tradeable(m)
-            if not ok:
-                continue
-            sk = _infer_sport_key_from_market(m, sports_order)
-            if sk is None:
-                continue
-            row = _gamma_row_from_market(m, sk, now_hint)
-            if row is None or row.condition_id in seen:
-                continue
-            seen.add(row.condition_id)
-            rows.append(row)
-    return rows
+def _odds_event_cache_key(event: dict[str, Any]) -> str:
+    oid = str(event.get("id") or "").strip()
+    if oid:
+        return oid
+    h, a = str(event.get("home_team") or ""), str(event.get("away_team") or "")
+    return f"{h}|{a}|{event.get('commence_time') or ''}"
+
+
+def _gamma_event_usable(ev: dict[str, Any]) -> bool:
+    if api_bool_true(ev.get("archived")):
+        return False
+    if api_bool_true(ev.get("closed")):
+        return False
+    return api_bool_true(ev.get("active", True))
+
+
+def _event_matches_odds_teams(ev: dict[str, Any], home_odds: str, away_odds: str) -> bool:
+    """Evento Gamma cuyo title/slug menciona ambos equipos (orden irrelevante)."""
+    blob = ((ev.get("title") or "") + " " + (ev.get("slug") or "")).strip()
+    if len(blob) < 3:
+        return False
+    return teams_match_odds_gamma(home_odds, blob) and teams_match_odds_gamma(away_odds, blob)
+
+
+def _pick_best_market_in_event(
+    ev_gamma: dict[str, Any],
+    sport_key: str,
+    odds_commence: datetime,
+) -> Optional[GammaSportMarket]:
+    """Mejor mercado hijo tradeable dentro de un evento public-search."""
+    candidates: list[GammaSportMarket] = []
+    for m in ev_gamma.get("markets") or []:
+        if not isinstance(m, dict):
+            continue
+        ok, _why = clob_market_tradeable(m)
+        if not ok:
+            continue
+        row = _gamma_row_from_market(m, sport_key, odds_commence)
+        if row is None:
+            continue
+        cg = row.commence_for_odds(odds_commence)
+        if cg is None or abs((cg - odds_commence).total_seconds()) >= 3600:
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+
+    def sort_key(r: GammaSportMarket) -> tuple[float, str]:
+        cg2 = r.commence_for_odds(odds_commence) or odds_commence
+        d = abs((cg2 - odds_commence).total_seconds())
+        if "more-markets" in r.slug.lower():
+            d += 1e6
+        return (d, r.condition_id)
+
+    return min(candidates, key=sort_key)
 
 
 def _extract_pinnacle_two_way(event: dict[str, Any]) -> Optional[tuple[str, float, str, float]]:
@@ -271,44 +263,6 @@ def _extract_pinnacle_two_way(event: dict[str, Any]) -> Optional[tuple[str, floa
             if ph is not None and pa is not None:
                 return home_team, ph, away_team, pa
     return None
-
-
-def _match_gamma_for_event(
-    event: dict[str, Any],
-    sport_key: str,
-    by_sport: dict[str, list[GammaSportMarket]],
-) -> Optional[GammaSportMarket]:
-    """Match según plan: deporte + Levenshtein<3 + ventana 3600s + desempate."""
-    ct_s = event.get("commence_time")
-    odds_commence = _parse_iso_utc(ct_s)
-    if odds_commence is None:
-        return None
-    pool = [g for g in by_sport.get(sport_key, []) if g.sport_key == sport_key]
-    cand: list[GammaSportMarket] = []
-    for g in pool:
-        perm_a = teams_match_odds_gamma(str(event.get("home_team") or ""), g.home_team) and teams_match_odds_gamma(
-            str(event.get("away_team") or ""), g.away_team
-        )
-        perm_b = teams_match_odds_gamma(str(event.get("home_team") or ""), g.away_team) and teams_match_odds_gamma(
-            str(event.get("away_team") or ""), g.home_team
-        )
-        if not (perm_a or perm_b):
-            continue
-        cg = g.commence_for_odds(odds_commence)
-        if cg is None or abs((cg - odds_commence).total_seconds()) >= 3600:
-            continue
-        cand.append(g)
-    if not cand:
-        return None
-    cand.sort(
-        key=lambda g: (
-            abs(
-                ((g.commence_for_odds(odds_commence) or odds_commence) - odds_commence).total_seconds()
-            ),
-            g.condition_id,
-        ),
-    )
-    return cand[0]
 
 
 def _map_outcomes_to_tokens(
@@ -380,13 +334,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 ttl_raw,
             )
         self.discovery_ttl = max(MIN_DISCOVERY_TTL_SEC, ttl_raw)
-        self.gamma_tag_id = os.getenv("LATENCY_SPORTS_GAMMA_TAG_ID", "").strip()
-        self.gamma_max_pages = int(os.getenv("LATENCY_SPORTS_GAMMA_MAX_PAGES", "8"))
+        self.gamma_public_search_limit = int(os.getenv("LATENCY_SPORTS_GAMMA_PUBLIC_SEARCH_LIMIT", "40"))
         self._breaker = config.get("circuit_breaker")
         self._start_capital = float(config.get("start_capital", os.getenv("ARB_START_CAPITAL", "10000")))
         self._current_capital = float(config.get("current_capital", os.getenv("ARB_CURRENT_CAPITAL", "10000")))
-        self._last_gamma_fetch = 0.0
-        self._gamma_by_sport: dict[str, list[GammaSportMarket]] = {}
+        # cache_key_odds_event -> (monotonic_ts, GammaSportMarket|None); TTL por partido
+        self._gamma_discovery_cache: dict[str, tuple[float, Optional[GammaSportMarket]]] = {}
         self._ws_cache: dict[str, dict[str, Any]] = {}
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._shutdown = asyncio.Event()
@@ -475,40 +428,88 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 break
             await asyncio.sleep(3.0)
 
-    async def _maybe_refresh_gamma(self, session: aiohttp.ClientSession) -> bool:
-        """Refresca Gamma si venció TTL. Devuelve True si hubo GET a Gamma."""
-        import time as time_mod
+    def _prune_gamma_discovery_cache(self, now_mono: float) -> None:
+        """Evita crecimiento indefinido del mapa por partidos viejos."""
+        cutoff = self.discovery_ttl * 2
+        stale = [k for k, (ts, _) in self._gamma_discovery_cache.items() if now_mono - ts > cutoff]
+        for k in stale:
+            del self._gamma_discovery_cache[k]
 
-        now = time_mod.monotonic()
-        if now - self._last_gamma_fetch < self.discovery_ttl and self._gamma_by_sport:
-            remain = self.discovery_ttl - (now - self._last_gamma_fetch)
-            log.info(
-                "[latency_arb_sports] gamma cache hit (siguiente refresh en ~%.0fs, ttl=%.0fs)",
-                remain,
-                self.discovery_ttl,
-            )
-            return False
-        rows = await _fetch_gamma_sports_markets(
-            session,
-            self.sports_keys,
-            tag_id=self.gamma_tag_id,
-            max_pages=self.gamma_max_pages,
-        )
-        by: dict[str, list[GammaSportMarket]] = {sk: [] for sk in self.sports_keys}
-        for r in rows:
-            if r.sport_key in by:
-                by[r.sport_key].append(r)
-        self._gamma_by_sport = by
-        self._last_gamma_fetch = now
-        by_counts = {k: len(v) for k, v in by.items()}
-        log.info(
-            "[latency_arb_sports] gamma refresh: total=%s by_sport=%s pages<=%s tag_id=%s",
-            len(rows),
-            by_counts,
-            self.gamma_max_pages,
-            self.gamma_tag_id or "(none)",
-        )
-        return True
+    async def _discover_gamma_row_for_odds_event(
+        self,
+        session: aiohttp.ClientSession,
+        sport_key: str,
+        event: dict[str, Any],
+    ) -> tuple[Optional[GammaSportMarket], Optional[bool]]:
+        """
+        Gamma vía GET public-search?q=home+away, filtrado por equipos en title/slug.
+        Segundo valor: True=HTTP a Gamma, False=acierto de caché TTL, None=sin lookup (métricas).
+        """
+        odds_commence = _parse_iso_utc(event.get("commence_time"))
+        if odds_commence is None:
+            return None, None
+
+        key = _odds_event_cache_key(event)
+        now_mono = time.monotonic()
+        hit = self._gamma_discovery_cache.get(key)
+        if hit is not None:
+            ts, row = hit
+            if now_mono - ts < self.discovery_ttl:
+                return row, False
+
+        home = str(event.get("home_team") or "").strip()
+        away = str(event.get("away_team") or "").strip()
+        q = f"{home} {away}".strip()
+        if not q:
+            return None, None
+
+        url = f"{GAMMA_API_URL}/public-search"
+        params = {"q": q, "limit": str(max(5, self.gamma_public_search_limit))}
+        try:
+            async with session.get(url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    log.warning("[latency_arb_sports] public-search HTTP %s q=%r", resp.status, q[:100])
+                    self._gamma_discovery_cache[key] = (now_mono, None)
+                    return None, True
+                data = json.loads(text)
+        except (json.JSONDecodeError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("[latency_arb_sports] public-search error q=%r: %s", q[:80], e)
+            self._gamma_discovery_cache[key] = (now_mono, None)
+            return None, True
+
+        evs = data.get("events") if isinstance(data, dict) else None
+        if not isinstance(evs, list):
+            self._gamma_discovery_cache[key] = (now_mono, None)
+            return None, True
+
+        best: Optional[GammaSportMarket] = None
+        best_key: Optional[tuple[float, str]] = None
+        for ev_gamma in evs:
+            if not isinstance(ev_gamma, dict):
+                continue
+            if not _gamma_event_usable(ev_gamma):
+                continue
+            if not _event_matches_odds_teams(ev_gamma, home, away):
+                continue
+            row = _pick_best_market_in_event(ev_gamma, sport_key, odds_commence)
+            if row is None:
+                continue
+            cg = row.commence_for_odds(odds_commence)
+            if cg is None:
+                continue
+            d = abs((cg - odds_commence).total_seconds())
+            if "more-markets" in row.slug.lower():
+                d += 1e6
+            rk = (d, row.condition_id)
+            if best is None or rk < (best_key or (1e18, "")):
+                best = row
+                best_key = rk
+
+        self._gamma_discovery_cache[key] = (now_mono, best)
+        if best is None:
+            log.debug("[latency_arb_sports] public-search sin match Gamma para q=%r (n=%s eventos)", q, len(evs))
+        return best, True
 
     async def _poll_cycle(self, state_manager: Any) -> None:
         if self._breaker:
@@ -542,12 +543,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
         ) as clob:
             self._cycle_seq += 1
             seq = self._cycle_seq
-            gamma_refreshed = await self._maybe_refresh_gamma(sess)
-            gamma_total = sum(len(v) for v in self._gamma_by_sport.values())
+            now_mono = time.monotonic()
+            self._prune_gamma_discovery_cache(now_mono)
             odds_counts: dict[str, int] = {}
             pinnacle_events = 0
             gamma_matched = 0
             csv_rows = 0
+            public_search_http = 0
+            public_search_cache = 0
             for sport_key in self.sports_keys:
                 try:
                     events = await get_odds(
@@ -568,17 +571,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     pinnacle_events += st["pinnacle"]
                     gamma_matched += st["gamma_match"]
                     csv_rows += st["csv_rows"]
+                    public_search_http += st.get("gamma_http", 0)
+                    public_search_cache += st.get("gamma_cache", 0)
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
-                "gamma_refreshed=%s gamma_total=%s gamma_by_sport=%s ws_slugs_cached=%s "
-                "odds_events=%s pinnacle_h2h=%s gamma_matched_events=%s csv_rows=%s dry_run=%s",
+                "gamma_cache_entries=%s public_search_http=%s public_search_cache_hit=%s "
+                "ws_slugs_cached=%s odds_events=%s pinnacle_h2h=%s gamma_matched_events=%s csv_rows=%s dry_run=%s",
                 seq,
                 self.regions,
                 self.min_edge,
                 self.max_stake,
-                gamma_refreshed,
-                gamma_total,
-                {k: len(v) for k, v in self._gamma_by_sport.items()},
+                len(self._gamma_discovery_cache),
+                public_search_http,
+                public_search_cache,
                 len(self._ws_cache),
                 odds_counts,
                 pinnacle_events,
@@ -589,12 +594,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
     async def _process_event(
         self,
-        _session: aiohttp.ClientSession,
+        session: aiohttp.ClientSession,
         clob: PolyCLOBClient,
         sport_key: str,
         event: dict[str, Any],
     ) -> dict[str, int]:
-        acc = {"pinnacle": 0, "gamma_match": 0, "csv_rows": 0}
+        acc = {"pinnacle": 0, "gamma_match": 0, "csv_rows": 0, "gamma_http": 0, "gamma_cache": 0}
         tw = _extract_pinnacle_two_way(event)
         if tw is None:
             return acc
@@ -603,7 +608,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
         p_h_raw = implied_prob(dec_h)
         p_a_raw = implied_prob(dec_a)
         p_h_fair, p_a_fair, _ = remove_vig(p_h_raw, p_a_raw, None)
-        g = _match_gamma_for_event(event, sport_key, self._gamma_by_sport)
+        g, gamma_src = await self._discover_gamma_row_for_odds_event(session, sport_key, event)
+        if gamma_src is True:
+            acc["gamma_http"] += 1
+        elif gamma_src is False:
+            acc["gamma_cache"] += 1
         if g is None:
             return acc
         acc["gamma_match"] = 1

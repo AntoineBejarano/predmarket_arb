@@ -1,10 +1,15 @@
-"""Tests unitarios: Odds API helpers y matching equipos."""
+"""Tests unitarios: Odds API helpers y matching equipos / Gamma."""
 
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 
-from arb.latency_arb_sports import GammaSportMarket, _match_gamma_for_event
+from arb.latency_arb_sports import (
+    GammaSportMarket,
+    _event_matches_odds_teams,
+    _pick_best_market_in_event,
+)
 from clients.odds_api import implied_prob, remove_vig, teams_match_odds_gamma
 
 
@@ -22,30 +27,34 @@ class TestLatencySportsOdds(unittest.TestCase):
         self.assertTrue(teams_match_odds_gamma("Manchester City", "Man City"))
         self.assertTrue(teams_match_odds_gamma("Boston Celtics", "Celtics"))
 
-    def test_match_gamma_time_window(self) -> None:
-        g = GammaSportMarket(
-            condition_id="0xabc",
-            slug="test-nba",
-            sport_key="basketball_nba",
-            league="NBA",
-            home_team="Celtics",
-            away_team="76ers",
-            outcome_tokens=[("Celtics", "1"), ("76ers", "2")],
-            question="NBA test",
-            end_date_s="2026-04-28T18:30:00Z",
-            start_date_s=None,
-        )
-        ev = {
-            "home_team": "Boston Celtics",
-            "away_team": "Philadelphia 76ers",
-            "commence_time": "2026-04-28T18:15:00Z",
-            "sport_key": "basketball_nba",
+    def test_event_matches_odds_teams_title(self) -> None:
+        ev_gamma = {
+            "title": "EPL: Arsenal vs Chelsea FC",
+            "slug": "epl-ars-che-2026-04-28",
         }
-        by = {"basketball_nba": [g]}
-        m = _match_gamma_for_event(ev, "basketball_nba", by)
-        self.assertIsNotNone(m)
-        assert m is not None
-        self.assertEqual(m.slug, "test-nba")
+        self.assertTrue(_event_matches_odds_teams(ev_gamma, "Arsenal", "Chelsea"))
+        self.assertFalse(_event_matches_odds_teams(ev_gamma, "Arsenal", "Tottenham"))
+
+    def test_pick_best_market_in_event_time_window(self) -> None:
+        odds_commence = datetime(2026, 4, 28, 18, 15, tzinfo=timezone.utc)
+        m = {
+            "acceptingOrders": True,
+            "closed": False,
+            "enableOrderBook": True,
+            "conditionId": "0xabc",
+            "slug": "test-nba",
+            "outcomes": '["Celtics", "76ers"]',
+            "clobTokenIds": '["1", "2"]',
+            "question": "NBA test",
+            "endDate": "2026-04-28T18:30:00Z",
+            "groupItemTitle": "NBA",
+        }
+        ev_gamma = {"markets": [m]}
+        row = _pick_best_market_in_event(ev_gamma, "basketball_nba", odds_commence)
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row.slug, "test-nba")
+        self.assertIsInstance(row, GammaSportMarket)
 
 
 if __name__ == "__main__":
