@@ -487,7 +487,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
     def __init__(self, config: dict[str, Any], dry_run: bool = True) -> None:
         super().__init__(config, dry_run=dry_run)
-        raw_slugs = os.getenv("LATENCY_SPORTS_POLY_SLUGS", "wta,atp,wttmen,nba,ucl,uel,nhl")
+        raw_slugs = os.getenv("LATENCY_SPORTS_POLY_SLUGS", "epl,nba,nfl,ucl,uel,nhl")
         self.poly_slugs = [s.strip().lower() for s in str(raw_slugs).split(",") if s.strip()]
         self.min_edge = float(config.get("min_edge", os.getenv("LATENCY_SPORTS_MIN_EDGE", "0.03")))
         self.max_stake = float(config.get("max_stake_usdc", os.getenv("LATENCY_SPORTS_MAX_STAKE_USDC", "50")))
