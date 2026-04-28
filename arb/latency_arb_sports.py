@@ -346,6 +346,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._shutdown = asyncio.Event()
         self._cycle_seq = 0
+        self._match_debug_done = False
 
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
@@ -553,6 +554,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             csv_rows = 0
             public_search_http = 0
             public_search_cache = 0
+            match_debug_events: list[tuple[str, dict[str, Any]]] = []
             for sport_key in self.sports_keys:
                 try:
                     events = await get_odds(
@@ -569,12 +571,44 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     continue
                 odds_counts[sport_key] = len(events)
                 for ev in events:
+                    if seq == 1 and not self._match_debug_done:
+                        match_debug_events.append((sport_key, ev))
                     st = await self._process_event(sess, clob, sport_key, ev)
                     pinnacle_events += st["pinnacle"]
                     gamma_matched += st["gamma_match"]
                     csv_rows += st["csv_rows"]
                     public_search_http += st.get("gamma_http", 0)
                     public_search_cache += st.get("gamma_cache", 0)
+            if seq == 1 and not self._match_debug_done:
+                for _sk, ev in match_debug_events:
+                    odds_home = str(ev.get("home_team") or "")
+                    odds_away = str(ev.get("away_team") or "")
+                    key = _odds_event_cache_key(ev)
+                    hit = self._gamma_discovery_cache.get(key)
+                    gamma_row = hit[1] if hit is not None else None
+                    if gamma_row is not None:
+                        gamma_title = (
+                            (gamma_row.question or f"{gamma_row.home_team} vs {gamma_row.away_team}")[:200]
+                        ).strip() or (gamma_row.slug or "")
+                        ev_stub: dict[str, Any] = {
+                            "title": gamma_row.question or f"{gamma_row.home_team} vs {gamma_row.away_team}",
+                            "slug": gamma_row.slug or "",
+                        }
+                        match = _event_matches_odds_teams(ev_stub, odds_home, odds_away)
+                        log.info(
+                            "[MATCH_DEBUG] odds=%r vs %r gamma=%r match=%s",
+                            odds_home,
+                            odds_away,
+                            gamma_title,
+                            match,
+                        )
+                    else:
+                        log.info(
+                            "[MATCH_DEBUG] odds=%r vs %r gamma=NO_RESULT",
+                            odds_home,
+                            odds_away,
+                        )
+                self._match_debug_done = True
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
                 "gamma_cache_entries=%s public_search_http=%s public_search_cache_hit=%s "
