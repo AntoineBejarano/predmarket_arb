@@ -29,7 +29,9 @@ logging.basicConfig(
 log = logging.getLogger("arb_engine")
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
-ENABLE_EXPERIMENTAL = os.getenv("ENABLE_EXPERIMENTAL", "false").lower() in ("true", "1", "yes")
+# Default true: carga combinatorial / term / latency / latency_sports sin tocar Railway.
+# Desactivar explícitamente con ENABLE_EXPERIMENTAL=false.
+ENABLE_EXPERIMENTAL = os.getenv("ENABLE_EXPERIMENTAL", "true").lower() in ("true", "1", "yes")
 
 from arb.bundle_arb import BundleArbStrategy
 from arb.combinatorial_arb import CombinatorialArbStrategy

@@ -6,7 +6,7 @@ Paper / laboratorio: comparar probabilidad fair Pinnacle (The Odds API) con mid 
 
 ## Variables de entorno
 
-- **`ENABLE_EXPERIMENTAL=true` obligatorio** en el **mismo proceso** que `arb_engine` (p. ej. variables del servicio en Railway). Si está en `false`, el motor solo arranca 3 estrategias y **nunca** ejecuta `latency_arb_sports` aunque el toggle en la UI esté ON.
+- **`ENABLE_EXPERIMENTAL`**: por defecto en `arb_engine.py` es **activo** (`true`) para no depender de variables en Railway. Solo si defines `ENABLE_EXPERIMENTAL=false` el motor queda en 3 estrategias base y **no** cargará `latency_arb_sports` aunque el toggle en la UI esté ON.
 - Con el motor en marcha, en Deploy Logs verás líneas `[latency_arb_sports] cycle #…` con conteos de Gamma, Odds API y matches (solo si esta estrategia está cargada).
 - `DRY_RUN=true` (recomendado) — no envía órdenes; `false` + credenciales L2 para POST `/order` FOK.
 - `LATENCY_SPORTS_MIN_EDGE`, `LATENCY_SPORTS_SPORTS`, `LATENCY_SPORTS_POLL_INTERVAL`, `LATENCY_SPORTS_MAX_STAKE_USDC`, `LATENCY_SPORTS_REGIONS` — ver `.env.example`.

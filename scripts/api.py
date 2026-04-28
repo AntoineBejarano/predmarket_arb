@@ -664,7 +664,7 @@ def _csv_stats_today(path: Path) -> dict[str, Any]:
 
 def _warn_if_experimental_enabled_in_state_but_env_off() -> None:
     """Evita confusión en Railway: toggles ON en JSON no cargan estrategias sin env."""
-    if os.getenv("ENABLE_EXPERIMENTAL", "false").lower() in ("true", "1", "yes"):
+    if os.getenv("ENABLE_EXPERIMENTAL", "true").lower() in ("true", "1", "yes"):
         return
     experimental_slugs = ("combinatorial_arb", "term_structure", "latency_arb", "latency_arb_sports")
     try:
