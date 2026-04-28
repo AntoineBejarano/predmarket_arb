@@ -271,6 +271,27 @@ def teams_match_odds_gamma(odds_name: str, gamma_name: str) -> bool:
     return _teams_match_odds_gamma_impl(odds_name, gamma_name)
 
 
+def find_odds_event_matching_teams(
+    events: list[dict[str, Any]], poly_home: str, poly_away: str
+) -> Optional[dict[str, Any]]:
+    """Primer evento Odds cuyo home/away matchea (orden o cruzado) con nombres Polymarket."""
+    ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
+    if not ph or not pa:
+        return None
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        oh = str(ev.get("home_team") or "").strip()
+        oa = str(ev.get("away_team") or "").strip()
+        if not oh or not oa:
+            continue
+        if (teams_match_odds_gamma(ph, oh) and teams_match_odds_gamma(pa, oa)) or (
+            teams_match_odds_gamma(ph, oa) and teams_match_odds_gamma(pa, oh)
+        ):
+            return ev
+    return None
+
+
 async def get_sports(session: aiohttp.ClientSession, *, api_key: Optional[str] = None) -> list[dict[str, Any]]:
     key = api_key or odds_api_key()
     url = f"{ODDS_API_BASE}/sports/"
