@@ -48,7 +48,11 @@ async def main() -> None:
     state_mgr = StrategyStateManager()
     _st = await state_mgr.get_all()
     _n_on = sum(1 for v in _st.values() if v.get("enabled"))
-    log.info("Control plane: %s/%s estrategias enabled (solo esas harán trabajo CLOB)", _n_on, len(_st))
+    log.info(
+        "Control plane: %s/%s estrategias enabled (solo esas ejecutan run_once / trabajo CLOB u otras APIs)",
+        _n_on,
+        len(_st),
+    )
 
     breaker = CircuitBreaker(max_daily_drawdown=float(os.getenv("MAX_DAILY_DRAWDOWN", "0.08")))
 
@@ -112,7 +116,14 @@ async def main() -> None:
             LatencyArbSportsStrategy(config_lat_sports, dry_run=DRY_RUN),
         ]
 
-    log.info("Arrancando %s estrategias. DRY_RUN=%s ENABLE_EXPERIMENTAL=%s", len(strategies), DRY_RUN, ENABLE_EXPERIMENTAL)
+    log.info(
+        "asyncio.gather: %s bucles de estrategia en paralelo (las disabled solo duermen; trabajo útil ≈ %s activas). "
+        "DRY_RUN=%s ENABLE_EXPERIMENTAL=%s",
+        len(strategies),
+        _n_on,
+        DRY_RUN,
+        ENABLE_EXPERIMENTAL,
+    )
     if not ENABLE_EXPERIMENTAL:
         log.info(
             "[arb_engine] ENABLE_EXPERIMENTAL=false: solo bundle_arb, cross_exchange, market_maker. "
