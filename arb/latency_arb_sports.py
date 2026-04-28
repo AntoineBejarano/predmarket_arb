@@ -774,7 +774,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 and len(odds_keys_loaded) > 0
             ):
                 for game in open_games[:5]:
-                    odds_events = self._get_odds_for_sport(game.sport_slug)
+                    odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug, game.sport_slug)
+                    odds_events = self._odds_client.get_cached_odds(odds_key)
                     preview = [f"{ev.home} vs {ev.away}" for ev in odds_events[:3]]
                     log.info(
                         "[REF_DEBUG] game='%s vs %s' sport=%s odds_io_events=%s",
