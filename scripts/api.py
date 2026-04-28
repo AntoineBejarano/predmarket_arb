@@ -56,6 +56,7 @@ ML_MODELS_HTML = STATIC_DIR / "ml_models.html"
 ML_MODEL_DETAIL_HTML = STATIC_DIR / "ml_model_detail.html"
 ARB_HTML = STATIC_DIR / "arb.html"
 ARB_STRATEGY_DETAIL_HTML = STATIC_DIR / "arb_strategy_detail.html"
+LATENCY_SPORTS_HTML = STATIC_DIR / "latency_sports.html"
 
 STRATEGY_SLUGS = [
     "bundle_arb",
@@ -64,6 +65,7 @@ STRATEGY_SLUGS = [
     "combinatorial_arb",
     "term_structure",
     "latency_arb",
+    "latency_arb_sports",
 ]
 ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SLUGS}
 BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
@@ -443,6 +445,15 @@ async def arb_dashboard() -> Union[FileResponse, JSONResponse]:
     if not ARB_HTML.is_file():
         return JSONResponse({"detail": "static/arb.html not found"}, status_code=404)
     return FileResponse(path=str(ARB_HTML), media_type="text/html; charset=utf-8")
+
+
+@app.get("/arb/strategy/latency_arb_sports", response_model=None)
+async def arb_latency_sports_detail_page() -> Union[FileResponse, JSONResponse]:
+    """UI dedicada Latency Arb — Sports (tabla, gráfico edge, SSE)."""
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    if not LATENCY_SPORTS_HTML.is_file():
+        return JSONResponse({"detail": "static/latency_sports.html not found"}, status_code=404)
+    return FileResponse(path=str(LATENCY_SPORTS_HTML), media_type="text/html; charset=utf-8")
 
 
 @app.get("/arb/strategy/{slug}", response_model=None)

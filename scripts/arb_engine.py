@@ -35,6 +35,7 @@ from arb.bundle_arb import BundleArbStrategy
 from arb.combinatorial_arb import CombinatorialArbStrategy
 from arb.cross_exchange import CrossExchangeStrategy
 from arb.latency_arb import LatencyArbStrategy
+from arb.latency_arb_sports import LatencyArbSportsStrategy
 from arb.market_maker import MarketMakerStrategy
 from arb.term_structure import TermStructureStrategy
 from risk.circuit_breaker import CircuitBreaker
@@ -96,10 +97,17 @@ async def main() -> None:
         config_combo = {**base_cap, "poll_interval": float(os.getenv("COMBO_SCAN_INTERVAL", "60"))}
         config_term = {**base_cap, "poll_interval": float(os.getenv("TERM_SCAN_INTERVAL", "300"))}
         config_lat = {**base_cap, "poll_interval": float(os.getenv("LAT_POLL_INTERVAL", "15"))}
+        config_lat_sports = {
+            **base_cap,
+            "poll_interval": float(os.getenv("LATENCY_SPORTS_POLL_INTERVAL", "5")),
+            "min_edge": float(os.getenv("LATENCY_SPORTS_MIN_EDGE", "0.03")),
+            "max_stake_usdc": float(os.getenv("LATENCY_SPORTS_MAX_STAKE_USDC", "50")),
+        }
         strategies += [
             CombinatorialArbStrategy(config_combo, dry_run=DRY_RUN),
             TermStructureStrategy(config_term, dry_run=DRY_RUN),
             LatencyArbStrategy(config_lat, dry_run=DRY_RUN),
+            LatencyArbSportsStrategy(config_lat_sports, dry_run=DRY_RUN),
         ]
 
     log.info("Arrancando %s estrategias. DRY_RUN=%s ENABLE_EXPERIMENTAL=%s", len(strategies), DRY_RUN, ENABLE_EXPERIMENTAL)

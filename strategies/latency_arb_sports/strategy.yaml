@@ -1,0 +1,7 @@
+id: latency_arb_sports
+label: "Latency Arb — Sports"
+status: experimental
+edge_target: 0.03
+horizon: intraday
+reference_source: pinnacle_via_odds_api
+polymarket_feed: sports_websocket

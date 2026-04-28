@@ -148,7 +148,7 @@ def build_post_order_body(
     ub = OrderBuilder(ex, chain_id, UtilsSigner(key=private_key))
     signed = ub.build_signed_order(data)
     ot = (order_type or "GTC").strip().upper()
-    if ot not in ("GTC", "GTD"):
+    if ot not in ("GTC", "GTD", "FOK"):
         ot = "GTC"
     body: dict[str, Any] = {
         "order": signed.dict(),

@@ -19,6 +19,7 @@ _SLUGS = [
     "combinatorial_arb",
     "term_structure",
     "latency_arb",
+    "latency_arb_sports",
 ]
 
 # Columnas extra en CSV de arb (unidad «EUR» = notionale paper, mismo escala que USDC del CLOB)

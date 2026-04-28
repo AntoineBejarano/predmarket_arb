@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Latency Arb — Sports · PredMarket Arb</title>
+  <link rel="icon" type="image/png" href="/static/logo.png" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    tailwind.config = { theme: { extend: { fontFamily: { mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'] } } } };
+  </script>
+</head>
+<body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
+  <div class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+    <header class="border-b border-slate-700 pb-5">
+      <nav class="flex flex-wrap gap-2 text-sm mb-4">
+        <a href="/arb" class="text-indigo-400 hover:underline">Motor Arb (CLOB)</a>
+        <span class="text-slate-600">/</span>
+        <span class="text-slate-200 font-medium">latency_arb_sports</span>
+      </nav>
+      <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+        <div>
+          <h1 class="text-2xl font-bold text-white tracking-tight">Latency Arb — Sports</h1>
+          <p class="text-sm text-slate-400 mt-1">Pinnacle (The Odds API) vs CLOB Polymarket · paper / CSV</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <span id="dry-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">DRY_RUN</span>
+          <span id="run-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">motor</span>
+          <button type="button" onclick="arbStart()" class="text-xs px-3 py-1.5 border border-slate-600 rounded-md hover:bg-slate-800">Start motor</button>
+          <button type="button" onclick="arbStop()" class="text-xs px-3 py-1.5 border border-red-900 text-red-400 rounded-md hover:bg-red-950/30">Stop motor</button>
+        </div>
+      </div>
+    </header>
+
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">Estrategia</p>
+        <div class="mt-2 flex items-center gap-2">
+          <button type="button" id="btn-toggle" onclick="toggleEnabled()"
+            class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent bg-slate-600 transition-colors">
+            <span id="toggle-knob" class="pointer-events-none inline-block h-5 w-5 translate-x-0 transform rounded-full bg-white shadow transition-transform"></span>
+          </button>
+          <span id="toggle-label" class="text-xs text-slate-400">—</span>
+        </div>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">Capital paper</p>
+        <p id="k-cap" class="font-mono text-lg text-indigo-200 mt-1">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">PnL acum. (est.)</p>
+        <p id="k-pnl" class="font-mono text-lg mt-1">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+        <p class="text-xs text-slate-500 uppercase">ROI · ops</p>
+        <p id="k-roi" class="font-mono text-lg text-slate-200 mt-1">—</p>
+        <p id="k-trades" class="text-xs text-slate-500 mt-0.5">—</p>
+      </div>
+    </section>
+
+    <section class="grid grid-cols-3 gap-3">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <p class="text-xs text-slate-500">Señales hoy</p>
+        <p id="c-sig" class="font-mono text-white text-lg">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <p class="text-xs text-slate-500">Ejecutadas</p>
+        <p id="c-exec" class="font-mono text-emerald-400 text-lg">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <p class="text-xs text-slate-500">Skipped</p>
+        <p id="c-skip" class="font-mono text-slate-400 text-lg">—</p>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="text-sm font-medium text-slate-300 mb-2">Edge por señal (histórico reciente)</h2>
+      <div class="rounded-xl border border-slate-700 bg-slate-950 p-4 h-64">
+        <canvas id="edge-chart"></canvas>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="text-sm font-medium text-slate-300 mb-2">Live (SSE · esta estrategia)</h2>
+      <div id="live-feed" class="font-mono text-xs bg-slate-950 rounded-lg p-3 h-36 overflow-y-auto border border-slate-700 space-y-0.5">
+        <p class="text-slate-600">Esperando eventos…</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-sm font-medium text-slate-300">Últimas 100 filas CSV</h2>
+        <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
+      </div>
+      <div class="overflow-x-auto rounded-xl border border-slate-700">
+        <table class="w-full text-xs text-left min-w-[900px]">
+          <thead>
+            <tr class="bg-slate-800 text-slate-400 uppercase">
+              <th class="p-2">ts</th>
+              <th class="p-2">partido</th>
+              <th class="p-2">lado</th>
+              <th class="p-2">price_poly</th>
+              <th class="p-2">prob_pin</th>
+              <th class="p-2">edge</th>
+              <th class="p-2">size</th>
+              <th class="p-2">status</th>
+              <th class="p-2">action</th>
+            </tr>
+          </thead>
+          <tbody id="log-body" class="divide-y divide-slate-800 font-mono"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const SLUG = "latency_arb_sports";
+    let _enabled = false;
+    let _chart = null;
+
+    function esc(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/\"/g, "&quot;");
+    }
+
+    function todayUtcPrefix() {
+      const d = new Date();
+      return d.toISOString().slice(0, 10);
+    }
+
+    function parseTsDay(ts) {
+      if (!ts) return "";
+      return String(ts).slice(0, 10);
+    }
+
+    async function refreshStatus() {
+      let data = { strategies: [], dry_run: true, engine_running: false };
+      try {
+        const r = await fetch("/api/arb/status");
+        if (r.ok) data = await r.json();
+      } catch (e) {}
+      const s = (data.strategies || []).find((x) => x.slug === SLUG) || {};
+      _enabled = !!s.enabled;
+      document.getElementById("dry-badge").textContent = data.dry_run ? "DRY_RUN" : "LIVE";
+      document.getElementById("run-badge").textContent = data.engine_running ? "● RUNNING" : "STOPPED";
+      document.getElementById("k-cap").textContent = s.fict_capital_eur != null ? Number(s.fict_capital_eur).toFixed(0) + " u" : "—";
+      const pnl = s.fict_pnl_cumulative_eur;
+      const elPnl = document.getElementById("k-pnl");
+      elPnl.textContent = pnl != null ? Number(pnl).toFixed(4) : "—";
+      elPnl.className = "font-mono text-lg mt-1 " + ((pnl || 0) >= 0 ? "text-emerald-400" : "text-red-400");
+      document.getElementById("k-roi").textContent = s.fict_roi != null ? (Number(s.fict_roi) * 100).toFixed(2) + "%" : "—";
+      document.getElementById("k-trades").textContent = s.fict_trades != null ? "Ops: " + s.fict_trades : "—";
+      const btn = document.getElementById("btn-toggle");
+      const knob = document.getElementById("toggle-knob");
+      btn.className =
+        "relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors " +
+        (_enabled ? "bg-emerald-600" : "bg-slate-600");
+      knob.className =
+        "pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow transition-transform " +
+        (_enabled ? "translate-x-5" : "translate-x-0");
+      document.getElementById("toggle-label").textContent = _enabled ? "encendida" : "apagada";
+    }
+
+    async function toggleEnabled() {
+      const path = _enabled ? "disable" : "enable";
+      await fetch("/api/arb/strategy/" + SLUG + "/" + path, { method: "POST" });
+      await refreshStatus();
+    }
+
+    async function arbStart() {
+      await fetch("/api/arb/start", { method: "POST" });
+      await refreshStatus();
+    }
+    async function arbStop() {
+      await fetch("/api/arb/stop", { method: "POST" });
+      await refreshStatus();
+    }
+
+    function pushLiveLine(payload) {
+      if (String(payload.strategy || "") !== SLUG) return;
+      const feed = document.getElementById("live-feed");
+      if (feed.querySelector("p.text-slate-600")) feed.innerHTML = "";
+      const p = document.createElement("p");
+      const a = payload.action || "—";
+      p.className = "text-slate-300";
+      p.innerHTML =
+        '<span class="text-slate-500">' +
+        String(payload.ts || "").substring(11, 19) +
+        '</span> <span class="text-yellow-300">' +
+        esc(a) +
+        "</span> " +
+        esc((payload.home_team || "") + " vs " + (payload.away_team || "")).slice(0, 80);
+      feed.prepend(p);
+      while (feed.children.length > 60) feed.removeChild(feed.lastChild);
+    }
+
+    function startLive() {
+      const es = new EventSource("/api/arb/signals/live");
+      es.onmessage = (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          pushLiveLine(d);
+        } catch (err) {}
+      };
+      es.onerror = () => es.close();
+    }
+
+    function updateChartFromRows(rows) {
+      const pts = rows
+        .filter((r) => r.edge && !isNaN(parseFloat(r.edge)))
+        .map((r) => ({ x: String(r.ts || ""), y: parseFloat(r.edge) }))
+        .slice(-80);
+      const ctx = document.getElementById("edge-chart");
+      if (!_chart) {
+        _chart = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: pts.map((p) => p.x.slice(11, 19)),
+            datasets: [{ label: "edge", data: pts.map((p) => p.y), borderColor: "rgb(129, 140, 248)", tension: 0.15 }],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              y: { grid: { color: "#334155" }, ticks: { color: "#94a3b8" } },
+              x: { grid: { color: "#334155" }, ticks: { color: "#94a3b8", maxRotation: 45 } },
+            },
+            plugins: { legend: { labels: { color: "#cbd5e1" } } },
+          },
+        });
+      } else {
+        _chart.data.labels = pts.map((p) => p.x.slice(11, 19));
+        _chart.data.datasets[0].data = pts.map((p) => p.y);
+        _chart.update();
+      }
+    }
+
+    function countToday(rows) {
+      const day = todayUtcPrefix();
+      let sig = 0,
+        ex = 0,
+        sk = 0;
+      for (const r of rows) {
+        if (parseTsDay(r.ts) !== day) continue;
+        const a = String(r.action || "");
+        const st = String(r.status || "");
+        if (a === "SIGNAL") sig++;
+        if (a === "EXECUTED") ex++;
+        if (st === "SKIP" || a.startsWith("SKIP:")) sk++;
+      }
+      return { sig, ex, sk };
+    }
+
+    async function loadLog() {
+      let rows = [];
+      try {
+        const r = await fetch("/api/arb/strategy/" + SLUG + "/log?limit=100");
+        if (r.ok) rows = await r.json();
+      } catch (e) {}
+      const tb = document.getElementById("log-body");
+      tb.innerHTML = rows
+        .map(
+          (row) =>
+            "<tr class='hover:bg-slate-800/50'>" +
+            "<td class='p-2 text-slate-500'>" +
+            esc((row.ts || "").slice(11, 22)) +
+            "</td>" +
+            "<td class='p-2'>" +
+            esc((row.home_team || "") + " / " + (row.away_team || "")) +
+            "</td>" +
+            "<td class='p-2'>" +
+            esc(row.side) +
+            "</td>" +
+            "<td class='p-2'>" +
+            esc(row.price_poly) +
+            "</td>" +
+            "<td class='p-2'>" +
+            esc(row.prob_pinnacle) +
+            "</td>" +
+            "<td class='p-2 text-yellow-200'>" +
+            esc(row.edge) +
+            "</td>" +
+            "<td class='p-2'>" +
+            esc(row.size_usdc) +
+            "</td>" +
+            "<td class='p-2'>" +
+            esc(row.status) +
+            "</td>" +
+            "<td class='p-2'>" +
+            esc(row.action) +
+            "</td></tr>"
+        )
+        .join("");
+      const c = countToday(rows);
+      document.getElementById("c-sig").textContent = String(c.sig);
+      document.getElementById("c-exec").textContent = String(c.ex);
+      document.getElementById("c-skip").textContent = String(c.sk);
+      updateChartFromRows(rows);
+    }
+
+    refreshStatus();
+    loadLog();
+    startLive();
+    setInterval(() => {
+      refreshStatus();
+      loadLog();
+    }, 12000);
+  </script>
+</body>
+</html>
