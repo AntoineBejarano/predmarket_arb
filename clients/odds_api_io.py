@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 from aiohttp import WSMsgType
@@ -31,6 +31,12 @@ ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis"
 
 BASE_REST = "https://api.odds-api.io/v3"
 WS_BASE = "wss://api.odds-api.io/v3/ws"
+
+
+def _ws_bookmakers_query_value(bookmakers_csv: str) -> str:
+    """Query WS: espacio → '+' dentro de cada nombre; comas entre casas (p. ej. Betfair+Exchange,Sharp+Exchange)."""
+    parts = [p.strip() for p in bookmakers_csv.split(",") if p.strip()]
+    return ",".join(p.replace(" ", "+") for p in parts)
 
 _DEFAULT_HEADERS = {
     "User-Agent": "predmarket-arb/odds-api-io (aiohttp; +https://github.com)",
@@ -407,13 +413,14 @@ class OddsApiIo:
             "markets": self.markets_ws,
             "sport": sport_param,
             "status": "live",
-            "bookmakers": self.bookmakers_csv,
         }
-        url = f"{WS_BASE}?{urlencode(q)}"
+        bm_ws = _ws_bookmakers_query_value(self.bookmakers_csv)
+        url = f"{WS_BASE}?{urlencode(q)}&bookmakers={quote(bm_ws, safe=',+')}"
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=None)
         async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS, timeout=timeout) as session:
             log.info("[odds_api_io] WS connecting sport=%s", sport_param)
             async with session.ws_connect(url, heartbeat=30.0) as ws:
+                ws_first_msg_types: set[str] = set()
                 welcome_ok = False
                 while not self._ws_cancel.is_set():
                     msg = await ws.receive()
@@ -433,6 +440,16 @@ class OddsApiIo:
                     if not isinstance(data, dict):
                         continue
                     typ = str(data.get("type") or "").lower()
+                    if typ and typ not in ws_first_msg_types:
+                        ws_first_msg_types.add(typ)
+                        log.info(
+                            "[odds_api_io] WS_FIRST_MSG type=%s bookie=%s event_id=%s home=%s away=%s",
+                            typ,
+                            str(data.get("bookie") or "").strip(),
+                            str(data.get("id") or "").strip(),
+                            str(data.get("home") or "").strip(),
+                            str(data.get("away") or "").strip(),
+                        )
                     if typ == "welcome":
                         welcome_ok = True
                         bks = data.get("bookmakers") or []

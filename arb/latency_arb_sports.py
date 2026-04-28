@@ -769,6 +769,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
             if (
                 not self._ref_debug_done
+                and seq == 10
                 and len(open_games) > 0
                 and len(odds_keys_loaded) > 0
             ):
@@ -787,7 +788,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
                 "open_poly_games=%s odds_io_keys=%s reference_matched=%s csv_rows=%s "
-                "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s",
+                "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_cache_size=%s",
                 seq,
                 self.regions,
                 self.min_edge,
@@ -799,6 +800,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self._discovery_fetch_ttl_sec(),
                 self._is_in_active_window(open_games),
                 self.dry_run,
+                len(self._odds_client._ws_odds_cache),
             )
 
     async def _process_matched_poly_odds(
