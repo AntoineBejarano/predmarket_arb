@@ -20,6 +20,7 @@ from clients.odds_api import (
     get_odds,
     implied_prob,
     odds_api_key,
+    odds_team_matches_gamma_blob,
     remove_vig,
     teams_match_odds_gamma,
 )
@@ -190,7 +191,8 @@ def _event_matches_odds_teams(ev: dict[str, Any], home_odds: str, away_odds: str
     blob = ((ev.get("title") or "") + " " + (ev.get("slug") or "")).strip()
     if len(blob) < 3:
         return False
-    return teams_match_odds_gamma(home_odds, blob) and teams_match_odds_gamma(away_odds, blob)
+    # normalize_team_for_match + segmentos vs dentro de odds_team_matches_gamma_blob
+    return odds_team_matches_gamma_blob(home_odds, blob) and odds_team_matches_gamma_blob(away_odds, blob)
 
 
 def _pick_best_market_in_event(

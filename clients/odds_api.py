@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import unicodedata
 from typing import Any, Optional
 
@@ -56,24 +57,123 @@ def normalize_team_label(s: str) -> str:
     return s
 
 
-def teams_match_odds_gamma(odds_team: str, gamma_label: str) -> bool:
+# Odds API nombres largos → nicknames tipo Gamma (expandir según necesidad).
+_TEAM_ALIAS_MAP: dict[str, str] = {
+    "los angeles lakers": "lakers",
+    "los angeles clippers": "clippers",
+    "golden state warriors": "warriors",
+    "boston celtics": "celtics",
+    "new york knicks": "knicks",
+    "miami heat": "heat",
+    "milwaukee bucks": "bucks",
+    "denver nuggets": "nuggets",
+    "phoenix suns": "suns",
+    "dallas mavericks": "mavericks",
+    "oklahoma city thunder": "thunder",
+    "minnesota timberwolves": "timberwolves",
+    "arsenal fc": "arsenal",
+    "chelsea fc": "chelsea",
+    "manchester city": "man city",
+    "manchester united": "man united",
+    "tottenham hotspur": "tottenham",
+    "newcastle united": "newcastle",
+    "west ham united": "west ham",
+    "nottingham forest": "nottm forest",
+    "aston villa": "aston villa",
+}
+
+_CLUB_SUFFIXES = (" fc", " cf", " sc", " ac", " bc")
+
+
+def _strip_club_suffixes(t: str) -> str:
+    out = (t or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        for suf in _CLUB_SUFFIXES:
+            if out.endswith(suf):
+                out = out[: -len(suf)].rstrip()
+                changed = True
+    return out
+
+
+def normalize_team_for_match(s: str) -> str:
     """
-    True si el equipo Odds API y el label Gamma (outcome o texto) son el mismo partido.
-    Incluye Levenshtein < 3 y reglas de contención (p. ej. 'Celtics' vs 'Boston Celtics').
+    Normaliza nombre de equipo Odds o Gamma para comparar: alias NBA/EPL,
+    luego sufijos de club (FC, SC, …).
     """
-    a = normalize_team_label(odds_team)
-    b = normalize_team_label(gamma_label)
+    t = normalize_team_label(s)
+    if not t:
+        return ""
+    if t in _TEAM_ALIAS_MAP:
+        return _TEAM_ALIAS_MAP[t]
+    t = _strip_club_suffixes(t)
+    if t in _TEAM_ALIAS_MAP:
+        return _TEAM_ALIAS_MAP[t]
+    return t
+
+
+def normalized_strings_match(a: str, b: str) -> bool:
+    """Match tras normalize_team_for_match: igualdad, substring en cualquier sentido, o Levenshtein < 3."""
     if not a or not b:
         return False
-    if levenshtein(a, b) < 3:
+    if a == b or a in b or b in a:
         return True
-    if a in b or b in a:
+    return levenshtein(a, b) < 3
+
+
+_BLOB_VS_SPLIT = re.compile(r"\s+(?:vs\.?|v|@)\s+|\s+[-–]\s+", re.IGNORECASE)
+
+
+def _gamma_blob_team_chunks(blob: str) -> list[str]:
+    """Parte título/slug en nombres de equipo (separador vs)."""
+    n = normalize_team_label(blob)
+    if not n:
+        return []
+    parts: list[str] = []
+    for part in _BLOB_VS_SPLIT.split(n):
+        p = part.strip()
+        if not p:
+            continue
+        p = re.sub(r"^[a-z0-9]{2,5}:\s*", "", p).strip()
+        if p:
+            parts.append(p)
+    return parts
+
+
+def odds_team_matches_gamma_blob(odds_team: str, blob: str) -> bool:
+    """
+    True si el nombre Odds coincide con el texto Gamma (título+slug con varios equipos).
+    Prueba match contra el blob completo y contra cada tramo separado por 'vs'.
+    """
+    n_o = normalize_team_for_match(odds_team)
+    if not n_o:
+        return False
+    n_full = normalize_team_label(blob)
+    if n_full and normalized_strings_match(n_o, n_full):
         return True
-    aw = a.split()[-1] if a.split() else a
-    bw = b.split()[-1] if b.split() else b
-    if aw == bw or aw in bw or bw in aw:
-        return True
-    return levenshtein(aw, bw) < 3
+    chunks = _gamma_blob_team_chunks(blob)
+    if len(chunks) >= 2:
+        for chunk in chunks:
+            n_chunk = normalize_team_for_match(chunk)
+            if normalized_strings_match(n_o, n_chunk):
+                return True
+        return False
+    n_single = normalize_team_for_match(blob)
+    return normalized_strings_match(n_o, n_single)
+
+
+def teams_match_odds_gamma(odds_team: str, gamma_label: str) -> bool:
+    """
+    True si el equipo Odds API y el label Gamma (outcome corto o texto largo) coinciden.
+    Textos con varios equipos (p. ej. título con \"vs\") comparan por segmentos.
+    """
+    chunks = _gamma_blob_team_chunks(gamma_label)
+    if len(chunks) >= 2:
+        return odds_team_matches_gamma_blob(odds_team, gamma_label)
+    a = normalize_team_for_match(odds_team)
+    b = normalize_team_for_match(gamma_label)
+    return normalized_strings_match(a, b)
 
 
 def levenshtein(a: str, b: str) -> int:
