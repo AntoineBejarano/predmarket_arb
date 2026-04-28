@@ -832,6 +832,26 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     mid = (float(bb) + float(ba)) / 2.0
             if mid is None:
                 continue
+            clob_read_at = datetime.utcnow().isoformat()
+            log.info(
+                "[latency_arb_sports] CLOB_READ game='%s vs %s' poly_mid=%s clob_read_at=%s",
+                game.home,
+                game.away,
+                mid,
+                clob_read_at,
+            )
+            log.info(
+                "[latency_arb_sports] LATENCY_SNAPSHOT\n   game='%s vs %s'\n"
+                "   odds_io_prob=%s poly_mid=%s\n   delta=%.4f\n"
+                "   odds_io_updated_at=%s\n   clob_read_at=%s",
+                game.home,
+                game.away,
+                p_fair,
+                mid,
+                float(p_fair) - float(mid),
+                odds_event.updated_at,
+                clob_read_at,
+            )
             raw_edge = float(p_fair) - float(mid)
             if abs(raw_edge) < self.min_edge:
                 continue

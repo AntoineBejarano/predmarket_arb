@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -24,7 +25,7 @@ log = logging.getLogger("odds_api_io")
 ODDS_API_IO_KEY_EMBEDDED = "647c2e8972c62f827b54f98b759982ea2b6d891be25b49c2a746a6f1ed4dd360"
 ODDS_API_IO_WS_EMBEDDED = True
 ODDS_API_IO_CACHE_TTL_EMBEDDED = 60
-ODDS_API_IO_BOOKMAKERS_EMBEDDED = "betfair_ex,sharp_exchange"
+ODDS_API_IO_BOOKMAKERS_EMBEDDED = "Betfair Exchange,Sharp Exchange"
 ODDS_API_IO_MARKETS_EMBEDDED = "ML"
 ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis"
 
@@ -142,20 +143,18 @@ def _ml_first_row(markets: Any) -> tuple[Optional[dict[str, Any]], Optional[str]
     return None, None
 
 
-def _bookie_matches_wanted(bk: str, wanted_lower: frozenset[str]) -> bool:
-    if not wanted_lower:
+def _bookie_matches_wanted(bk: str, wanted: frozenset[str]) -> bool:
+    """Compara con los nombres configurados (identificadores oficiales /v3/bookmakers), case-insensitive."""
+    if not wanted:
         return True
-    n = bk.strip().lower().replace(" ", "_").replace("-", "_")
-    for w in wanted_lower:
-        if w == n or w in n or n in w:
-            return True
-    return False
+    bcf = bk.strip().casefold()
+    return any(bcf == w.casefold() for w in wanted)
 
 
 def _oddsevents_from_odds_payload(
     payload: dict[str, Any],
     sport_slug: str,
-    wanted_bookies: frozenset[str],
+    wanted_bookmakers: frozenset[str],
 ) -> list[OddsEvent]:
     """Parsea cuerpo tipo GET /odds (un evento) a filas OddsEvent por bookie."""
     eid = str(payload.get("id") or "")
@@ -178,7 +177,7 @@ def _oddsevents_from_odds_payload(
         return out
     for bk_name, markets in items:
         bk = str(bk_name).strip()
-        if not _bookie_matches_wanted(bk, wanted_bookies):
+        if not _bookie_matches_wanted(bk, wanted_bookmakers):
             continue
         mk_list = markets if isinstance(markets, list) else []
         row, upd_at = _ml_first_row(mk_list)
@@ -211,7 +210,7 @@ class OddsApiIo:
         self.cache_ttl = int(os.getenv("ODDS_API_IO_CACHE_TTL") or ODDS_API_IO_CACHE_TTL_EMBEDDED)
         raw_bk = os.getenv("ODDS_API_IO_BOOKMAKERS") or ODDS_API_IO_BOOKMAKERS_EMBEDDED
         self.bookmakers_csv = ",".join(b.strip() for b in raw_bk.split(",") if b.strip())
-        self._wanted_bookies_lower = frozenset(b.strip().lower() for b in self.bookmakers_csv.split(",") if b.strip())
+        self._wanted_bookmaker_names = frozenset(b.strip() for b in self.bookmakers_csv.split(",") if b.strip())
         self.markets_ws = (os.getenv("ODDS_API_IO_MARKETS") or ODDS_API_IO_MARKETS_EMBEDDED).strip() or "ML"
         self._lock = asyncio.Lock()
         self._ws_odds_cache: dict[str, dict[str, OddsEvent]] = {}
@@ -271,10 +270,10 @@ class OddsApiIo:
         return acc
 
     def _bookie_priority(self, bookie: str) -> int:
-        b = bookie.strip().lower().replace(" ", "_").replace("-", "_")
-        order = [x.strip().lower().replace(" ", "_").replace("-", "_") for x in self.bookmakers_csv.split(",") if x.strip()]
+        bcf = bookie.strip().casefold()
+        order = [x.strip() for x in self.bookmakers_csv.split(",") if x.strip()]
         for i, o in enumerate(order):
-            if o == b or o in b or b in o:
+            if bcf == o.casefold():
                 return i
         return len(order)
 
@@ -351,7 +350,7 @@ class OddsApiIo:
             arr = []
         for item in arr:
             if isinstance(item, dict):
-                rows.extend(_oddsevents_from_odds_payload(item, sport_slug, self._wanted_bookies_lower))
+                rows.extend(_oddsevents_from_odds_payload(item, sport_slug, self._wanted_bookmaker_names))
         return rows
 
     async def _fetch_event_meta(self, session: aiohttp.ClientSession, event_id: str) -> tuple[str, str, str]:
@@ -408,6 +407,7 @@ class OddsApiIo:
             "markets": self.markets_ws,
             "sport": sport_param,
             "status": "live",
+            "bookmakers": self.bookmakers_csv,
         }
         url = f"{WS_BASE}?{urlencode(q)}"
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=None)
@@ -442,7 +442,7 @@ class OddsApiIo:
                     if not welcome_ok:
                         continue
                     if typ in ("created", "updated"):
-                        await self._apply_ws_created_updated(session, data, sport_param)
+                        await self._apply_ws_created_updated(session, data, sport_param, typ)
                     elif typ == "deleted":
                         await self._apply_ws_deleted(data)
                     elif typ == "no_markets":
@@ -462,10 +462,14 @@ class OddsApiIo:
             else:
                 self._ws_odds_cache.pop(eid, None)
 
-    async def _apply_ws_created_updated(self, session: aiohttp.ClientSession, data: dict[str, Any], sport_param: str) -> None:
+    async def _apply_ws_created_updated(
+        self, session: aiohttp.ClientSession, data: dict[str, Any], sport_param: str, message_type: str
+    ) -> None:
         eid = str(data.get("id") or "")
         bookie = str(data.get("bookie") or "").strip()
         if not eid or not bookie:
+            return
+        if self._wanted_bookmaker_names and not _bookie_matches_wanted(bookie, self._wanted_bookmaker_names):
             return
         home = str(data.get("home") or "").strip()
         away = str(data.get("away") or "").strip()
@@ -487,6 +491,15 @@ class OddsApiIo:
         ho, ao, d_o = _parse_ml_odds_row(row)
         if ho is None or ao is None:
             return
+        if message_type == "updated":
+            log.info(
+                "[odds_api_io] TICK event_id=%s bookie=%s\n   home_odds=%s away_odds=%s\n   received_at=%s",
+                eid,
+                bookie,
+                ho,
+                ao,
+                datetime.utcnow().isoformat(),
+            )
         ev = OddsEvent(
             home=home,
             away=away,
