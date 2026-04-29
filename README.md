@@ -63,9 +63,12 @@ Scripts `evaluate_compact_vs_baseline.py`, `freeze_baseline_compact.py`, and `co
 
 ## Local setup
 
+Requisito: **Python ≥ 3.11** (recomendado **3.12**, ver `.python-version`). `setup.py` instala todo desde `pyproject.toml` (runtime + dev: Jupyter, matplotlib, seaborn, duckdb). Solo runtime: `python3.12 setup.py --no-dev`.
+
+Si `python3.12` no está en el PATH: **macOS Homebrew** suele dejarlo en `/opt/homebrew/bin/python3.12` (`brew install python@3.12`). `setup.py` también prueba esa ruta al crear `.venv`.
+
 ```bash
-python setup.py
-source .venv/bin/activate
+python3.12 setup.py && source .venv/bin/activate
 python download_datasets.py   # populates data/raw (gitignored)
 python models/train.py
 python scripts/validate_edge.py --hours 72

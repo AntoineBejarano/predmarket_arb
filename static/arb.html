@@ -106,6 +106,7 @@
       "SKIP:LOCKUP": "text-slate-500",
       "SKIP:HIGH_GAS": "text-slate-500",
       "SKIP:STALE_PRICE": "text-slate-500",
+      "SKIP:BELOW_MIN_EDGE": "text-slate-500",
       "ERROR:API_TIMEOUT": "text-red-400",
       "ERROR:API_ERROR": "text-red-400",
       "ERROR:ORDER_FAIL": "text-red-500",
@@ -139,6 +140,7 @@
             ${def.experimental ? '<span class="ml-1 text-xs text-slate-500">(exp)</span>' : ""}
           </p>
           ${def.detailHref ? '<a href="' + def.detailHref + '" class="text-xs text-indigo-400 hover:underline mt-1 inline-block">Ver detalle →</a>' : ""}
+          ${def.slug === "latency_arb_sports" ? '<p class="text-[10px] text-slate-600 mt-1">Snapshots históricos: <code class="text-slate-500">logs/latency_arb_sports_snapshots.csv</code> (tabla en detalle).</p>' : ""}
           <p class="text-[10px] text-slate-600 mt-1">Paper: PnL est. ≈ stake×edge por SIGNAL/EXECUTED; ROI = acum / capital (edita <code class="text-slate-500">data/strategy_state.json</code>).</p>
         </div>
         <button type="button"
@@ -149,13 +151,17 @@
         </button>
       </div>
       <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs mb-3">
-        <span class="text-slate-500">Señales hoy</span>
+        <span class="text-slate-500">SIGNAL hoy</span>
         <span class="font-mono text-slate-200">${s.signals_today ?? "—"}</span>
         <span class="text-slate-500">Ejecutadas</span>
         <span class="font-mono ${(s.executed_today || 0) > 0 ? "text-emerald-400" : "text-slate-200"}">
           ${s.executed_today ?? "—"}
           ${statusData.dry_run && (s.executed_today || 0) > 0 ? '<span class="text-slate-500 text-xs">(dry)</span>' : ""}
         </span>
+        <span class="text-slate-500">Filas CSV / día UTC</span>
+        <span class="font-mono text-slate-200">${s.total_today ?? "—"}</span>
+        <span class="text-slate-500">Skips hoy</span>
+        <span class="font-mono text-slate-200">${s.skips_today ?? "—"}</span>
         <span class="text-slate-500">Skip rate</span>
         <span class="font-mono text-slate-200">${s.skip_rate != null ? (s.skip_rate * 100).toFixed(0) + "%" : "—"}</span>
         <span class="text-slate-500">Mejor edge</span>

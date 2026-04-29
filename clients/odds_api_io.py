@@ -238,9 +238,11 @@ class OddsApiIo:
         self._lock = asyncio.Lock()
         self._ws_odds_cache: dict[str, dict[str, OddsEvent]] = {}
         self._rest_cache: dict[str, tuple[float, list[OddsEvent]]] = {}
-        self._id_meta: dict[str, tuple[str, str, str]] = {}
+        self._event_meta_cache: dict[str, dict[str, str]] = {}
+        self._event_meta_inflight: set[str] = set()
         self._ws_runner_task: Optional[asyncio.Task[None]] = None
         self._ws_cancel = asyncio.Event()
+        self._raw_logged = False
 
     def start_ws_stream(self, sports: list[str]) -> None:
         if not self.ws_enabled:
@@ -373,25 +375,45 @@ class OddsApiIo:
                 rows.extend(_oddsevents_from_odds_payload(item, sport_slug, self._wanted_bookmaker_names))
         return rows
 
-    async def _fetch_event_meta(self, session: aiohttp.ClientSession, event_id: str) -> tuple[str, str, str]:
-        if event_id in self._id_meta:
-            return self._id_meta[event_id]
-        url = f"{BASE_REST}/events/{event_id}"
-        params = {"apiKey": self.api_key}
-        async with session.get(
-            url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                return "", "", ""
-            ev = json.loads(text)
-        if not isinstance(ev, dict):
-            return "", "", ""
-        home = str(ev.get("home") or ev.get("home_team") or "").strip()
-        away = str(ev.get("away") or ev.get("away_team") or "").strip()
-        sport = str(ev.get("sport") or ev.get("sport_slug") or "").strip().lower()
-        self._id_meta[event_id] = (home, away, sport)
-        return home, away, sport
+    async def _fetch_event_meta(self, session: aiohttp.ClientSession, event_id: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if not event_id:
+            return out
+        try:
+            async with self._lock:
+                if event_id in self._event_meta_cache:
+                    return dict(self._event_meta_cache[event_id])
+            url = f"{BASE_REST}/events/{event_id}"
+            params = {"apiKey": self.api_key}
+            async with session.get(
+                url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    log.debug("[odds_api_io] GET /events/%s HTTP %s", event_id, resp.status)
+                    return out
+                raw = json.loads(text)
+            if not isinstance(raw, dict):
+                return out
+            home_raw = str(raw.get("home") or raw.get("home_team") or "").strip()
+            away_raw = str(raw.get("away") or raw.get("away_team") or "").strip()
+            home = normalize_name_order(home_raw) if home_raw else ""
+            away = normalize_name_order(away_raw) if away_raw else ""
+            sp = raw.get("sport")
+            if isinstance(sp, dict):
+                sport_slug = str(sp.get("slug") or "").strip().lower()
+            else:
+                sport_slug = str(sp or raw.get("sport_slug") or "").strip().lower()
+            out = {"home": home, "away": away, "sport": sport_slug}
+            async with self._lock:
+                self._event_meta_cache[event_id] = out
+            return dict(out)
+        except Exception as e:
+            log.warning("[odds_api_io] event meta id=%s: %s", event_id, e)
+            return out
+        finally:
+            async with self._lock:
+                self._event_meta_inflight.discard(event_id)
 
     async def _ws_runner_loop(self, sports: list[str]) -> None:
         attempt = 0
@@ -472,7 +494,19 @@ class OddsApiIo:
                         continue
                     if not welcome_ok:
                         continue
+                    if typ in ("created", "updated") and not self._raw_logged:
+                        self._raw_logged = True
+                        log.info("[odds_api_io] RAW_MSG %s", json.dumps(data)[:500])
                     if typ in ("created", "updated"):
+                        eid_w = str(data.get("id") or "").strip()
+                        if eid_w:
+                            start_meta = False
+                            async with self._lock:
+                                if eid_w not in self._event_meta_cache and eid_w not in self._event_meta_inflight:
+                                    self._event_meta_inflight.add(eid_w)
+                                    start_meta = True
+                            if start_meta:
+                                asyncio.create_task(self._fetch_event_meta(session, eid_w))
                         await self._apply_ws_created_updated(session, data, sport_param, typ)
                     elif typ == "deleted":
                         await self._apply_ws_deleted(data)
@@ -505,17 +539,16 @@ class OddsApiIo:
         home = str(data.get("home") or "").strip()
         away = str(data.get("away") or "").strip()
         sport_guess = str(data.get("sport") or "").strip().lower()
-        if not home or not away:
-            h2, a2, sg = await self._fetch_event_meta(session, eid)
-            home = home or h2
-            away = away or a2
-            sport_guess = sport_guess or sg
+        meta: dict[str, str] = {}
+        async with self._lock:
+            if eid in self._event_meta_cache:
+                meta = dict(self._event_meta_cache[eid])
+        if not home:
+            home = str(meta.get("home") or "").strip()
+        if not away:
+            away = str(meta.get("away") or "").strip()
         if not sport_guess:
-            for s in sport_param.split(","):
-                s = s.strip().lower()
-                if s:
-                    sport_guess = s
-                    break
+            sport_guess = str(meta.get("sport") or "").strip().lower()
         row, upd_at = _ml_first_row(data.get("markets"))
         if row is None:
             return
@@ -531,6 +564,10 @@ class OddsApiIo:
                 ao,
                 datetime.utcnow().isoformat(),
             )
+        if home:
+            home = normalize_name_order(home)
+        if away:
+            away = normalize_name_order(away)
         ev = OddsEvent(
             home=home,
             away=away,

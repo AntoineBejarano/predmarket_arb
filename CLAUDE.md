@@ -14,7 +14,7 @@ Convenciones detalladas (inglés): [strategies/README.md](strategies/README.md).
 | ----- | --- |
 | `strategies/` | Cada hipótesis vive en `strategies/<strategy_id>/`: `strategy.yaml`, opcional `README.md`, y `experiments/<experiment_slug>/` con `RUNBOOK.md`, `LEARNINGS.md` y artefactos **pequeños** en git. Plantilla: `strategies/_template/`. |
 | `lab/` | Utilidades compartidas: [`lab/paths.py`](lab/paths.py) define `REPO_ROOT`, `strategy_experiment_dir(...)` y la ruta por defecto del pipeline compacto crypto 5m (`crypto_5m_updown/exogenous_compact`); override con `PM_STRATEGY_EXPERIMENT_DIR`. |
-| `arb/` | Estrategias **runtime** del motor CLOB (subclases de `arb/base.py`). Siempre cargadas en `scripts/arb_engine.py`: `bundle_arb`, `cross_exchange`, `market_maker`. Solo si `ENABLE_EXPERIMENTAL=true`: `combinatorial_arb`, `term_structure`, `latency_arb`. Módulos de apoyo: `bundle_pricing.py`, `bundle_maker_quote.py`, `negrisk_execution_policy.py`, `negrisk_maker_runtime.py`. |
+| `arb/` | Estrategias **runtime** del motor CLOB (subclases de `arb/base.py`). Siempre cargadas en `scripts/arb_engine.py`: `bundle_arb`, `cross_exchange`, `market_maker`. Solo si `ENABLE_EXPERIMENTAL=true`: `combinatorial_arb`, `term_structure`, `latency_arb`, **`latency_arb_sports`**. Módulos de apoyo: `bundle_pricing.py`, `bundle_maker_quote.py`, `negrisk_execution_policy.py`, `negrisk_maker_runtime.py`. |
 | `clients/` | Gamma + CLOB REST/WebSocket, descubrimiento de mercados (`poly_markets.py`), parseo (`poly_parse.py`), Kalshi stub, auth y órdenes firmadas. |
 | `risk/` | Estado de estrategias/modelos ML, circuit breaker, Kelly, etc. |
 | `scripts/` | API, validador, arb engine, datasets, features, evaluación compacta, healthcheck. |
@@ -24,7 +24,7 @@ Convenciones detalladas (inglés): [strategies/README.md](strategies/README.md).
 | `models/` | Entrenamiento (`train.py`) y PKL en `models/saved/`. |
 | `notebooks/` | Exploración; no commitear outputs pesados. |
 
-**Índice de carpetas bajo `strategies/`** (RUNBOOK + yaml; la lógica CLOB principal está en `arb/` homónimo o relacionado): `crypto_5m_updown` (validador ML + experimento `exogenous_compact`), `bundle_arb`, `cross_exchange`, `market_maker`, `combinatorial_arb`, `latency_arb`, `term_structure`.
+**Índice de carpetas bajo `strategies/`** (RUNBOOK + yaml; la lógica CLOB principal está en `arb/` homónimo o relacionado): `crypto_5m_updown` (validador ML + experimento `exogenous_compact`), `bundle_arb`, `cross_exchange`, `market_maker`, `combinatorial_arb`, `latency_arb`, `latency_arb_sports`, `term_structure`.
 
 ## Arquitectura en procesos
 
@@ -33,12 +33,13 @@ Convenciones detalladas (inglés): [strategies/README.md](strategies/README.md).
 | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `**scripts/api.py`**            | FastAPI: **validador ML** — **catálogo ML** `/ml` (`ml_models.html`), **monitor** por slug `/ml/model/<slug>` y **`/`** (mismo HTML que `crypto_5m_lgbm`, `ml_model_detail.html`); JSON `/api/status`, `/api/ml/models`, `POST /api/ml/models/<slug>/enable|disable`, START/STOP del worker, SSE `/api/signals/live`, `/health` → `{"status":"ok"}` para Railway. **Motor Arb (CLOB)** — `POST/GET /api/arb/start|stop|status`, toggles por estrategia, log CSV, SSE `/api/arb/signals/live`. |
 | `**scripts/validate_edge.py`**  | Worker largo: Binance + Gamma, Rich en consola, escribe `logs/signals.csv`. Arrancado por el API como subproceso o en local a mano.                                  |
-| `**scripts/arb_engine.py`**     | Subproceso opcional lanzado desde el API: `asyncio.gather` de estrategias en `arb/` + `risk/`; por defecto 3 slugs (`bundle_arb`, `cross_exchange`, `market_maker`); con `ENABLE_EXPERIMENTAL=true` suma 3 más. Usa `clients/poly_clob.py` (REST CLOB, órdenes si `DRY_RUN=false`). |
+| `**scripts/arb_engine.py`**     | Subproceso opcional lanzado desde el API: `asyncio.gather` de estrategias en `arb/` + `risk/`; por defecto 3 slugs (`bundle_arb`, `cross_exchange`, `market_maker`); con `ENABLE_EXPERIMENTAL=true` suma **4** (`combinatorial_arb`, `term_structure`, `latency_arb`, `latency_arb_sports`). Usa `clients/poly_clob.py` (REST CLOB, órdenes si `DRY_RUN=false`) y `clients/odds_api_io.py` en sports. |
 
 
 - Comunicación validador: `**logs/signals.csv`** (ruta bajo `DATA_DIR`) y PID en memoria del API.
 - **Catálogo de modelos ML (UI):** definiciones en `risk/ml_model_registry.py` (slug, label, `implemented`, etc.); toggles `enabled` en `**data/model_state.json**` vía `risk/model_state.py`. **`validate_edge` aún no elige pipeline por slug**: un solo worker escribe el mismo CSV; los toggles preparan multi-modelo futuro.
 - Comunicación arb: CSV por estrategia bajo `DATA_DIR` / `logs` (según rutas en `scripts/api.py` y `data/`). Diagnóstico de escaneo bundle (UI `/arb/strategy/bundle_arb`): `logs/bundle_arb_scan.json` bajo `DATA_DIR`.
+- **`latency_arb_sports` (experimental):** lógica en `arb/latency_arb_sports.py`; UI dedicada `GET /arb/strategy/latency_arb_sports` → `static/latency_sports.html`. Cada ciclo escribe `logs/latency_arb_sports_cycle_metrics.json` (`open_poly_games`, `reference_matched`, `ws_cache_size`, `updated_at`); `GET /api/arb/status` fusiona esas claves en la fila con `slug=latency_arb_sports`. Snapshots CSV opcional (`LATENCY_SPORTS_SNAPSHOT_CSV` y resto `LATENCY_SPORTS_*` en `.env.example`). **Ventana activa / discovery:** `_is_in_active_window` devuelve `True` si hay entradas en el caché WS de odds-api.io aunque la ventana temporal Gamma aún no alinee, para TTL de discovery corto (~30s) y refresco de Gamma frecuente.
 - **Puertos:** el API usa `PORT` (p. ej. 8080). El worker tiene su propio mini HTTP de health en `**VALIDATOR_HEALTH_PORT`** (default `18088`) para no colisionar con el API.
 
 ## Archivos importantes
@@ -48,24 +49,25 @@ Convenciones detalladas (inglés): [strategies/README.md](strategies/README.md).
 - `scripts/arb_engine.py` — punto de entrada del arb engine; estrategias en `arb/`, riesgo en `risk/`, clientes HTTP en `clients/`. Variable `ENABLE_EXPERIMENTAL` amplía el conjunto de estrategias (ver tabla arriba).
 - `lab/paths.py` — rutas reproducibles a `strategies/<id>/experiments/<slug>/` y directorio por defecto del experimento compacto crypto 5m.
 - `arb/bundle_arb.py` — NegRisk bundle: modos `taker_scan` / `maker_first`, descubrimiento Gamma (`gamma_events` vía `clients/poly_markets.py` con filtros nativos documentados donde aplica).
+- `arb/latency_arb_sports.py` — Deportes: Gamma + CLOB + cuotas **odds-api.io** (REST/WS); ciclo escribe métricas JSON para el API; ver bullet “latency_arb_sports” arriba.
 - `risk/ml_model_registry.py` — slugs y metadatos del catálogo ML servidos por `/api/ml/models`. `risk/model_state.py` — lectura/escritura de `enabled` por slug (async lock, mismo patrón que `risk/strategy_state.py`).
 - `clients/poly_clob.py` — CLOB REST (`/markets`, `/book`, `/order`, cancelaciones L2), WebSocket `subscribe_market` (payload tipo `market` con `assets_ids`). Firma de órdenes: `clients/poly_order_live.py` + `clients/poly_clob_auth.py` (HMAC L2 alineado con `py_clob_client`).
 - `clients/kalshi_rest.py` — cliente REST Kalshi (stubs donde aplique).
 - `scripts/healthcheck.py` — handler HTTP mínimo usado por el worker.
-- `static/ml_models.html` — **catálogo ML** (`/ml`). `static/ml_model_detail.html` — **monitor validador** (métricas, tablas, Gamma debug, START/STOP) en **`/`** y **`/ml/model/<slug>`**; slugs no implementados muestran vista “en desarrollo”. `static/arb.html` — **motor Arb (CLOB)** (`/arb`). `static/arb_strategy_detail.html` — detalle por estrategia (`/arb/strategy/<slug>`). Navegación cruzada con nombres: Catálogo ML · Monitor validador · Motor Arb (CLOB).
+- `static/ml_models.html` — **catálogo ML** (`/ml`). `static/ml_model_detail.html` — **monitor validador** (métricas, tablas, Gamma debug, START/STOP) en **`/`** y **`/ml/model/<slug>`**; slugs no implementados muestran vista “en desarrollo”. `static/arb.html` — **motor Arb (CLOB)** (`/arb`). `static/arb_strategy_detail.html` — detalle por estrategia (`/arb/strategy/<slug>`). `static/latency_sports.html` — dashboard **latency_arb_sports** (`/arb/strategy/latency_arb_sports`). Navegación cruzada con nombres: Catálogo ML · Monitor validador · Motor Arb (CLOB).
 - `Dockerfile` / `railway.toml` — arranque con `python scripts/api.py`; healthcheck Railway en `/health` del API.
 
-En `**python:3.11-slim`** hace falta el paquete `**libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
+En `**python:3.12-slim`** hace falta el paquete `**libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
 
 Los `**.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma familia de `scikit-learn`** que al entrenar; en `pyproject.toml` está acotado a **1.6.x** para evitar `InconsistentVersionWarning` y resultados raros si Docker instala 1.8+.
 
-Órdenes CLOB en vivo requieren **`eth-account`** y **`py-order-utils`**. El runtime oficial del repo es **Python ≥ 3.11** (`pyproject.toml`, `setup.py` y imagen Docker); no uses 3.9.x para este proyecto.
+Órdenes CLOB en vivo requieren **`eth-account`** y **`py-order-utils`**. El runtime oficial del repo es **Python ≥ 3.11** (recomendado **3.12**; **`.python-version`** para pyenv). Ejecutar **`python3.12 setup.py`**: instala desde **`pyproject.toml`** las entradas de **`[project].dependencies`** y **`[tool.uv].dev-dependencies`** (Jupyter, matplotlib, seaborn, duckdb). **`python3.12 setup.py --no-dev`**: solo runtime (API/arb/ML, sin dev). Si `python3.12` no está en PATH, Homebrew suele dejarlo en **`/opt/homebrew/bin/python3.12`**; `setup.py` prueba también esa ruta al crear `.venv`. Si `.venv` existe con Python menor que 3.11, el script exige `rm -rf .venv` y repetir. No uses 3.9.x para este proyecto.
 
 ## Entorno y variables
 
 - Copiar `.env.example` → `.env`. Relevantes: `DATA_DIR`, `PORT`, `AUTO_START`, `SIGNAL_THRESHOLD`, `LOG_LEVEL`, `GAMMA_MAX_PAGES`, `VALIDATOR_HEALTH_PORT`, `DASHBOARD_PASSWORD` (reservado; auth no implementada).
-- **Arb / CLOB:** `DRY_RUN` (default seguro `true`), `ENABLE_EXPERIMENTAL` (default `false`; activa estrategias experimentales en `arb_engine.py`), `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY`; opcionales `POLY_FUNDER`, `POLY_SIGNATURE_TYPE`, `POLYGON_CHAIN_ID`. Sin secret L2, `place_order` en vivo falla con mensaje explícito. Descubrimiento bundle / Gamma: ver `.env.example` (`BUNDLE_*`, `BUNDLE_GAMMA_KEYSET_LEGACY_ACTIVE`, `BUNDLE_GAMMA_MARKETS_LEGACY_ACTIVE`, etc.).
-- Python del proyecto: **≥ 3.11** obligatorio (`python setup.py` sale con error si no). Docker `python:3.11-slim` cumple. En rutas FastAPI evitar anotaciones `X | Y` sin `from __future__ import annotations` donde haga falta compatibilidad con intérpretes viejos.
+- **Arb / CLOB:** `DRY_RUN` (default seguro `true`), `ENABLE_EXPERIMENTAL` (en `.env.example` está `true`; en `scripts/arb_engine.py` el default si falta la env también es **activar** experimental — carga `combinatorial_arb`, `term_structure`, `latency_arb`, `latency_arb_sports` además de las tres base; pon `false` si solo quieres bundle/cross/mm), `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY`; opcionales `POLY_FUNDER`, `POLY_SIGNATURE_TYPE`, `POLYGON_CHAIN_ID`. Sin secret L2, `place_order` en vivo falla con mensaje explícito. Descubrimiento bundle / Gamma: ver `.env.example` (`BUNDLE_*`, `BUNDLE_GAMMA_KEYSET_LEGACY_ACTIVE`, `BUNDLE_GAMMA_MARKETS_LEGACY_ACTIVE`, etc.).
+- Python del proyecto: **≥ 3.11** obligatorio (`python3.12 setup.py` recomendado; sale con error si el intérprete o `.venv` es menor que 3.11). Docker `python:3.12-slim`. En rutas FastAPI evitar anotaciones `X | Y` sin `from __future__ import annotations` donde haga falta compatibilidad con intérpretes viejos.
 - **Arb en Railway:** con `DRY_RUN=true` y estrategias **desactivadas** por defecto en `data/strategy_state.json`, el despliegue levanta la UI lista; el motor no llama al CLOB hasta que actives toggles y pulses Start.
 - **Catálogo ML en UI:** `data/model_state.json` guarda `enabled` por slug (alineado con `risk/ml_model_registry.py`). Sin efecto sobre qué código corre en `validate_edge` hasta que se cablee lectura de ese estado o variables de entorno.
 - **Capital ficticio (paper):** por estrategia en `data/strategy_state.json` (`fict_capital_eur`, default `ARB_FICT_CAPITAL_EUR=1000`). Cada `SIGNAL`/`EXECUTED` con `edge` y `size_usdc` acumula `fict_pnl_est ≈ stake×edge` y ROI en `/api/arb/status` y CSV (`fict_*` columnas).
@@ -73,8 +75,8 @@ Los `**.pkl`** (calibradores `IsotonicRegression`) deben cargarse con la **misma
 ## Comandos útiles
 
 ```bash
-# Entorno (bootstrap del repo)
-python setup.py && source .venv/bin/activate
+# Entorno (bootstrap del repo: deps = pyproject.toml + dev)
+python3.12 setup.py && source .venv/bin/activate
 
 # Datos + modelos
 python download_datasets.py
@@ -83,10 +85,10 @@ python models/train.py
 # Solo validador (consola Rich)
 python scripts/validate_edge.py --hours 72
 
-# API + dashboard (supervisor)
-AUTO_START=false PORT=8080 python scripts/api.py
+# API + dashboard (supervisor). ENABLE_EXPERIMENTAL=true para cargar latency_arb / latency_arb_sports en el subproceso del arb.
+ENABLE_EXPERIMENTAL=true AUTO_START=false PORT=8080 python scripts/api.py
 # http://127.0.0.1:8080/ (monitor validador) · http://127.0.0.1:8080/ml (catálogo ML) · http://127.0.0.1:8080/ml/model/crypto_5m_lgbm (monitor por slug)
-# http://127.0.0.1:8080/arb (motor Arb CLOB) · http://127.0.0.1:8080/arb/strategy/bundle_arb (detalle estrategia) — http://127.0.0.1:8080/health
+# http://127.0.0.1:8080/arb (motor Arb CLOB) · http://127.0.0.1:8080/arb/strategy/bundle_arb · http://127.0.0.1:8080/arb/strategy/latency_arb_sports — http://127.0.0.1:8080/health
 ```
 
 ## Convenciones al editar

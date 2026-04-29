@@ -25,7 +25,7 @@
       <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
         <div>
           <h1 id="title-h1" class="text-2xl font-bold text-white tracking-tight">Estrategia</h1>
-          <p id="title-sub" class="text-sm text-slate-400 mt-1">Detalle, paper PnL y log CSV</p>
+          <p id="title-sub" class="text-sm text-slate-400 mt-1">Detalle, paper PnL y log CSV de <code class="text-slate-500">logs/&lt;slug&gt;.csv</code> (métricas del día = UTC).</p>
           <p class="text-xs text-slate-500 mt-2 max-w-lg">
             <strong class="text-slate-400">Activada</strong> = esta estrategia en <code class="text-slate-500">strategy_state.json</code>.
             <strong class="text-slate-400">Start / Stop</strong> = proceso <code class="text-slate-500">arb_engine</code> (todas las estrategias).
@@ -69,12 +69,14 @@
 
     <section class="grid grid-cols-2 md:grid-cols-4 gap-3">
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
-        <p class="text-xs text-slate-500">Señales hoy</p>
+        <p class="text-xs text-slate-500">SIGNAL hoy (CSV estrategia)</p>
         <p id="k-sig" class="font-mono text-white">—</p>
+        <p id="k-sig-sub" class="text-[10px] text-slate-500 mt-1 leading-snug">—</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
-        <p class="text-xs text-slate-500">Mejor edge hoy</p>
+        <p class="text-xs text-slate-500">Mejor edge hoy (|prob−mid| en CSV)</p>
         <p id="k-edge" class="font-mono text-yellow-400/90">—</p>
+        <p id="k-edge-sub" class="text-[10px] text-slate-500 mt-1">—</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
         <p class="text-xs text-slate-500">Última acción</p>
@@ -83,6 +85,25 @@
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
         <p class="text-xs text-slate-500">Última hora (UTC)</p>
         <p id="k-last-t" class="font-mono text-xs text-slate-400">—</p>
+      </div>
+    </section>
+
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="rounded-xl border border-slate-700 bg-slate-800/20 p-3">
+        <p class="text-xs text-slate-500">Filas CSV hoy (UTC)</p>
+        <p id="k-total" class="font-mono text-slate-200">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/20 p-3">
+        <p class="text-xs text-slate-500">Skips hoy</p>
+        <p id="k-skips" class="font-mono text-slate-200">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/20 p-3">
+        <p class="text-xs text-slate-500">SKIP &lt; min_edge</p>
+        <p id="k-skip-min" class="font-mono text-slate-200">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/20 p-3">
+        <p class="text-xs text-slate-500">Errores hoy</p>
+        <p id="k-err" class="font-mono text-slate-200">—</p>
       </div>
     </section>
 
@@ -126,11 +147,37 @@
       </div>
     </section>
 
+    <section id="snapshots-section" class="hidden mt-8 space-y-2">
+      <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+        <div>
+          <h2 class="text-sm font-medium text-slate-300">Snapshots (odds IO vs mid Poly)</h2>
+          <p class="text-xs text-slate-500 mt-0.5 max-w-xl">
+            <code class="text-slate-400">logs/latency_arb_sports_snapshots.csv</code> — las 4 primeras columnas quedan fijas al hacer scroll horizontal.
+          </p>
+        </div>
+        <button type="button" onclick="loadSnapshots()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
+      </div>
+      <div class="overflow-x-auto rounded-xl border border-slate-700">
+        <table class="w-full text-xs text-left min-w-[960px] border-collapse">
+          <thead id="snapshots-head" class="text-slate-400 uppercase"></thead>
+          <tbody id="snapshots-body" class="divide-y divide-slate-800 font-mono"></tbody>
+        </table>
+      </div>
+    </section>
+
     <p class="text-xs text-slate-600">Capital paper y acumulados viven en <code class="text-slate-500">data/strategy_state.json</code>. Más estrategias tendrán su propia ruta bajo <code class="text-slate-500">/arb/strategy/&lt;slug&gt;</code>.</p>
   </div>
 
   <script>
-    const KNOWN = new Set(["bundle_arb", "cross_exchange", "market_maker", "combinatorial_arb", "term_structure", "latency_arb"]);
+    const KNOWN = new Set([
+      "bundle_arb",
+      "cross_exchange",
+      "market_maker",
+      "combinatorial_arb",
+      "term_structure",
+      "latency_arb",
+      "latency_arb_sports",
+    ]);
     const SLUG = (function () {
       const p = location.pathname.replace(/\/$/, "").split("/").filter(Boolean);
       return p[p.length - 1] || "";
@@ -147,6 +194,89 @@
     if (SLUG === "bundle_arb") {
       const wrap = document.getElementById("bundle-scan-wrap");
       if (wrap) wrap.classList.remove("hidden");
+    }
+    if (SLUG === "latency_arb_sports") {
+      const snap = document.getElementById("snapshots-section");
+      if (snap) snap.classList.remove("hidden");
+    }
+
+    const SNAPSHOT_PREFIX = [
+      "snapshot_at",
+      "game",
+      "delta_home",
+      "delta_away",
+      "poly_mid_home",
+      "poly_mid_away",
+      "betfair_prob_home",
+      "betfair_prob_away",
+      "betfair_home_odds",
+      "betfair_away_odds",
+      "betfair_updated_at",
+    ];
+    const SNAPSHOT_STICKY = 4;
+    const SNAP_STICKY_TH =
+      "sticky z-30 px-2 py-2 font-medium whitespace-nowrap bg-slate-950 border-r border-slate-600 shadow-[6px_0_12px_-6px_rgba(0,0,0,0.55)]";
+    const SNAP_STICKY_TD =
+      "sticky z-20 px-2 py-1.5 align-top bg-slate-950 border-r border-slate-800 text-slate-300 shadow-[6px_0_12px_-6px_rgba(0,0,0,0.45)]";
+
+    function snapshotThClass(i) {
+      if (i >= SNAPSHOT_STICKY) return "px-2 py-2 font-medium whitespace-nowrap bg-slate-800";
+      const left = ["left-0 min-w-[10rem]", "left-[10rem] min-w-[12rem] max-w-[12rem]", "left-[22rem] min-w-[5.5rem]", "left-[27.5rem] min-w-[5.5rem]"][i];
+      return SNAP_STICKY_TH + " " + left;
+    }
+    function snapshotTdClass(i, isGame) {
+      if (i >= SNAPSHOT_STICKY) return "px-2 py-1.5 max-w-[220px] truncate text-slate-300";
+      const left = ["left-0 min-w-[10rem]", "left-[10rem] min-w-[12rem] max-w-[12rem]", "left-[22rem] min-w-[5.5rem]", "left-[27.5rem] min-w-[5.5rem]"][i];
+      return SNAP_STICKY_TD + " " + left + (isGame ? " max-w-[12rem] truncate" : "");
+    }
+
+    function snapshotColumnOrder(rows) {
+      const rest = new Set();
+      rows.forEach((row) => Object.keys(row).forEach((k) => rest.add(k)));
+      SNAPSHOT_PREFIX.forEach((k) => rest.delete(k));
+      return SNAPSHOT_PREFIX.concat(Array.from(rest).sort());
+    }
+
+    async function loadSnapshots() {
+      if (SLUG !== "latency_arb_sports") return;
+      const tbody = document.getElementById("snapshots-body");
+      const thead = document.getElementById("snapshots-head");
+      if (!tbody || !thead) return;
+      let rows = [];
+      try {
+        const r = await fetch("/api/arb/strategy/latency_arb_sports/snapshots?limit=400");
+        if (r.ok) rows = await r.json();
+      } catch (e) {}
+      if (!rows.length) {
+        thead.innerHTML = "<tr><th class=\"px-2 py-2\">—</th></tr>";
+        tbody.innerHTML = "<tr><td class=\"px-2 py-4 text-slate-500\">Sin filas en snapshots (activa el motor y espera un ciclo con match + mids).</td></tr>";
+        return;
+      }
+      const ordered = snapshotColumnOrder(rows);
+      thead.innerHTML =
+        "<tr>" +
+        ordered
+          .map((k, i) => '<th class="' + snapshotThClass(i) + '">' + esc(k) + "</th>")
+          .join("") +
+        "</tr>";
+      tbody.innerHTML = rows
+        .map((row) => {
+          return (
+            "<tr class=\"hover:bg-slate-800/30\">" +
+            ordered
+              .map((k, i) => {
+                let v = row[k];
+                if (v == null || v === "") v = "—";
+                const vs = String(v);
+                const isGame = k === "game";
+                const cls = snapshotTdClass(i, isGame);
+                return '<td class="' + cls + '" title="' + (isGame ? esc(vs) : "") + '">' + esc(vs) + "</td>";
+              })
+              .join("") +
+            "</tr>"
+          );
+        })
+        .join("");
     }
 
     const ACTION_COLOR = {
@@ -244,7 +374,27 @@
       document.getElementById("k-trades").textContent = s.fict_trades != null ? "Ops paper: " + s.fict_trades : "—";
 
       document.getElementById("k-sig").textContent = s.signals_today != null ? String(s.signals_today) : "—";
+      const subSig = document.getElementById("k-sig-sub");
+      if (subSig) {
+        const ex = s.executed_today != null ? String(s.executed_today) : "—";
+        const tot = s.total_today != null ? String(s.total_today) : "—";
+        const sk = s.skips_today != null ? String(s.skips_today) : "—";
+        subSig.textContent = "Ejecutadas: " + ex + " · Filas CSV (día UTC): " + tot + " · Skips: " + sk;
+      }
       document.getElementById("k-edge").textContent = s.best_edge_today != null ? (Number(s.best_edge_today) * 100).toFixed(2) + "%" : "—";
+      const subEdge = document.getElementById("k-edge-sub");
+      if (subEdge) {
+        subEdge.textContent =
+          s.avg_edge_today != null ? "Media filas con edge: " + (Number(s.avg_edge_today) * 100).toFixed(2) + "%" : "";
+      }
+      const elTot = document.getElementById("k-total");
+      if (elTot) elTot.textContent = s.total_today != null ? String(s.total_today) : "—";
+      const elSk = document.getElementById("k-skips");
+      if (elSk) elSk.textContent = s.skips_today != null ? String(s.skips_today) : "—";
+      const elSm = document.getElementById("k-skip-min");
+      if (elSm) elSm.textContent = s.skip_below_min_edge_today != null ? String(s.skip_below_min_edge_today) : "—";
+      const elEr = document.getElementById("k-err");
+      if (elEr) elEr.textContent = s.errors_today != null ? String(s.errors_today) : "—";
       document.getElementById("k-last-a").textContent = s.last_action || "—";
       document.getElementById("k-last-t").textContent = s.last_ts ? String(s.last_ts).substring(11, 19) + "Z" : "—";
 
@@ -462,6 +612,10 @@
       if (SLUG === "bundle_arb") {
         loadBundleScan();
         setInterval(loadBundleScan, 15000);
+      }
+      if (SLUG === "latency_arb_sports") {
+        loadSnapshots();
+        setInterval(loadSnapshots, 20000);
       }
       startLive();
     });

@@ -627,6 +627,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         return
 
     def _is_in_active_window(self, games: list[OpenPolymarketGame]) -> bool:
+        # Si el WS de odds tiene partidos live → ventana activa (Gamma puede ir aún vacío)
+        if len(self._odds_client._ws_odds_cache) > 0:
+            return True
         now = datetime.now(timezone.utc)
         lo = now - timedelta(hours=self._window_past_hours)
         hi = now + timedelta(hours=self.window_hours_before)

@@ -5,7 +5,7 @@ Reproduce the compact exogenous evaluation after local data exists under `data/r
 ## Preconditions
 
 ```bash
-python setup.py && source .venv/bin/activate
+python3.12 setup.py && source .venv/bin/activate
 python download_datasets.py   # {ASSET}_1min.parquet in data/raw/
 ```
 
