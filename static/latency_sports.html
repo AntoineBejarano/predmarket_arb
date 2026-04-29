@@ -81,7 +81,7 @@
 
     <section class="grid grid-cols-3 gap-3">
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
-        <p class="text-xs text-slate-500">Señales hoy</p>
+        <p class="text-xs text-slate-500">Señales hoy <span class="text-slate-600">(día España)</span></p>
         <p id="c-sig" class="font-mono text-white text-lg">—</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
@@ -123,7 +123,7 @@
         <table class="w-full text-xs text-left min-w-[900px]">
           <thead>
             <tr class="bg-slate-800 text-slate-400 uppercase">
-              <th class="p-2">ts</th>
+              <th class="p-2">ts <span class="text-slate-600 normal-case">(España)</span></th>
               <th class="p-2">partido</th>
               <th class="p-2">lado</th>
               <th class="p-2">price_poly</th>
@@ -165,14 +165,59 @@
         .replace(/\"/g, "&quot;");
     }
 
-    function todayUtcPrefix() {
-      const d = new Date();
-      return d.toISOString().slice(0, 10);
+    const TZ_ES = "Europe/Madrid";
+    function parseCsvTs(ts) {
+      if (!ts) return null;
+      let s = String(ts).trim();
+      if (!s) return null;
+      if (/^\d{4}-\d{2}-\d{2} \d/.test(s)) s = s.replace(" ", "T");
+      const hasTz = /[zZ]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s);
+      if (!hasTz && s.includes("T")) s += "Z";
+      const d = new Date(s);
+      return Number.isNaN(d.getTime()) ? null : d;
     }
-
-    function parseTsDay(ts) {
-      if (!ts) return "";
-      return String(ts).slice(0, 10);
+    function formatTimeEs(ts) {
+      const d = parseCsvTs(ts);
+      if (!d) return "—";
+      return new Intl.DateTimeFormat("es-ES", {
+        timeZone: TZ_ES,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(d);
+    }
+    function formatDateTimeEs(ts) {
+      const d = parseCsvTs(ts);
+      if (!d) return "—";
+      return new Intl.DateTimeFormat("es-ES", {
+        timeZone: TZ_ES,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(d);
+    }
+    function todaySpainYmd() {
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: TZ_ES,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date());
+    }
+    function tsDaySpain(ts) {
+      const d = parseCsvTs(ts);
+      if (!d) return "";
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: TZ_ES,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(d);
     }
 
     async function refreshStatus() {
@@ -333,7 +378,7 @@
       p.className = "text-slate-300";
       p.innerHTML =
         '<span class="text-slate-500">' +
-        String(payload.ts || "").substring(11, 19) +
+        formatTimeEs(payload.ts) +
         '</span> <span class="text-yellow-300">' +
         esc(a) +
         "</span> " +
@@ -364,7 +409,7 @@
         _chart = new Chart(ctx, {
           type: "line",
           data: {
-            labels: pts.map((p) => p.x.slice(11, 19)),
+            labels: pts.map((p) => formatTimeEs(p.x)),
             datasets: [{ label: "edge", data: pts.map((p) => p.y), borderColor: "rgb(129, 140, 248)", tension: 0.15 }],
           },
           options: {
@@ -378,7 +423,7 @@
           },
         });
       } else {
-        _chart.data.labels = pts.map((p) => p.x.slice(11, 19));
+        _chart.data.labels = pts.map((p) => formatTimeEs(p.x));
         _chart.data.datasets[0].data = pts.map((p) => p.y);
         _chart.update();
       }
@@ -472,7 +517,7 @@
         wrap.appendChild(title);
         wrap.appendChild(chartBox);
         host.appendChild(wrap);
-        const labels = pts.map((p) => (p.ts.length >= 19 ? p.ts.slice(11, 19) : p.ts));
+        const labels = pts.map((p) => formatTimeEs(p.ts));
         const ch = new Chart(cv, {
           type: "line",
           data: {
@@ -518,7 +563,7 @@
                 callbacks: {
                   title: (items) => {
                     const i = items[0]?.dataIndex;
-                    return i != null ? pts[i].ts : "";
+                    return i != null ? formatDateTimeEs(pts[i].ts) : "";
                   },
                 },
               },
@@ -530,12 +575,12 @@
     }
 
     function countToday(rows) {
-      const day = todayUtcPrefix();
+      const day = todaySpainYmd();
       let sig = 0,
         ex = 0,
         sk = 0;
       for (const r of rows) {
-        if (parseTsDay(r.ts) !== day) continue;
+        if (tsDaySpain(r.ts) !== day) continue;
         const a = String(r.action || "");
         const st = String(r.status || "");
         if (a === "SIGNAL") sig++;
@@ -568,7 +613,7 @@
             "<td class='" +
             tsCls +
             "'>" +
-            esc((row.ts || "").slice(11, 22)) +
+            esc(formatDateTimeEs(row.ts)) +
             "</td>" +
             "<td class='p-2'>" +
             esc((row.home_team || "") + " / " + (row.away_team || "")) +

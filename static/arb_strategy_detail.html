@@ -25,7 +25,7 @@
       <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
         <div>
           <h1 id="title-h1" class="text-2xl font-bold text-white tracking-tight">Estrategia</h1>
-          <p id="title-sub" class="text-sm text-slate-400 mt-1">Detalle, paper PnL y log CSV de <code class="text-slate-500">logs/&lt;slug&gt;.csv</code> (métricas del día = UTC).</p>
+          <p id="title-sub" class="text-sm text-slate-400 mt-1">Detalle, paper PnL y log CSV de <code class="text-slate-500">logs/&lt;slug&gt;.csv</code> (métricas del día y horas en hora España, Europe/Madrid; el servidor suele registrar en UTC).</p>
           <p class="text-xs text-slate-500 mt-2 max-w-lg">
             <strong class="text-slate-400">Activada</strong> = esta estrategia en <code class="text-slate-500">strategy_state.json</code>.
             <strong class="text-slate-400">Start / Stop</strong> = proceso <code class="text-slate-500">arb_engine</code> (todas las estrategias).
@@ -88,14 +88,14 @@
         <p id="k-last-a" class="font-mono text-xs text-slate-300 truncate">—</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
-        <p class="text-xs text-slate-500">Última hora (UTC)</p>
+        <p class="text-xs text-slate-500">Última hora (España)</p>
         <p id="k-last-t" class="font-mono text-xs text-slate-400">—</p>
       </div>
     </section>
 
     <section class="grid grid-cols-2 md:grid-cols-4 gap-3">
       <div class="rounded-xl border border-slate-700 bg-slate-800/20 p-3">
-        <p class="text-xs text-slate-500">Filas CSV hoy (UTC)</p>
+        <p class="text-xs text-slate-500">Filas CSV hoy (España)</p>
         <p id="k-total" class="font-mono text-slate-200">—</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/20 p-3">
@@ -316,6 +316,43 @@
         .replace(/\"/g, "&quot;");
     }
 
+    const TZ_ES = "Europe/Madrid";
+    function parseCsvTs(ts) {
+      if (!ts) return null;
+      let s = String(ts).trim();
+      if (!s) return null;
+      if (/^\d{4}-\d{2}-\d{2} \d/.test(s)) s = s.replace(" ", "T");
+      const hasTz = /[zZ]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s);
+      if (!hasTz && s.includes("T")) s += "Z";
+      const d = new Date(s);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+    function formatTimeEs(ts) {
+      const d = parseCsvTs(ts);
+      if (!d) return "—";
+      return new Intl.DateTimeFormat("es-ES", {
+        timeZone: TZ_ES,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(d);
+    }
+    function formatDateTimeEs(ts) {
+      const d = parseCsvTs(ts);
+      if (!d) return "—";
+      return new Intl.DateTimeFormat("es-ES", {
+        timeZone: TZ_ES,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(d);
+    }
+
     function actionClass(a) {
       if (!a) return "text-slate-400";
       if (a.startsWith("SKIP:")) return "text-slate-500";
@@ -402,7 +439,7 @@
         const ex = s.executed_today != null ? String(s.executed_today) : "—";
         const tot = s.total_today != null ? String(s.total_today) : "—";
         const sk = s.skips_today != null ? String(s.skips_today) : "—";
-        subSig.textContent = "Ejecutadas: " + ex + " · Filas CSV (día UTC): " + tot + " · Skips: " + sk;
+        subSig.textContent = "Ejecutadas: " + ex + " · Filas CSV (día España): " + tot + " · Skips: " + sk;
       }
       document.getElementById("k-edge").textContent = s.best_edge_today != null ? (Number(s.best_edge_today) * 100).toFixed(2) + "%" : "—";
       const subEdge = document.getElementById("k-edge-sub");
@@ -419,7 +456,7 @@
       const elEr = document.getElementById("k-err");
       if (elEr) elEr.textContent = s.errors_today != null ? String(s.errors_today) : "—";
       document.getElementById("k-last-a").textContent = s.last_action || "—";
-      document.getElementById("k-last-t").textContent = s.last_ts ? String(s.last_ts).substring(11, 19) + "Z" : "—";
+      document.getElementById("k-last-t").textContent = s.last_ts ? formatDateTimeEs(s.last_ts) : "—";
 
       const btn = document.getElementById("btn-toggle");
       const knob = document.getElementById("toggle-knob");
@@ -516,7 +553,7 @@
       const p = document.createElement("p");
       const a = payload.action || "—";
       p.className = "font-mono";
-      p.innerHTML = '<span class="text-slate-500">' + String(payload.ts || "").substring(11, 19) + '</span> <span class="' + actionClass(a) + '">' + a + "</span> <span class=\"text-slate-500\">" + String(payload.reason || "").slice(0, 120) + "</span>";
+      p.innerHTML = '<span class="text-slate-500">' + formatTimeEs(payload.ts) + '</span> <span class="' + actionClass(a) + '">' + a + "</span> <span class=\"text-slate-500\">" + String(payload.reason || "").slice(0, 120) + "</span>";
       feed.prepend(p);
       while (feed.children.length > 80) feed.removeChild(feed.lastChild);
     }
@@ -678,9 +715,10 @@
         return "<tr class=\"hover:bg-slate-800/40\">" + ordered.map((k) => {
           let v = row[k];
           if (v == null || v === "") v = "—";
-          const vs = String(v);
+          let vs = String(v);
+          if (k === "ts" && v !== "—") vs = formatDateTimeEs(v);
           const cls = k === "action" ? actionClass(vs) : "text-slate-300";
-          return "<td class=\"px-2 py-1.5 max-w-[220px] truncate " + cls + "\" title=\"" + esc(vs) + "\">" + esc(vs) + "</td>";
+          return "<td class=\"px-2 py-1.5 max-w-[220px] truncate " + cls + "\" title=\"" + esc(String(row[k] != null && row[k] !== "" ? row[k] : "")) + "\">" + esc(vs) + "</td>";
         }).join("") + "</tr>";
       }).join("");
     }

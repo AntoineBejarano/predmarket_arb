@@ -18,6 +18,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Tuple, Union
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -677,18 +678,31 @@ def _read_arb_csv_tail(path: Path, n: int = 200) -> list[dict[str, Any]]:
     return rows[-n:]
 
 
-def _csv_ts_date_utc(ts: Any) -> str:
-    """YYYY-MM-DD en UTC a partir de columna ts (ISO)."""
+_TZ_ES = ZoneInfo("Europe/Madrid")
+
+
+def _csv_ts_date_spain(ts: Any) -> str:
+    """YYYY-MM-DD en Europe/Madrid a partir de columna ts (ISO, típicamente UTC en servidor)."""
     s = str(ts or "").strip()
-    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-        return s[:10]
-    return ""
+    if not s:
+        return ""
+    try:
+        t = pd.Timestamp(s)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        else:
+            t = t.tz_convert("UTC")
+        return t.tz_convert(_TZ_ES).strftime("%Y-%m-%d")
+    except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime):
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return s[:10]
+        return ""
 
 
 def _csv_stats_today(path: Path) -> dict[str, Any]:
-    today = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+    today = pd.Timestamp.now(tz=_TZ_ES).strftime("%Y-%m-%d")
     rows = _read_arb_csv_tail(path, n=15000)
-    today_rows = [r for r in rows if _csv_ts_date_utc(r.get("ts")) == today]
+    today_rows = [r for r in rows if _csv_ts_date_spain(r.get("ts")) == today]
 
     signals = [r for r in today_rows if r.get("action") == "SIGNAL"]
     executed = [r for r in today_rows if r.get("action") == "EXECUTED"]

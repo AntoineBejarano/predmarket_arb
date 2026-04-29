@@ -104,6 +104,30 @@
       },
     ];
 
+    /** Timestamps CSV/API en UTC; UI en hora peninsular (servidor suele ir en UTC). */
+    const TZ_ES = "Europe/Madrid";
+    function parseCsvTs(ts) {
+      if (!ts) return null;
+      let s = String(ts).trim();
+      if (!s) return null;
+      if (/^\d{4}-\d{2}-\d{2} \d/.test(s)) s = s.replace(" ", "T");
+      const hasTz = /[zZ]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s);
+      if (!hasTz && s.includes("T")) s += "Z";
+      const d = new Date(s);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+    function formatTimeEs(ts) {
+      const d = parseCsvTs(ts);
+      if (!d) return "—";
+      return new Intl.DateTimeFormat("es-ES", {
+        timeZone: TZ_ES,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(d);
+    }
+
     const ACTION_COLOR = {
       "SIGNAL": "text-yellow-400",
       "EXECUTED": "text-emerald-400",
@@ -167,7 +191,7 @@
           ${s.executed_today ?? "—"}
           ${statusData.dry_run && (s.executed_today || 0) > 0 ? '<span class="text-slate-500 text-xs">(dry)</span>' : ""}
         </span>
-        <span class="text-slate-500">Filas CSV / día UTC</span>
+        <span class="text-slate-500">Filas CSV / día (España)</span>
         <span class="font-mono text-slate-200">${s.total_today ?? "—"}</span>
         <span class="text-slate-500">Skips hoy</span>
         <span class="font-mono text-slate-200">${s.skips_today ?? "—"}</span>
@@ -189,7 +213,7 @@
       </div>
       <div class="text-xs border-t border-slate-700 pt-2 mb-3 truncate">
         <span class="${lastActionColor} font-mono">${s.last_action ?? "—"}</span>
-        ${s.last_ts ? '<span class="text-slate-500 ml-1">' + String(s.last_ts).substring(11, 19) + " UTC</span>" : ""}
+        ${s.last_ts ? '<span class="text-slate-500 ml-1">' + formatTimeEs(s.last_ts) + " España</span>" : ""}
         ${s.last_reason ? '<p class="text-slate-500 truncate mt-0.5">' + String(s.last_reason) + "</p>" : ""}
       </div>
       <div class="flex items-center gap-2">
@@ -259,7 +283,7 @@
       }
       tbody.innerHTML = [...rows].reverse().map((row) => {
         const color = actionColor(row.action);
-        const hora = (row.ts || "").substring(11, 19);
+        const hora = formatTimeEs(row.ts);
         let edge = "—";
         if (row.edge != null && row.edge !== "") {
           const p = parseFloat(row.edge);
@@ -422,7 +446,7 @@
         let d = {};
         try { d = JSON.parse(e.data); } catch (err) { return; }
         const color = actionColor(d.action);
-        const hora = (d.ts || "").substring(11, 19);
+        const hora = formatTimeEs(d.ts);
         let edgeStr = "";
         if (d.edge != null && d.edge !== "") {
           const p = parseFloat(d.edge);

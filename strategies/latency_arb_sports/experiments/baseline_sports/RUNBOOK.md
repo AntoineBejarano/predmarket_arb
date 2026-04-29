@@ -50,3 +50,41 @@ Ruta: `$DATA_DIR/logs/latency_arb_sports.csv` (columnas `ts`, `action`, `reason`
 
 - `action=SIGNAL` / `EXECUTED`: oportunidad con `edge` positivo (fair − mid) por encima de `LATENCY_SPORTS_MIN_EDGE`.
 - `SKIP:LOW_EDGE` / `SKIP:CIRCUIT_BREAKER`: sin trade o breaker activo.
+
+## Conocimiento: Betfair vs Polymarket (mercados sharp)
+
+**Betfair es generalmente el mercado más “sharp” en comparación con Polymarket, especialmente para un sistema de value betting.**  
+Esto se debe a su alta liquidez, participación de apostadores profesionales y eficiencia en precios que refleja información precisa rápidamente. [caanberry](https://caanberry.com/why-is-betfair-exchange-pricing-so-accurate/)
+
+### ¿Qué significa “mercado sharp”?
+
+Un mercado sharp tiene odds eficientes, con bajo margen (vig), alta liquidez y movimiento rápido ante nueva información, minimizando ineficiencias explotables. [punter2pro](https://punter2pro.com/best-sharp-sportsbooks-betting-sites/)  
+Betfair Exchange destaca por su modelo peer-to-peer, donde pros y bots ajustan precios cerca de bookies sharp como Pinnacle. [caanberry](https://caanberry.com/why-is-betfair-exchange-pricing-so-accurate/)  
+Polymarket, enfocado en predicciones (política, cripto), muestra más ineficiencias por bots y arbitraje. [dlnews](https://www.dlnews.com/articles/markets/polymarket-users-lost-millions-of-dollars-to-bot-like-bettors-over-the-past-year/)
+
+### Ventajas de Betfair como benchmark
+
+- **Liquidez masiva en deportes**: miles de millones en volumen anual, spreads ajustados (1.5–3% margen), superior en fútbol, tenis y caballos. [betaminic](https://www.betaminic.com/es/estudios-de-apuestas/que-ligas-de-futbol-tienen-mas-liquidez-en-betfair/)
+- **Precios precisos**: correlacionados con bookies sharp; útil como referencia (“oráculo”) para detectar edge en otros sitios. [reddit](https://www.reddit.com/r/algobetting/comments/1p72c9i/using_polymarket_as_an_oracle_to_find_ev_bets/)
+- **Comisiones**: 2–5% en ganancias netas; penaliza winners con “Expert Fee” (hasta 40% extra). [startpolymarket](https://startpolymarket.com/reviews/best-prediction-markets/)
+
+### Ineficiencias en Polymarket
+
+- **Arbitraje frecuente**: bots ganaron ~$40M en un año explotando mispricings, especialmente en política (sumas por debajo del 100% en outcomes). [finance.yahoo](https://finance.yahoo.com/news/polymarket-silent-gold-rush-sharp-092527911.html)
+- **Menos sharp en general**: retail-heavy, delays en fills y spreads amplios fuera de majors; odds divergen de fuentes sharp como CME. [edgescouts](https://www.edgescouts.com/blog/polymarket-vs-sportsbooks-where-edges-hide)
+- **Fees bajos (0–2%)**, pero las ineficiencias crean edge —p. ej. discrepancia tipo 84.6% Betfair vs 91% Poly, donde Betfair suele estar más alineado con pros. [newspoly](https://www.newspoly.net/blog/polymarket-vs-sports-betting)
+
+### Justificación para el sistema (fair externo vs mid Poly)
+
+Un setup de value bets con **Betfair (u otra fuente sharp) como base** puede tener edge real porque Betfair es más sharp en eventos con liquidez compartida (deportes / predicciones híbridas). [reddit](https://www.reddit.com/r/algobetting/comments/1p72c9i/using_polymarket_as_an_oracle_to_find_ev_bets/)  
+Riesgo si Poly captura información única (cripto/política), pero en muchos casos Betfair converge más rápido a la “verdad” de mercado. [startpolymarket](https://startpolymarket.com/reviews/best-prediction-markets/)  
+En una ventana corta de discrepancia, un edge implícito del orden **91/84.6 − 1 ≈ 6.3%** puede ser viable incluso sin depender solo de latency arb puro. [edgescouts](https://www.edgescouts.com/blog/polymarket-vs-sportsbooks-where-edges-hide)
+
+> **Nota de alineación con este repo:** el experimento baseline usa **Pinnacle vía The Odds API** como fair reference en código; la lógica de “mercado sharp” y benchmark deportivo es análoga a la de Betfair descrita aquí.
+
+| Aspecto | Betfair | Polymarket |
+|--------|---------|------------|
+| Liquidez principal | Deportes (profunda) | Política/cripto (alta en majors) [startpolymarket](https://startpolymarket.com/reviews/best-prediction-markets/) |
+| Eficiencia odds | Muy alta (sigue Pinnacle) | Media (arbs, bots) [caanberry](https://caanberry.com/why-is-betfair-exchange-pricing-so-accurate/) |
+| Edge para value | Benchmark ideal | Oportunidades, pero más riesgo [reddit](https://www.reddit.com/r/algobetting/comments/1p72c9i/using_polymarket_as_an_oracle_to_find_ev_bets/) |
+| Fees | ~5% + Expert | menor del 2% en profits [newspoly](https://www.newspoly.net/blog/polymarket-vs-sports-betting) |

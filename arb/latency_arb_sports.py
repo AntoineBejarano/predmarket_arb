@@ -82,8 +82,8 @@ _SIGNAL_COOLDOWN_SEC = 300.0
 
 # Defaults embebidos si Railway (u otro) no define env; `os.getenv` sigue pudiendo sobreescribir en local.
 _EMBEDDED_LATENCY_SPORTS_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
-_EMBEDDED_LATENCY_MIN_EDGE = "0.03"
-_EMBEDDED_LATENCY_MAX_STAKE_USDC = "50"
+_EMBEDDED_LATENCY_MIN_EDGE = "0.005"
+_EMBEDDED_LATENCY_MAX_STAKE_USDC = "10"
 _EMBEDDED_LATENCY_REGIONS = "eu"
 _EMBEDDED_LATENCY_POLL_INTERVAL = "5"
 _EMBEDDED_LATENCY_POLL_INTERVAL_ACTIVE = "2"
