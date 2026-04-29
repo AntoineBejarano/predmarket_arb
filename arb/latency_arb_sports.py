@@ -1647,10 +1647,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 if odds_key is None:
                     continue
                 if odds_key not in odds_events_by_key:
-                    if not self._odds_client.ws_enabled:
-                        await self._odds_client.refresh_rest_cache(
-                            sess, _client_poly_key_for_odds_io(odds_key, game.sport_slug)
-                        )
+                    # Con WS activo igual hace falta REST para deportes fuera de la suscripción WS
+                    # (p. ej. NBA); odds_api_io prioriza ticks WS y cae a _rest_cache si está vacío.
+                    await self._odds_client.refresh_rest_cache(
+                        sess, _client_poly_key_for_odds_io(odds_key, game.sport_slug)
+                    )
                     odds_events_by_key[odds_key] = self._odds_client.get_cached_odds(
                         _client_poly_key_for_odds_io(odds_key, game.sport_slug)
                     )

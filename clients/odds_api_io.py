@@ -27,7 +27,8 @@ log = logging.getLogger("odds_api_io")
 ODDS_API_IO_KEY_EMBEDDED = "647c2e8972c62f827b54f98b759982ea2b6d891be25b49c2a746a6f1ed4dd360"
 ODDS_API_IO_WS_EMBEDDED = True
 ODDS_API_IO_CACHE_TTL_EMBEDDED = 60
-ODDS_API_IO_BOOKMAKERS_EMBEDDED = "Betfair Exchange,Sharp Exchange"
+# Alineado con el tier típico de la clave (máx. 2 bookies: Betfair + Polymarket). Sharp Exchange → 403 en /odds/multi.
+ODDS_API_IO_BOOKMAKERS_EMBEDDED = "Betfair Exchange,Polymarket"
 ODDS_API_IO_MARKETS_EMBEDDED = "ML"
 ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis"
 
@@ -97,6 +98,8 @@ ODDS_KEY_TO_IO_SPORT = {
 }
 
 _WS_BACKOFF_SEC = (2, 4, 8, 16, 30)
+# Tope de eventos por deporte en REST (evita decenas de GET /odds/multi por ciclo en tenis/fútbol).
+_ODDS_IO_REST_MAX_EVENT_IDS = 100
 
 
 def _event_meta_disk_path() -> Path:
@@ -355,6 +358,8 @@ class OddsApiIo:
         self._ws_runner_task: Optional[asyncio.Task[None]] = None
         self._ws_cancel = asyncio.Event()
         self._raw_logged = False
+        # Tras 403/429 REST no reintentar en bucle (mata el gather del arb_engine).
+        self._rest_backoff_until: float = 0.0
 
     def start_ws_stream(self, sports: list[str]) -> None:
         if not self.ws_enabled:
@@ -382,8 +387,12 @@ class OddsApiIo:
         """Solo lectura de caché; en REST la caché se rellena vía refresh_rest_cache."""
         k = sport.strip().lower()
         sport_slug = str(ODDS_KEY_TO_IO_SPORT.get(k, k)).strip().lower()
+        # WS suele estar suscrito solo a un subconjunto (p. ej. tenis). Si no hay ticks,
+        # seguir con REST para basketball/football/etc. sin apagar el WS global.
         if self.ws_enabled:
-            return self._flatten_ws_cache_io_sport(sport_slug)
+            ws_events = self._flatten_ws_cache_io_sport(sport_slug)
+            if ws_events:
+                return ws_events
         now = time.monotonic()
         row = self._rest_cache.get(sport_slug)
         if not row:
@@ -417,20 +426,25 @@ class OddsApiIo:
         await asyncio.to_thread(_save_event_meta_disk_cache, snap)
 
     async def refresh_rest_cache(self, session: aiohttp.ClientSession, poly_sport: str) -> None:
-        if self.ws_enabled:
-            return
         io_sport = poly_odds_key_to_io_sport(poly_sport)
         if not io_sport:
             return
         now = time.monotonic()
+        if now < self._rest_backoff_until:
+            return
         async with self._lock:
             row = self._rest_cache.get(io_sport)
             if row and now - row[0] < self.cache_ttl:
                 return
         try:
             events_rows = await self._rest_fetch_sport(session, io_sport)
-        except OddsApiIoRestQuotaError:
-            raise
+        except OddsApiIoRestQuotaError as e:
+            log.warning(
+                "[odds_api_io] REST en pausa ~1h (cuota o límite de bookmakers); el motor sigue con WS. %s",
+                e,
+            )
+            self._rest_backoff_until = time.monotonic() + 3600.0
+            return
         except Exception as e:
             log.warning("[odds_api_io] REST fetch sport=%s: %s", io_sport, e)
             return
@@ -457,6 +471,8 @@ class OddsApiIo:
             eid = ev.get("id")
             if eid is not None:
                 ids.append(str(eid))
+        if len(ids) > _ODDS_IO_REST_MAX_EVENT_IDS:
+            ids = ids[:_ODDS_IO_REST_MAX_EVENT_IDS]
         if not ids:
             return []
         out: list[OddsEvent] = []
