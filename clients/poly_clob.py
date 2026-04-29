@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Callable, List, Optional, Union
 
@@ -36,6 +37,11 @@ class PolyCLOBClient:
         self._neg_cache: dict[str, tuple[float, bool]] = {}
         self._fee_cache: dict[str, tuple[float, int]] = {}
         self._meta_ttl_sec: float = float(os.getenv("MARKET_META_CACHE_TTL_SEC", "600"))
+        # Caché en memoria alimentada por subscribe_market (canal market); lectura sync con lock.
+        self._market_ws_lock = threading.Lock()
+        self._market_ws_books: dict[str, dict[str, Any]] = {}
+        self._market_ws_task: Optional[asyncio.Task[None]] = None
+        self._market_ws_ids: frozenset[str] = frozenset()
 
     async def __aenter__(self) -> PolyCLOBClient:
         self._session = aiohttp.ClientSession(
@@ -45,6 +51,7 @@ class PolyCLOBClient:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        await self._stop_market_ws_subscription()
         if self._session:
             await self._session.close()
             self._session = None
@@ -575,6 +582,180 @@ class PolyCLOBClient:
             if resp.status not in (200, 204):
                 raise RuntimeError(f"CLOB DELETE /cancel-market-orders HTTP {resp.status}: {text[:500]}")
             return out if isinstance(out, dict) else {}
+
+    async def _stop_market_ws_subscription(self) -> None:
+        t = self._market_ws_task
+        self._market_ws_task = None
+        if t is not None and not t.done():
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self._market_ws_ids = frozenset()
+        with self._market_ws_lock:
+            self._market_ws_books.clear()
+
+    def _ingest_market_ws_message(self, data: dict[str, Any]) -> None:
+        tid = ""
+        for k in ("asset_id", "assetId", "token_id", "tokenId"):
+            v = data.get(k)
+            if v:
+                tid = str(v).strip()
+                break
+        if not tid:
+            return
+        bids_raw = data.get("bids")
+        asks_raw = data.get("asks")
+        bk = data.get("book")
+        if isinstance(bk, dict):
+            if not bids_raw:
+                bids_raw = bk.get("bids")
+            if not asks_raw:
+                asks_raw = bk.get("asks")
+        bids = bids_raw if isinstance(bids_raw, list) else []
+        asks = asks_raw if isinstance(asks_raw, list) else []
+
+        with self._market_ws_lock:
+            prev = self._market_ws_books.get(tid)
+            if bids or asks:
+                bb = list(bids)[:80]
+                aa = list(asks)[:80]
+                best_bid = _best_price_side(bb, is_bid=True)
+                best_ask = _best_price_side(aa, is_bid=False)
+                row: dict[str, Any] = {
+                    "bids": bb,
+                    "asks": aa,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                }
+                if best_ask is not None:
+                    sz = _size_at_price(aa, best_ask)
+                    row["best_ask_size"] = sz
+                    row["best_ask_notional_usdc"] = (
+                        float(best_ask) * float(sz) if sz is not None else None
+                    )
+                else:
+                    row["best_ask_size"] = None
+                    row["best_ask_notional_usdc"] = None
+                row["ts"] = time.monotonic()
+                self._market_ws_books[tid] = row
+                return
+
+            bb_new: Optional[float] = None
+            ba_new: Optional[float] = None
+            for key in ("best_bid", "bestBid"):
+                if key in data and data[key] is not None:
+                    try:
+                        bb_new = float(data[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            for key in ("best_ask", "bestAsk"):
+                if key in data and data[key] is not None:
+                    try:
+                        ba_new = float(data[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            if bb_new is None and ba_new is None:
+                return
+            base: dict[str, Any]
+            if prev:
+                base = {
+                    "bids": list(prev.get("bids") or []),
+                    "asks": list(prev.get("asks") or []),
+                    "best_bid": prev.get("best_bid"),
+                    "best_ask": prev.get("best_ask"),
+                    "best_ask_size": prev.get("best_ask_size"),
+                    "best_ask_notional_usdc": prev.get("best_ask_notional_usdc"),
+                }
+            else:
+                base = {
+                    "bids": [],
+                    "asks": [],
+                    "best_bid": None,
+                    "best_ask": None,
+                    "best_ask_size": None,
+                    "best_ask_notional_usdc": None,
+                }
+            if bb_new is not None:
+                base["best_bid"] = bb_new
+            if ba_new is not None:
+                base["best_ask"] = ba_new
+                aa_list = base.get("asks") or []
+                if isinstance(aa_list, list):
+                    sz2 = _size_at_price(aa_list, ba_new)
+                    base["best_ask_size"] = sz2
+                    base["best_ask_notional_usdc"] = (
+                        float(ba_new) * float(sz2) if sz2 is not None else None
+                    )
+            base["ts"] = time.monotonic()
+            self._market_ws_books[tid] = base
+
+    def get_cached_mid(self, token_id: str, max_age_sec: float = 8.0) -> Optional[float]:
+        tid = str(token_id).strip()
+        if not tid:
+            return None
+        now = time.monotonic()
+        with self._market_ws_lock:
+            row = self._market_ws_books.get(tid)
+            if not row:
+                return None
+            if now - float(row.get("ts", 0.0)) > max_age_sec:
+                return None
+            bb = row.get("best_bid")
+            ba = row.get("best_ask")
+            if bb is not None and ba is not None:
+                return (float(bb) + float(ba)) / 2.0
+            return None
+
+    def get_cached_orderbook_snapshot(self, token_id: str, max_age_sec: float = 8.0) -> Optional[dict[str, Any]]:
+        """Copia superficial compatible con _orderbook_best_bid_size / bandas de asks; None si stale o vacío."""
+        tid = str(token_id).strip()
+        if not tid:
+            return None
+        now = time.monotonic()
+        with self._market_ws_lock:
+            row = self._market_ws_books.get(tid)
+            if not row:
+                return None
+            if now - float(row.get("ts", 0.0)) > max_age_sec:
+                return None
+            bb = row.get("best_bid")
+            ba = row.get("best_ask")
+            if bb is None and ba is None:
+                return None
+            out = {
+                "bids": list(row.get("bids") or []),
+                "asks": list(row.get("asks") or []),
+                "best_bid": bb,
+                "best_ask": ba,
+                "best_ask_size": row.get("best_ask_size"),
+                "best_ask_notional_usdc": row.get("best_ask_notional_usdc"),
+            }
+            return out
+
+    async def ensure_market_ws_subscription(self, token_ids: List[str], *, cap: int = 400) -> None:
+        """Mantiene una tarea WS al canal market para los token_id; reinicia si el conjunto cambia."""
+        ids = sorted({str(x).strip() for x in token_ids if str(x).strip()})[: int(cap)]
+        new_set = frozenset(ids)
+        if new_set == self._market_ws_ids and self._market_ws_task and not self._market_ws_task.done():
+            return
+        await self._stop_market_ws_subscription()
+        self._market_ws_ids = new_set
+        if not new_set:
+            return
+
+        def on_msg(d: dict[str, Any]) -> None:
+            self._ingest_market_ws_message(d)
+
+        self._market_ws_task = asyncio.create_task(
+            self.subscribe_market(list(new_set), on_msg),
+            name="poly_clob_market_ws_cache",
+        )
 
     async def subscribe_market(
         self,

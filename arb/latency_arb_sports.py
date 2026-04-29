@@ -29,6 +29,7 @@ from clients.odds_api_io import (
     OddsEvent,
     find_event_matching_teams,
     normalize_name_order,
+    poly_odds_key_to_io_sport,
     remove_vig as remove_vig_decimal,
 )
 from clients.poly_clob import PolyCLOBClient, _level_price, _level_size, _size_at_price
@@ -157,7 +158,7 @@ _SIGNAL_COOLDOWN_SEC = 30.0
 
 # Parámetros fijos de la estrategia (no se leen LATENCY_SPORTS_* ni ODDS_API_IO_SPORTS del entorno).
 # Rutas de datos: ``lab.paths.data_dir()`` (fijo ``<repo>/data``). Siguen por env: POLY_* (CLOB), claves Odds API en clients/odds_api_io.
-_HARDCODE_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
+_HARDCODE_POLY_SLUGS = "atp,wta,wttmen"
 _HARDCODE_MIN_EDGE = 0.005
 _HARDCODE_MAX_STAKE_USDC = 10.0
 _HARDCODE_REGIONS = "eu"
@@ -167,8 +168,15 @@ _HARDCODE_DISCOVERY_TTL = 300.0
 _HARDCODE_DISCOVERY_TTL_ACTIVE = 30.0
 _HARDCODE_WINDOW_HOURS_BEFORE = 3.0
 _HARDCODE_BETFAIR_GAMMA_SEARCH_TTL = 60.0
+_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL_ACTIVE = 10.0
 _HARDCODE_GAMMA_PUBLIC_SEARCH_LIMIT = 40
+_HARDCODE_MATCH_PARALLELISM = 8
 _SNAPSHOT_CSV_ENABLED = True
+# Calidad referencia odds-io: descartar emparejamientos demasiado viejos o pre-game listado.
+_HARDCODE_MAX_REFERENCE_LAG_SEC = 30.0
+_HARDCODE_STALE_ODDS_IO_SEC = 120.0
+_HARDCODE_PRE_GAME_END_MARGIN_SEC = 172800.0
+_HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC = 120.0
 
 # Gamma /events con ?sport= no filtra de forma fiable; usamos series_id del GET /sports nativo.
 GAMMA_SPORTS_META_TTL_SEC = 3600.0
@@ -177,14 +185,6 @@ POLY_SLUG_TO_ODDS_KEY: dict[str, str] = {
     "wta": "tennis",
     "atp": "tennis",
     "wttmen": "table-tennis",
-    "nba": "basketball_nba",
-    "nhl": "icehockey_nhl",
-    "mlb": "baseball_mlb",
-    "ufc": "mma_mixed_martial_arts",
-    "ucl": "soccer_uefa_champs_league",
-    "uel": "soccer_uefa_europa_league",
-    "epl": "soccer_epl",
-    "nfl": "americanfootball_nfl",
 }
 
 # odds-api.io slug deporte (OddsEvent.sport) → prefijos esperados en slug Gamma (public-search mezcla deportes).
@@ -302,6 +302,37 @@ class OpenPolymarketGame:
     slug: str
     outcome_tokens: list[tuple[str, str]]
     end_date_s: Optional[str]
+
+
+def _odds_io_updated_age_sec(odds_event: OddsEvent) -> Optional[float]:
+    raw = (odds_event.updated_at or "").strip()
+    if not raw:
+        return None
+    u = _parse_iso_utc(raw)
+    if u is None:
+        return None
+    return (datetime.now(timezone.utc) - u).total_seconds()
+
+
+def _is_reference_stale_for_io(odds_event: OddsEvent) -> bool:
+    age = _odds_io_updated_age_sec(odds_event)
+    if age is None:
+        return True
+    return age > float(_HARDCODE_STALE_ODDS_IO_SEC)
+
+
+def _is_reference_lag_over_limit(odds_event: OddsEvent) -> bool:
+    age = _odds_io_updated_age_sec(odds_event)
+    if age is None:
+        return True
+    return age > float(_HARDCODE_MAX_REFERENCE_LAG_SEC)
+
+
+def _is_pre_game_listing_game(game: OpenPolymarketGame) -> bool:
+    now = datetime.now(timezone.utc)
+    if game.end_date is not None and (game.end_date - now).total_seconds() > float(_HARDCODE_PRE_GAME_END_MARGIN_SEC):
+        return True
+    return False
 
 
 @dataclass
@@ -924,6 +955,18 @@ def _open_game_to_gamma_row(game: OpenPolymarketGame, odds_sport_key: str) -> Ga
     )
 
 
+def _poly_token_ids_from_open_games(games: list[OpenPolymarketGame]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for g in games:
+        for _lbl, tid in g.outcome_tokens:
+            t = (tid or "").strip()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
+
+
 class LatencyArbSportsStrategy(ArbStrategy):
     slug = "latency_arb_sports"
     name = "Latency Arb — Sports"
@@ -1012,6 +1055,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._io_ws_depth_hook_installed = False
         # Follow-up precios Poly a 30/60/120s tras SIGNAL/SKIP (clave uuid).
         self._pending_poly_followups: dict[str, dict[str, Any]] = {}
+        self._rest_rr_index = 0
+        # condition_id -> (último side YES|NO con SIGNAL, monotonic) para bloquear opuesto en ventana corta.
+        self._condition_signal_recent: dict[str, tuple[str, float]] = {}
 
     def _ensure_csv(self) -> None:
         """Migra cabecera si hay columnas nuevas (base solo fusiona ficticio)."""
@@ -1071,7 +1117,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
     async def _clob_trace_for_token(
         self, clob: PolyCLOBClient, token_id: str, mid_signal: float
     ) -> dict[str, str]:
-        ob = await clob.get_orderbook(token_id)
+        ob = clob.get_cached_orderbook_snapshot(token_id)
+        if ob is None:
+            ob = await clob.get_orderbook(token_id)
         if not isinstance(ob, dict) or ob.get("error"):
             return {
                 "clob_best_bid": "",
@@ -1100,6 +1148,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         }
 
     async def _poly_mid_for_followup(self, clob: PolyCLOBClient, token_id: str) -> Optional[float]:
+        cm = clob.get_cached_mid(token_id)
+        if cm is not None:
+            return float(cm)
         m = await clob.get_midpoint(token_id)
         if m is not None:
             return float(m)
@@ -1242,6 +1293,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
         return
+
+    def _betfair_gamma_search_ttl_eff(self) -> float:
+        if self._is_in_active_window(self._open_games):
+            return float(_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL_ACTIVE)
+        return self._betfair_gamma_search_ttl
 
     def _is_in_active_window(self, games: list[OpenPolymarketGame]) -> bool:
         # Si el WS de odds tiene partidos live → ventana activa (Gamma puede ir aún vacío)
@@ -1398,6 +1454,59 @@ class LatencyArbSportsStrategy(ArbStrategy):
         log.info("[latency_arb_sports] Gamma /sports refreshed: n=%s slugs mapped=%s", len(rows), len(self._poly_series_by_slug))
         return self._gamma_sports_meta
 
+    async def _gamma_open_games_for_slug(
+        self, session: aiohttp.ClientSession, poly_slug: str
+    ) -> list[OpenPolymarketGame]:
+        """GET Gamma /events para un poly_slug; sin dedupe global (fusiona el caller)."""
+        out: list[OpenPolymarketGame] = []
+        odds_key = POLY_SLUG_TO_ODDS_KEY.get(poly_slug)
+        if odds_key is None:
+            return out
+        series_id = self._poly_series_by_slug.get(poly_slug)
+        if not series_id:
+            return out
+        url = f"{GAMMA_API_URL}/events"
+        params: dict[str, str | int] = {
+            "series_id": int(series_id) if str(series_id).isdigit() else series_id,
+            "active": "true",
+            "closed": "false",
+            "limit": 200,
+            "order": "createdAt",
+            "ascending": "false",
+        }
+        try:
+            async with session.get(
+                url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    log.warning("[latency_arb_sports] Gamma /events series=%s HTTP %s", series_id, resp.status)
+                    return out
+                evs = json.loads(text)
+        except (json.JSONDecodeError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            log.warning("[latency_arb_sports] Gamma /events series=%s error: %s", series_id, e)
+            return out
+        if not isinstance(evs, list):
+            return out
+        for ev in evs:
+            if not isinstance(ev, dict):
+                continue
+            if not _gamma_event_usable(ev):
+                continue
+            og = _poly_event_to_open_game(ev, poly_slug)
+            if og is None:
+                continue
+            raw_title = str(ev.get("title") or "")
+            if _latency_sports_skip_doubles() and (
+                _doubles_hint_in_text(og.home)
+                or _doubles_hint_in_text(og.away)
+                or _doubles_hint_in_text(raw_title)
+                or _gamma_event_doubles_signal(ev)
+            ):
+                continue
+            out.append(og)
+        return out
+
     async def _fetch_open_polymarket_sports(self, session: aiohttp.ClientSession) -> list[OpenPolymarketGame]:
         now = time.monotonic()
         ttl = self._discovery_fetch_ttl_sec()
@@ -1408,65 +1517,28 @@ class LatencyArbSportsStrategy(ArbStrategy):
         games: list[OpenPolymarketGame] = []
         seen_discovery: set[tuple[str, Any]] = set()
 
-        for poly_slug in self.poly_slugs:
-            odds_key = POLY_SLUG_TO_ODDS_KEY.get(poly_slug)
-            if odds_key is None:
-                continue
-            series_id = self._poly_series_by_slug.get(poly_slug)
-            if not series_id:
-                continue
-            url = f"{GAMMA_API_URL}/events"
-            params: dict[str, str | int] = {
-                "series_id": int(series_id) if str(series_id).isdigit() else series_id,
-                "active": "true",
-                "closed": "false",
-                "limit": 200,
-                "order": "createdAt",
-                "ascending": "false",
-            }
-            try:
-                async with session.get(url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)) as resp:
-                    text = await resp.text()
-                    if resp.status != 200:
-                        log.warning("[latency_arb_sports] Gamma /events series=%s HTTP %s", series_id, resp.status)
+        slug_coros = [self._gamma_open_games_for_slug(session, poly_slug) for poly_slug in self.poly_slugs]
+        if slug_coros:
+            results = await asyncio.gather(*slug_coros, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    log.warning("[latency_arb_sports] Gamma /events slug task error: %s", res)
+                    continue
+                for og in res:
+                    dedupe_str = (og.slug or og.condition_id or "").strip()
+                    if dedupe_str:
+                        dk: tuple[str, Any] = ("s", dedupe_str)
+                    else:
+                        dk = (
+                            "s",
+                            frozenset(
+                                (normalize_name_order(og.home), normalize_name_order(og.away))
+                            ),
+                        )
+                    if dk in seen_discovery:
                         continue
-                    evs = json.loads(text)
-            except (json.JSONDecodeError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-                log.warning("[latency_arb_sports] Gamma /events series=%s error: %s", series_id, e)
-                continue
-            if not isinstance(evs, list):
-                continue
-            for ev in evs:
-                if not isinstance(ev, dict):
-                    continue
-                if not _gamma_event_usable(ev):
-                    continue
-                og = _poly_event_to_open_game(ev, poly_slug)
-                if og is None:
-                    continue
-                # Por si _poly_event_to_open_game cambia: no indexar dobles.
-                raw_title = str(ev.get("title") or "")
-                if _latency_sports_skip_doubles() and (
-                    _doubles_hint_in_text(og.home)
-                    or _doubles_hint_in_text(og.away)
-                    or _doubles_hint_in_text(raw_title)
-                    or _gamma_event_doubles_signal(ev)
-                ):
-                    continue
-                dedupe_str = (og.slug or og.condition_id or "").strip()
-                if dedupe_str:
-                    dk: tuple[str, Any] = ("s", dedupe_str)
-                else:
-                    dk = (
-                        "s",
-                        frozenset(
-                            (normalize_name_order(og.home), normalize_name_order(og.away))
-                        ),
-                    )
-                if dk in seen_discovery:
-                    continue
-                seen_discovery.add(dk)
-                games.append(og)
+                    seen_discovery.add(dk)
+                    games.append(og)
 
         self._open_games = games
         self._open_games_cache_mono = now
@@ -1498,7 +1570,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             return None
         now = time.monotonic()
         cached = self._betfair_gamma_search_cache.get(eid)
-        if cached is not None and now - cached[0] < self._betfair_gamma_search_ttl:
+        if cached is not None and now - cached[0] < self._betfair_gamma_search_ttl_eff():
             self._cycle_public_search_cache_hits += 1
             return cached[1]
 
@@ -1588,6 +1660,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         if clear_p.is_file():
             try:
                 self._odds_client._event_meta_cache.clear()
+                self._odds_client._event_meta_negative.clear()
                 log.info("[latency_arb_sports] odds_event_meta_cache en memoria vaciada (admin clear-meta-cache)")
             finally:
                 try:
@@ -1607,6 +1680,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             self._cycle_public_search_http = 0
             self._cycle_public_search_cache_hits = 0
             open_games = await self._fetch_open_polymarket_sports(sess)
+            await clob.ensure_market_ws_subscription(_poly_token_ids_from_open_games(open_games))
             if seq == 1 and not self._cache_debug_done:
                 self._cache_debug_done = True
                 odds_key = POLY_SLUG_TO_ODDS_KEY.get("atp", "atp")
@@ -1617,54 +1691,101 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     len(cached),
                     list(self._odds_client._ws_odds_cache.keys())[:3],
                 )
-            odds_keys_loaded: set[str] = set()
+            odds_events_by_key: dict[str, list[OddsEvent]] = {}
+            keys_order: list[str] = []
+            for g in open_games:
+                ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
+                if ok and ok not in keys_order:
+                    keys_order.append(ok)
+            if keys_order:
+                pick_idx = self._rest_rr_index % len(keys_order)
+                self._rest_rr_index = (self._rest_rr_index + 1) % 10_000
+                pick_key = keys_order[pick_idx]
+                sample_g = next(gg for gg in open_games if POLY_SLUG_TO_ODDS_KEY.get(gg.sport_slug) == pick_key)
+                poly_k = _client_poly_key_for_odds_io(pick_key, sample_g.sport_slug)
+                io_s = poly_odds_key_to_io_sport(poly_k)
+                ws_nonempty = bool(
+                    io_s and self._odds_client.ws_enabled and self._odds_client.has_ws_odds_for_io_sport(io_s)
+                )
+                if not ws_nonempty:
+                    await self._odds_client.refresh_rest_cache(sess, poly_k)
+            for g in open_games:
+                ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
+                if not ok:
+                    continue
+                pk = _client_poly_key_for_odds_io(ok, g.sport_slug)
+                odds_events_by_key[ok] = self._odds_client.get_cached_odds(pk)
+            odds_keys_loaded = {k for k, evs in odds_events_by_key.items() if evs}
             reference_matched = 0
             csv_rows = 0
-            odds_events_by_key: dict[str, list[OddsEvent]] = {}
             processed_condition_ids: set[str] = set()
+            match_sem = asyncio.Semaphore(int(_HARDCODE_MATCH_PARALLELISM))
+            processed_lock = asyncio.Lock()
 
-            if self._odds_client.ws_enabled:
-                for odds_ev in _flatten_ws_odds_best_per_event(self._odds_client):
+            async def _process_bf_row(odds_ev: OddsEvent) -> tuple[int, int]:
+                async with match_sem:
                     game_bf = await self._resolve_open_game_betfair_public_search(sess, odds_ev)
                     if game_bf is None:
-                        continue
+                        return (0, 0)
                     cid_bf = (game_bf.condition_id or "").strip()
-                    if not cid_bf or cid_bf in processed_condition_ids:
-                        continue
                     odds_key_bf = POLY_SLUG_TO_ODDS_KEY.get(game_bf.sport_slug)
                     if odds_key_bf is None:
-                        continue
-                    reference_matched += 1
-                    processed_condition_ids.add(cid_bf)
+                        return (0, 0)
+                    async with processed_lock:
+                        if not cid_bf or cid_bf in processed_condition_ids:
+                            return (0, 0)
+                        processed_condition_ids.add(cid_bf)
                     st_bf = await self._process_matched_poly_odds(sess, clob, game_bf, odds_key_bf, odds_ev)
-                    csv_rows += st_bf["csv_rows"]
+                    return (1, st_bf["csv_rows"])
 
-            for game in open_games:
-                cid_g = (game.condition_id or "").strip()
-                if cid_g and cid_g in processed_condition_ids:
-                    continue
-                odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug)
-                if odds_key is None:
-                    continue
-                if odds_key not in odds_events_by_key:
-                    # Con WS activo igual hace falta REST para deportes fuera de la suscripción WS
-                    # (p. ej. NBA); odds_api_io prioriza ticks WS y cae a _rest_cache si está vacío.
-                    await self._odds_client.refresh_rest_cache(
-                        sess, _client_poly_key_for_odds_io(odds_key, game.sport_slug)
+            async def _process_og_row(game: OpenPolymarketGame) -> tuple[int, int]:
+                async with match_sem:
+                    cid_g = (game.condition_id or "").strip()
+                    async with processed_lock:
+                        if cid_g and cid_g in processed_condition_ids:
+                            return (0, 0)
+                    odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug)
+                    if odds_key is None:
+                        return (0, 0)
+                    events_list = odds_events_by_key.get(odds_key) or []
+                    odds_ev = find_event_matching_teams(events_list, game.home, game.away)
+                    if odds_ev is None:
+                        return (0, 0)
+                    async with processed_lock:
+                        if cid_g and cid_g in processed_condition_ids:
+                            return (0, 0)
+                        if cid_g:
+                            processed_condition_ids.add(cid_g)
+                    st = await self._process_matched_poly_odds(sess, clob, game, odds_key, odds_ev)
+                    return (1, st["csv_rows"])
+
+            if self._odds_client.ws_enabled:
+                bf_events = list(_flatten_ws_odds_best_per_event(self._odds_client))
+                if bf_events:
+                    bf_results = await asyncio.gather(
+                        *(_process_bf_row(ev) for ev in bf_events),
+                        return_exceptions=True,
                     )
-                    odds_events_by_key[odds_key] = self._odds_client.get_cached_odds(
-                        _client_poly_key_for_odds_io(odds_key, game.sport_slug)
-                    )
-                    odds_keys_loaded.add(odds_key)
-                events_list = odds_events_by_key.get(odds_key) or []
-                odds_ev = find_event_matching_teams(events_list, game.home, game.away)
-                if odds_ev is None:
-                    continue
-                reference_matched += 1
-                if cid_g:
-                    processed_condition_ids.add(cid_g)
-                st = await self._process_matched_poly_odds(sess, clob, game, odds_key, odds_ev)
-                csv_rows += st["csv_rows"]
+                    for r in bf_results:
+                        if isinstance(r, Exception):
+                            log.warning("[latency_arb_sports] betfair-first row error: %s", r)
+                            continue
+                        ref_i, csv_i = r
+                        reference_matched += ref_i
+                        csv_rows += csv_i
+
+            if open_games:
+                og_results = await asyncio.gather(
+                    *(_process_og_row(g) for g in open_games),
+                    return_exceptions=True,
+                )
+                for r in og_results:
+                    if isinstance(r, Exception):
+                        log.warning("[latency_arb_sports] open_games row error: %s", r)
+                        continue
+                    ref_i, csv_i = r
+                    reference_matched += ref_i
+                    csv_rows += csv_i
 
             if (
                 not self._ref_debug_done
@@ -1769,6 +1890,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
         odds_event: OddsEvent,
     ) -> dict[str, int]:
         acc = {"csv_rows": 0}
+        if _is_pre_game_listing_game(game):
+            return acc
+        if _is_reference_lag_over_limit(odds_event) or _is_reference_stale_for_io(odds_event):
+            return acc
         tw = _align_odds_io_to_game(odds_event, game)
         if tw is None:
             return acc
@@ -1782,6 +1907,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         _mset_snap, mscr_live = self._ws_snapshot_match_fields(game)
 
         async def _resolve_mid(tid: str) -> Optional[float]:
+            cm = clob.get_cached_mid(tid)
+            if cm is not None:
+                return float(cm)
             m = await clob.get_midpoint(tid)
             if m is not None:
                 return float(m)
@@ -1973,6 +2101,41 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 base_key = (token_id or "unknown")[:32]
             sig_key = f"{base_key}_{side_label}"
             now_mono = time.monotonic()
+            cid_live = (game.condition_id or "").strip()
+            if cid_live:
+                prev_opp = self._condition_signal_recent.get(cid_live)
+                if prev_opp is not None:
+                    prev_side, prev_mono = prev_opp
+                    if (
+                        prev_side != side_label
+                        and (now_mono - prev_mono) < float(_HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC)
+                    ):
+                        ex = await self._enrich_signal_csv_fields(
+                            clob, token_id, float(mid), odds_event, mscr_live
+                        )
+                        await self.log_signal_async(
+                            {
+                                "action": "SKIP:OPPOSITE_DEDUPE",
+                                "reason": (
+                                    f"recent_signal_side={prev_side}_this_side={side_label}_"
+                                    f"window_s={_HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC:.0f}"
+                                ),
+                                "game_slug": g.slug,
+                                "league": g.league,
+                                "home_team": odds_home,
+                                "away_team": odds_away,
+                                "side": side_label,
+                                "token_id": token_id,
+                                "price_poly": f"{mid:.6f}",
+                                "prob_pinnacle": f"{p_fair:.6f}",
+                                "edge": f"{edge_mag:.6f}",
+                                "size_usdc": "0",
+                                "status": "SKIP",
+                                **ex,
+                            }
+                        )
+                        acc["csv_rows"] += 1
+                        continue
             prev_p = self._last_signal_price.get(sig_key)
             prev_t = self._last_signal_mono.get(sig_key)
             if prev_p is not None and prev_t is not None:
@@ -2044,5 +2207,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
             )
             self._last_signal_price[sig_key] = float(mid)
             self._last_signal_mono[sig_key] = now_mono
+            if cid_live:
+                self._condition_signal_recent[cid_live] = (side_label, now_mono)
+                if len(self._condition_signal_recent) > 800:
+                    cutoff = now_mono - float(_HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC) * 4
+                    self._condition_signal_recent = {
+                        k: v
+                        for k, v in self._condition_signal_recent.items()
+                        if v[1] >= cutoff
+                    }
             acc["csv_rows"] += 1
         return acc

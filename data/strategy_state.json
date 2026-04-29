@@ -64,9 +64,9 @@
     "enabled_at": "2026-04-29T17:17:37.317505+00:00",
     "disabled_at": "2026-04-29T17:17:33.669140+00:00",
     "fict_capital_eur": 1000.0,
-    "fict_pnl_cumulative_eur": 0.0,
-    "fict_trades": 0,
-    "fict_last_stake_eur": null,
-    "fict_last_pnl_est_eur": null
+    "fict_pnl_cumulative_eur": 108.64613999999999,
+    "fict_trades": 137,
+    "fict_last_stake_eur": 10.0,
+    "fict_last_pnl_est_eur": 0.13718
   }
 }

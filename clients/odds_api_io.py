@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,7 @@ log = logging.getLogger("odds_api_io")
 # Valores embebidos (p. ej. Railway sin env). `os.getenv("ODDS_API_IO_*")` sigue pudiendo sobreescribir en local.
 ODDS_API_IO_KEY_EMBEDDED = "647c2e8972c62f827b54f98b759982ea2b6d891be25b49c2a746a6f1ed4dd360"
 ODDS_API_IO_WS_EMBEDDED = True
-ODDS_API_IO_CACHE_TTL_EMBEDDED = 60
+ODDS_API_IO_CACHE_TTL_EMBEDDED = 300
 # Alineado con el tier típico de la clave (máx. 2 bookies: Betfair + Polymarket). Sharp Exchange → 403 en /odds/multi.
 ODDS_API_IO_BOOKMAKERS_EMBEDDED = "Betfair Exchange,Polymarket"
 ODDS_API_IO_MARKETS_EMBEDDED = "ML"
@@ -100,6 +101,11 @@ ODDS_KEY_TO_IO_SPORT = {
 _WS_BACKOFF_SEC = (2, 4, 8, 16, 30)
 # Tope de eventos por deporte en REST (evita decenas de GET /odds/multi por ciclo en tenis/fútbol).
 _ODDS_IO_REST_MAX_EVENT_IDS = 100
+# Máx. GET /events/{id} por ventana de 60s (meta WS) para no quemar cupo.
+_ODDS_IO_META_FETCH_PER_60S = 12
+_EVENT_META_NEGATIVE_TTL_404_SEC = 600.0
+_EVENT_META_NEGATIVE_TTL_429_SEC = 300.0
+_META_DISK_DEBOUNCE_SEC = 30.0
 
 
 def _event_meta_disk_path() -> Path:
@@ -360,6 +366,10 @@ class OddsApiIo:
         self._raw_logged = False
         # Tras 403/429 REST no reintentar en bucle (mata el gather del arb_engine).
         self._rest_backoff_until: float = 0.0
+        # event_id -> no reintentar GET /events/{id} hasta este monotonic (404/429/transitorio).
+        self._event_meta_negative: dict[str, float] = {}
+        self._meta_fetch_times: deque[float] = deque(maxlen=128)
+        self._meta_disk_lt_handle: Optional[asyncio.TimerHandle] = None
 
     def start_ws_stream(self, sports: list[str]) -> None:
         if not self.ws_enabled:
@@ -402,6 +412,10 @@ class OddsApiIo:
             return []
         return list(events)
 
+    def has_ws_odds_for_io_sport(self, io_sport: str) -> bool:
+        """True si hay al menos un tick WS en caché para el slug IO (p. ej. tennis)."""
+        return len(self._flatten_ws_cache_io_sport(str(io_sport or "").strip().lower())) > 0
+
     def _flatten_ws_cache_io_sport(self, sport_slug: str) -> list[OddsEvent]:
         sl = sport_slug.strip().casefold()
         acc: list[OddsEvent] = []
@@ -424,6 +438,37 @@ class OddsApiIo:
         async with self._lock:
             snap = {str(k): dict(v) for k, v in self._event_meta_cache.items()}
         await asyncio.to_thread(_save_event_meta_disk_cache, snap)
+
+    def _schedule_debounced_meta_disk(self) -> None:
+        """Una escritura a disco ~30s tras el último cambio de meta (no cada GET)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        h = self._meta_disk_lt_handle
+        if h is not None and not h.cancelled():
+            h.cancel()
+
+        async def _flush() -> None:
+            try:
+                await self._persist_event_meta_disk()
+            except OSError as e:
+                log.warning("[odds_api_io] debounced meta disk persist: %s", e)
+
+        def _fire() -> None:
+            self._meta_disk_lt_handle = None
+            loop.create_task(_flush())
+
+        self._meta_disk_lt_handle = loop.call_later(_META_DISK_DEBOUNCE_SEC, _fire)
+
+    def _meta_rate_limit_pop_old(self) -> None:
+        now = time.monotonic()
+        while self._meta_fetch_times and now - self._meta_fetch_times[0] > 60.0:
+            self._meta_fetch_times.popleft()
+
+    def _meta_rate_limit_allows(self) -> bool:
+        self._meta_rate_limit_pop_old()
+        return len(self._meta_fetch_times) < _ODDS_IO_META_FETCH_PER_60S
 
     async def refresh_rest_cache(self, session: aiohttp.ClientSession, poly_sport: str) -> None:
         io_sport = poly_odds_key_to_io_sport(poly_sport)
@@ -517,24 +562,54 @@ class OddsApiIo:
         if not event_id:
             return out
         try:
+            now_mono = time.monotonic()
+            if now_mono < self._rest_backoff_until:
+                return out
+            neg_until = self._event_meta_negative.get(event_id)
+            if neg_until is not None and now_mono < neg_until:
+                return out
             async with self._lock:
                 cached = self._event_meta_cache.get(event_id)
             if cached is not None and _event_meta_has_io_sport(cached):
                 return dict(cached)
+            if not self._meta_rate_limit_allows():
+                log.debug("[odds_api_io] event meta rate-limit skip id=%s", event_id)
+                return out
+            self._meta_fetch_times.append(time.monotonic())
             url = f"{BASE_REST}/events/{event_id}"
             params = {"apiKey": self.api_key}
-            async with session.get(
-                url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    if resp.status == 404:
-                        log.debug("[odds_api_io] GET /events/%s HTTP 404", event_id)
+            try:
+                async with session.get(
+                    url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        if resp.status == 404:
+                            log.debug("[odds_api_io] GET /events/%s HTTP 404", event_id)
+                            self._event_meta_negative[event_id] = (
+                                time.monotonic() + _EVENT_META_NEGATIVE_TTL_404_SEC
+                            )
+                            return out
+                        if resp.status in (401, 403, 429):
+                            log.warning(
+                                "[odds_api_io] GET /events/%s HTTP %s — backoff REST compartido, WS sigue.",
+                                event_id,
+                                resp.status,
+                            )
+                            self._rest_backoff_until = time.monotonic() + 3600.0
+                            self._event_meta_negative[event_id] = (
+                                time.monotonic() + _EVENT_META_NEGATIVE_TTL_429_SEC
+                            )
+                            return out
+                        log.debug("[odds_api_io] GET /events/%s HTTP %s", event_id, resp.status)
+                        self._event_meta_negative[event_id] = time.monotonic() + 120.0
                         return out
-                    _raise_if_rest_quota_error(resp.status, text, f"GET /events/{event_id}")
-                    log.debug("[odds_api_io] GET /events/%s HTTP %s", event_id, resp.status)
-                    return out
-                raw = json.loads(text)
+                    raw = json.loads(text)
+            except OddsApiIoRestQuotaError as e:
+                log.warning("[odds_api_io] event meta quota id=%s: %s", event_id, e)
+                self._rest_backoff_until = time.monotonic() + 3600.0
+                self._event_meta_negative[event_id] = time.monotonic() + _EVENT_META_NEGATIVE_TTL_429_SEC
+                return out
             if not isinstance(raw, dict):
                 return out
             home_raw = str(raw.get("home") or raw.get("home_team") or "").strip()
@@ -549,6 +624,7 @@ class OddsApiIo:
             out = {"home": home, "away": away, "sport": sport_slug}
             async with self._lock:
                 self._event_meta_cache[event_id] = out
+                self._event_meta_negative.pop(event_id, None)
                 # WS a veces manda "updated" sin sport/home/away; el filtro por io_sport
                 # descartaba esos OddsEvent hasta el siguiente tick. Rellenar caché en vivo.
                 by_bk = self._ws_odds_cache.get(event_id)
@@ -560,12 +636,16 @@ class OddsApiIo:
                             ev.home = home
                         if not (ev.away or "").strip() and away:
                             ev.away = away
-            await self._persist_event_meta_disk()
+            self._schedule_debounced_meta_disk()
             return dict(out)
-        except OddsApiIoRestQuotaError:
-            raise
+        except OddsApiIoRestQuotaError as e:
+            log.warning("[odds_api_io] event meta outer quota id=%s: %s", event_id, e)
+            self._rest_backoff_until = time.monotonic() + 3600.0
+            self._event_meta_negative[event_id] = time.monotonic() + _EVENT_META_NEGATIVE_TTL_429_SEC
+            return out
         except Exception as e:
             log.warning("[odds_api_io] event meta id=%s: %s", event_id, e)
+            self._event_meta_negative[event_id] = time.monotonic() + 90.0
             return out
         finally:
             async with self._lock:
@@ -580,9 +660,16 @@ class OddsApiIo:
                 await self._ws_once(sport_param)
             except asyncio.CancelledError:
                 raise
-            except OddsApiIoRestQuotaError:
-                log.error("[odds_api_io] REST odds-api.io en error de cuota/auth; no se reintenta el WS.")
-                raise
+            except OddsApiIoRestQuotaError as e:
+                log.warning(
+                    "[odds_api_io] WS ciclo: cuota/auth REST (%s); reintento tras pausa sin tumbar el proceso.",
+                    e,
+                )
+                try:
+                    await asyncio.wait_for(self._ws_cancel.wait(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    pass
+                continue
             except Exception as e:
                 attempt += 1
                 delay = _WS_BACKOFF_SEC[min(backoff_i, len(_WS_BACKOFF_SEC) - 1)]
