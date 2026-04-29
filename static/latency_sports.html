@@ -22,7 +22,7 @@
       <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
         <div>
           <h1 class="text-2xl font-bold text-white tracking-tight">Latency Arb — Sports</h1>
-          <p class="text-sm text-slate-400 mt-1">Pinnacle (The Odds API) vs CLOB Polymarket · paper / CSV</p>
+          <p class="text-sm text-slate-400 mt-1">odds-api.io vs CLOB Polymarket · CSV en DATA_DIR/logs (ver data_dir en /api/arb/status)</p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <span id="dry-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">DRY_RUN</span>
@@ -38,7 +38,7 @@
       </div>
     </header>
 
-    <section class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-7 gap-2 md:gap-3">
+    <section class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-9 gap-2 md:gap-3">
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase">Estrategia</p>
         <div class="mt-2 flex items-center gap-2">
@@ -73,9 +73,19 @@
         <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">odds-api.io</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
-        <p class="text-xs text-slate-500 uppercase leading-tight">Reference matched</p>
+        <p class="text-xs text-slate-500 uppercase leading-tight">Alineados Poly↔odds</p>
         <p id="k-ref-matched" class="font-mono text-base md:text-lg text-cyan-300/90 mt-1">—</p>
-        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">último ciclo</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">tokens + cuotas IO</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
+        <p class="text-xs text-slate-500 uppercase leading-tight">Pipeline (últ. ciclo)</p>
+        <p id="k-pipeline" class="font-mono text-base md:text-lg text-slate-200 mt-1">—</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">entradas a evaluar CLOB</p>
+      </div>
+      <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
+        <p class="text-xs text-slate-500 uppercase leading-tight">Filas CSV (últ. ciclo)</p>
+        <p id="k-csv-cycle" class="font-mono text-base md:text-lg text-emerald-300/90 mt-1">—</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">señales + SKIP</p>
       </div>
     </section>
 
@@ -113,7 +123,8 @@
         <h2 class="text-sm font-medium text-slate-300">Últimas 100 filas CSV</h2>
         <div class="flex flex-wrap items-center gap-2">
           <a href="/api/arb/strategy/latency_arb_sports/csv-download" download="latency_arb_sports.csv"
-            class="text-xs px-2 py-1 border border-emerald-800 text-emerald-300 rounded hover:bg-emerald-950/40">Descargar CSV completo</a>
+            class="text-xs px-2 py-1 border border-emerald-800 text-emerald-300 rounded hover:bg-emerald-950/40"
+            title="Mismo archivo que escribe arb_engine bajo DATA_DIR/logs/latency_arb_sports.csv">Descargar CSV completo</a>
           <a href="/api/arb/strategy/latency_arb_sports/snapshots-csv-download" download="latency_arb_sports_snapshots.csv"
             class="text-xs px-2 py-1 border border-cyan-800 text-cyan-300 rounded hover:bg-cyan-950/40">Descargar snapshots CSV</a>
           <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
@@ -240,6 +251,10 @@
       document.getElementById("k-open-poly").textContent = s.open_poly_games != null ? String(s.open_poly_games) : "—";
       document.getElementById("k-ws-cache").textContent = s.ws_cache_size != null ? String(s.ws_cache_size) : "—";
       document.getElementById("k-ref-matched").textContent = s.reference_matched != null ? String(s.reference_matched) : "—";
+      document.getElementById("k-pipeline").textContent =
+        s.pipeline_entered_last_cycle != null ? String(s.pipeline_entered_last_cycle) : "—";
+      document.getElementById("k-csv-cycle").textContent =
+        s.csv_rows_last_cycle != null ? String(s.csv_rows_last_cycle) : "—";
       const btn = document.getElementById("btn-toggle");
       const knob = document.getElementById("toggle-knob");
       btn.className =

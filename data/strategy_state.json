@@ -2,7 +2,7 @@
   "bundle_arb": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-04-29T17:17:33.669140+00:00",
+    "disabled_at": "2026-04-29T20:23:11.768403+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -12,7 +12,7 @@
   "cross_exchange": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-04-29T17:17:33.669140+00:00",
+    "disabled_at": "2026-04-29T20:23:11.768403+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -22,7 +22,7 @@
   "market_maker": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-04-29T17:17:33.669140+00:00",
+    "disabled_at": "2026-04-29T20:23:11.768403+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -32,7 +32,7 @@
   "combinatorial_arb": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-04-29T17:17:33.669140+00:00",
+    "disabled_at": "2026-04-29T20:23:11.768403+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -42,7 +42,7 @@
   "term_structure": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-04-29T17:17:33.669140+00:00",
+    "disabled_at": "2026-04-29T20:23:11.768403+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -52,7 +52,7 @@
   "latency_arb": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-04-29T17:17:33.669140+00:00",
+    "disabled_at": "2026-04-29T20:23:11.768403+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -61,12 +61,12 @@
   },
   "latency_arb_sports": {
     "enabled": true,
-    "enabled_at": "2026-04-29T17:17:37.317505+00:00",
-    "disabled_at": "2026-04-29T17:17:33.669140+00:00",
+    "enabled_at": "2026-04-29T20:23:29.781792+00:00",
+    "disabled_at": "2026-04-29T20:23:11.768403+00:00",
     "fict_capital_eur": 1000.0,
-    "fict_pnl_cumulative_eur": 108.64613999999999,
-    "fict_trades": 137,
-    "fict_last_stake_eur": 10.0,
-    "fict_last_pnl_est_eur": 0.13718
+    "fict_pnl_cumulative_eur": 0.0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
   }
 }

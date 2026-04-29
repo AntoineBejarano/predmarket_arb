@@ -847,6 +847,9 @@ async def arb_status() -> JSONResponse:
             if m:
                 row["open_poly_games"] = m.get("open_poly_games")
                 row["reference_matched"] = m.get("reference_matched")
+                row["reference_aligned_last_cycle"] = m.get("reference_aligned_last_cycle")
+                row["pipeline_entered_last_cycle"] = m.get("pipeline_entered_last_cycle")
+                row["csv_rows_last_cycle"] = m.get("csv_rows_last_cycle")
                 row["ws_cache_size"] = m.get("ws_cache_size")
                 row["cycle_metrics_updated_at"] = m.get("updated_at")
         strategies.append(row)

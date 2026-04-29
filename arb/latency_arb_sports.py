@@ -1296,7 +1296,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
         except Exception as e:
             log.warning("[latency_arb_sports] snapshot csv append: %s", e)
 
-    def _write_cycle_metrics_json(self, open_poly_games: int, reference_matched: int, ws_cache_size: int) -> None:
+    def _write_cycle_metrics_json(
+        self,
+        open_poly_games: int,
+        reference_aligned: int,
+        csv_rows_last_cycle: int,
+        ws_cache_size: int,
+        pipeline_entered: int,
+    ) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
             from lab.paths import data_dir
@@ -1305,7 +1312,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "open_poly_games": int(open_poly_games),
-                "reference_matched": int(reference_matched),
+                # ``reference_matched`` = Poly↔odds alineados con tokens CLOB (no confundir con “intentos de pipeline”).
+                "reference_matched": int(reference_aligned),
+                "reference_aligned_last_cycle": int(reference_aligned),
+                "pipeline_entered_last_cycle": int(pipeline_entered),
+                "csv_rows_last_cycle": int(csv_rows_last_cycle),
                 "ws_cache_size": int(ws_cache_size),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -1770,6 +1781,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
             odds_events_by_key: dict[str, list[OddsEvent]] = {}
             keys_order: list[str] = []
+            pipeline_entered = 0
+            reference_aligned = 0
+            csv_rows = 0
             for g in open_games:
                 ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
                 if ok and ok not in keys_order:
@@ -1793,48 +1807,55 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 pk = _client_poly_key_for_odds_io(ok, g.sport_slug)
                 odds_events_by_key[ok] = self._odds_client.get_cached_odds(pk)
             odds_keys_loaded = {k for k, evs in odds_events_by_key.items() if evs}
-            reference_matched = 0
-            csv_rows = 0
             processed_condition_ids: set[str] = set()
             match_sem = asyncio.Semaphore(int(_HARDCODE_MATCH_PARALLELISM))
             processed_lock = asyncio.Lock()
 
-            async def _process_bf_row(odds_ev: OddsEvent) -> tuple[int, int]:
+            async def _process_bf_row(odds_ev: OddsEvent) -> tuple[int, int, int]:
+                """(pipeline_entered, reference_aligned, csv_rows) por partido."""
                 async with match_sem:
                     game_bf = await self._resolve_open_game_betfair_public_search(sess, odds_ev)
                     if game_bf is None:
-                        return (0, 0)
+                        return (0, 0, 0)
                     cid_bf = (game_bf.condition_id or "").strip()
                     odds_key_bf = POLY_SLUG_TO_ODDS_KEY.get(game_bf.sport_slug)
                     if odds_key_bf is None:
-                        return (0, 0)
+                        return (0, 0, 0)
                     async with processed_lock:
                         if not cid_bf or cid_bf in processed_condition_ids:
-                            return (0, 0)
+                            return (0, 0, 0)
                         processed_condition_ids.add(cid_bf)
                     st_bf = await self._process_matched_poly_odds(sess, clob, game_bf, odds_key_bf, odds_ev)
-                    return (1, st_bf["csv_rows"])
+                    return (
+                        1,
+                        int(st_bf.get("reference_aligned", 0)),
+                        int(st_bf.get("csv_rows", 0)),
+                    )
 
-            async def _process_og_row(game: OpenPolymarketGame) -> tuple[int, int]:
+            async def _process_og_row(game: OpenPolymarketGame) -> tuple[int, int, int]:
                 async with match_sem:
                     cid_g = (game.condition_id or "").strip()
                     async with processed_lock:
                         if cid_g and cid_g in processed_condition_ids:
-                            return (0, 0)
+                            return (0, 0, 0)
                     odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug)
                     if odds_key is None:
-                        return (0, 0)
+                        return (0, 0, 0)
                     events_list = odds_events_by_key.get(odds_key) or []
                     odds_ev = find_event_matching_teams(events_list, game.home, game.away)
                     if odds_ev is None:
-                        return (0, 0)
+                        return (0, 0, 0)
                     async with processed_lock:
                         if cid_g and cid_g in processed_condition_ids:
-                            return (0, 0)
+                            return (0, 0, 0)
                         if cid_g:
                             processed_condition_ids.add(cid_g)
                     st = await self._process_matched_poly_odds(sess, clob, game, odds_key, odds_ev)
-                    return (1, st["csv_rows"])
+                    return (
+                        1,
+                        int(st.get("reference_aligned", 0)),
+                        int(st.get("csv_rows", 0)),
+                    )
 
             if self._odds_client.ws_enabled:
                 bf_events = list(_flatten_ws_odds_best_per_event(self._odds_client))
@@ -1847,8 +1868,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         if isinstance(r, Exception):
                             log.warning("[latency_arb_sports] betfair-first row error: %s", r)
                             continue
-                        ref_i, csv_i = r
-                        reference_matched += ref_i
+                        ent_i, ali_i, csv_i = r
+                        pipeline_entered += ent_i
+                        reference_aligned += ali_i
                         csv_rows += csv_i
 
             if open_games:
@@ -1860,8 +1882,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     if isinstance(r, Exception):
                         log.warning("[latency_arb_sports] open_games row error: %s", r)
                         continue
-                    ref_i, csv_i = r
-                    reference_matched += ref_i
+                    ent_i, ali_i, csv_i = r
+                    pipeline_entered += ent_i
+                    reference_aligned += ali_i
                     csv_rows += csv_i
 
             if (
@@ -1887,7 +1910,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge_exec=%.4f max_stake=%.2f "
-                "open_poly_games=%s odds_io_keys=%s reference_matched=%s csv_rows=%s "
+                "open_poly_games=%s odds_io_keys=%s pipeline_entered=%s reference_aligned=%s csv_rows=%s "
                 "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_cache_size=%s "
                 "public_search_http=%s public_search_cache_hits=%s",
                 seq,
@@ -1896,7 +1919,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self.max_stake,
                 len(open_games),
                 len(odds_keys_loaded),
-                reference_matched,
+                pipeline_entered,
+                reference_aligned,
                 csv_rows,
                 self._discovery_fetch_ttl_sec(),
                 self._is_in_active_window(open_games),
@@ -1905,7 +1929,13 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self._cycle_public_search_http,
                 self._cycle_public_search_cache_hits,
             )
-            self._write_cycle_metrics_json(len(open_games), reference_matched, len(self._odds_client._ws_odds_cache))
+            self._write_cycle_metrics_json(
+                len(open_games),
+                reference_aligned,
+                csv_rows,
+                len(self._odds_client._ws_odds_cache),
+                pipeline_entered,
+            )
             await self._drain_poly_followups(clob)
 
     async def _enrich_signal_csv_fields(
@@ -1995,7 +2025,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         odds_sport_key: str,
         odds_event: OddsEvent,
     ) -> dict[str, int]:
-        acc = {"csv_rows": 0}
+        acc: dict[str, int] = {"csv_rows": 0, "reference_aligned": 0}
         if _is_pre_game_listing_game(game):
             return acc
         if _is_reference_lag_over_limit(odds_event) or _is_reference_stale_for_io(odds_event):
@@ -2010,6 +2040,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         tok_h, tok_a = _map_outcomes_to_tokens(g, odds_home, odds_away)
         if not tok_h or not tok_a:
             return acc
+        acc["reference_aligned"] = 1
         _mset_snap, mscr_live = self._ws_snapshot_match_fields(game)
 
         async def _resolve_mid(tid: str) -> Optional[float]:
@@ -2114,6 +2145,43 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "latency_ms_ref_to_clob": latency_ms_ref_to_clob,
                 }
             )
+
+        if not legs:
+            sid0 = str(uuid.uuid4())
+            ex0 = await self._enrich_signal_csv_fields(
+                clob,
+                tok_h,
+                0.5,
+                odds_event,
+                mscr_live,
+                signal_id=sid0,
+                edge_mid=None,
+                spread=None,
+                latency_ms_ref_to_clob=latency_ms_ref_to_clob,
+            )
+            await self.log_signal_async(
+                {
+                    "action": "SKIP:CLOB_NO_MID",
+                    "reason": "poly_odds_aligned_but_no_clob_mid_yes_no_check_ws_subscription",
+                    "game_slug": g.slug,
+                    "league": g.league,
+                    "home_team": odds_home,
+                    "away_team": odds_away,
+                    "side": "",
+                    "token_id": f"{tok_h}|{tok_a}",
+                    "price_poly": "",
+                    "prob_pinnacle": "",
+                    "edge_mid": "",
+                    "edge_exec": "",
+                    "edge": "",
+                    "spread": "",
+                    "size_usdc": "0",
+                    "status": "SKIP",
+                    **ex0,
+                }
+            )
+            acc["csv_rows"] += 1
+            return acc
 
         # Como máximo un BUY por partido/ciclo: el mejor edge ejecutable.
         signal_side: Optional[str] = None
