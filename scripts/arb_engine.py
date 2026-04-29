@@ -106,8 +106,8 @@ async def main() -> None:
         config_lat_sports = {
             **base_cap,
             "poll_interval": float(os.getenv("LATENCY_SPORTS_POLL_INTERVAL", "5")),
-            "min_edge": float(os.getenv("LATENCY_SPORTS_MIN_EDGE", "0.03")),
-            "max_stake_usdc": float(os.getenv("LATENCY_SPORTS_MAX_STAKE_USDC", "50")),
+            "min_edge": float(os.getenv("LATENCY_SPORTS_MIN_EDGE", "0.005")),
+            "max_stake_usdc": float(os.getenv("LATENCY_SPORTS_MAX_STAKE_USDC", "10")),
         }
         strategies += [
             CombinatorialArbStrategy(config_combo, dry_run=DRY_RUN),
