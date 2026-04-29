@@ -71,6 +71,7 @@ ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SL
 BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
 LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snapshots.csv"
 LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
+ODDS_EVENT_META_CACHE_JSON = DATA_DIR / "logs" / "odds_event_meta_cache.json"
 
 
 def _read_latency_sports_cycle_metrics() -> dict[str, Any]:
@@ -418,7 +419,7 @@ app = FastAPI(title="PredMarket Arb API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -752,8 +753,34 @@ def _arb_engine_stop() -> tuple[bool, Optional[str]]:
         return True, None
 
 
+def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
+    """Borra CSV/logs auxiliares del motor Arb bajo DATA_DIR (no toca strategy_state.json)."""
+    paths: list[Path] = []
+    paths.extend(ARB_CSV_PATHS.values())
+    paths.extend(
+        [
+            BUNDLE_ARB_SCAN_JSON,
+            LATENCY_ARB_SPORTS_SNAPSHOTS_CSV,
+            LATENCY_SPORTS_CYCLE_METRICS_JSON,
+            ODDS_EVENT_META_CACHE_JSON,
+        ]
+    )
+    if include_validator:
+        paths.append(SIGNALS_CSV)
+    removed: list[str] = []
+    errors: list[str] = []
+    for p in paths:
+        try:
+            if p.is_file():
+                p.unlink()
+                removed.append(str(p))
+        except OSError as e:
+            errors.append(f"{p}: {e}")
+    return {"files_removed": removed, "file_errors": errors}
+
+
 @app.get("/api/arb/status")
-async def arb_status() -> dict[str, Any]:
+async def arb_status() -> JSONResponse:
     state = await _state_manager.get_all()
     strategies: list[dict[str, Any]] = []
     for slug in STRATEGY_SLUGS:
@@ -785,11 +812,15 @@ async def arb_status() -> dict[str, Any]:
     with _arb_lock:
         if _arb_proc is not None and _arb_proc.poll() is None:
             running = True
-    return {
+    payload = {
         "engine_running": running,
         "dry_run": os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         "strategies": strategies,
     }
+    return JSONResponse(
+        content=payload,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @app.post("/api/arb/start")
@@ -808,6 +839,44 @@ async def arb_stop() -> dict[str, Any]:
     if stopped:
         return {"stopped": True}
     return JSONResponse({"stopped": False, "error": err or "not_running"}, status_code=400)
+
+
+@app.post("/api/arb/reset-data", response_model=None)
+async def arb_reset_data(
+    include_validator: bool = Query(
+        False,
+        description="Si true, también borra logs/signals.csv del validador ML",
+    ),
+) -> Union[dict[str, Any], JSONResponse]:
+    """
+    Detiene arb_engine (si lo lanzó este API), borra CSV de estrategias y artefactos
+    auxiliares (bundle scan, snapshots sports, métricas ciclo, caché odds-api),
+    resetea contadores paper y desactiva todas las estrategias (no arranca el motor).
+    """
+    try:
+        engine_stopped_here, _ = await asyncio.to_thread(_arb_engine_stop)
+        file_result = await asyncio.to_thread(_arb_delete_data_files, include_validator)
+        await _state_manager.reset_fictional_paper()
+        await _state_manager.disable_all_strategies()
+        log.info(
+            "POST /api/arb/reset-data include_validator=%s engine_stopped=%s removed=%s",
+            include_validator,
+            engine_stopped_here,
+            len(file_result.get("files_removed") or []),
+        )
+        return {
+            "ok": True,
+            "engine_stopped_by_reset": engine_stopped_here,
+            "strategies_disabled": True,
+            "include_validator": include_validator,
+            **file_result,
+        }
+    except Exception as e:
+        log.exception("POST /api/arb/reset-data failed: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(e), "ok": False},
+        )
 
 
 @app.post("/api/arb/strategy/{slug}/enable")

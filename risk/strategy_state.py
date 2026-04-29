@@ -127,10 +127,38 @@ class StrategyStateManager:
                 self._state[slug]["disabled_at"] = datetime.now(timezone.utc).isoformat()
                 self._save()
 
+    async def disable_all_strategies(self) -> None:
+        """Apaga el interruptor de todas las estrategias (un solo guardado en disco)."""
+        async with self._lock:
+            self._reload_if_file()
+            now = datetime.now(timezone.utc).isoformat()
+            defaults = self._default_state()
+            for slug in _SLUGS:
+                if slug not in self._state:
+                    self._state[slug] = defaults[slug]
+                self._state[slug]["enabled"] = False
+                self._state[slug]["disabled_at"] = now
+            self._save()
+
     async def get_all(self) -> dict:
         async with self._lock:
             self._reload_if_file()
             return dict(self._state)
+
+    async def reset_fictional_paper(self) -> None:
+        """Pone a cero PnL/ops paper por estrategia; conserva enabled y fict_capital_eur."""
+        async with self._lock:
+            self._reload_if_file()
+            for slug in _SLUGS:
+                ent = self._merge_entry(slug, self._state.get(slug, {}))
+                cap = float(ent.get("fict_capital_eur") or _default_fictional_capital())
+                ent["fict_capital_eur"] = cap
+                ent["fict_pnl_cumulative_eur"] = 0.0
+                ent["fict_trades"] = 0
+                ent["fict_last_stake_eur"] = None
+                ent["fict_last_pnl_est_eur"] = None
+                self._state[slug] = ent
+            self._save()
 
     async def enrich_row_with_fictional(self, slug: str, row: dict[str, Any]) -> dict[str, Any]:
         """

@@ -9,6 +9,7 @@ import os
 import time
 from datetime import datetime
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
 
@@ -16,8 +17,9 @@ import aiohttp
 from aiohttp import WSMsgType
 
 from clients.odds_api import implied_prob as _implied_prob
+from clients.odds_api import levenshtein
+from clients.odds_api import normalize_team_for_match
 from clients.odds_api import remove_vig as _remove_vig_probs
-from clients.odds_api import teams_match_odds_gamma
 
 log = logging.getLogger("odds_api_io")
 
@@ -31,6 +33,24 @@ ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis"
 
 BASE_REST = "https://api.odds-api.io/v3"
 WS_BASE = "wss://api.odds-api.io/v3/ws"
+
+
+class OddsApiIoRestQuotaError(RuntimeError):
+    """REST odds-api.io devolvió 401/403/429 (u otro fatal acordado); el motor debe parar para no seguir gastando requests."""
+
+
+def _raise_if_rest_quota_error(status: int, body: str, where: str) -> None:
+    """Plan gratuito: ~100 REST/h; el WS es ilimitado. Sin contador: si la API responde error de cuota/auth, abortar."""
+    if status not in (401, 403, 429):
+        return
+    snippet = (body or "").replace("\n", " ")[:400]
+    log.error(
+        "[odds_api_io] REST odds-api.io HTTP %s %s — deteniendo uso de REST (evitar quemar cuota). Respuesta: %s",
+        status,
+        where,
+        snippet,
+    )
+    raise OddsApiIoRestQuotaError(f"odds-api.io HTTP {status} {where}: {(body or '')[:200]}")
 
 
 def _ws_bookmakers_query_value(bookmakers_csv: str) -> str:
@@ -71,7 +91,53 @@ ODDS_KEY_TO_IO_SPORT: dict[str, str] = {
 for _odds_k, _io_slug in _POLY_ODDS_KEY_TO_IO_SPORT.items():
     ODDS_KEY_TO_IO_SPORT.setdefault(_odds_k, _io_slug)
 
+# Claves y valores en minúscula para lookup estable (REST/WS/caché).
+ODDS_KEY_TO_IO_SPORT = {
+    str(k).strip().lower(): str(v).strip().lower() for k, v in ODDS_KEY_TO_IO_SPORT.items()
+}
+
 _WS_BACKOFF_SEC = (2, 4, 8, 16, 30)
+
+
+def _event_meta_disk_path() -> Path:
+    """Misma convención que el resto del repo (DATA_DIR → logs bajo ese directorio)."""
+    return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "odds_event_meta_cache.json"
+
+
+def _load_event_meta_disk_cache(into: dict[str, dict[str, str]]) -> None:
+    path = _event_meta_disk_path()
+    if not path.is_file():
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError) as e:
+        log.warning("[odds_api_io] event meta disk cache read %s: %s", path, e)
+        return
+    if not isinstance(raw, dict):
+        return
+    n = 0
+    for k, v in raw.items():
+        eid = str(k).strip()
+        if not eid or not isinstance(v, dict):
+            continue
+        into[eid] = {
+            "home": str(v.get("home") or "").strip(),
+            "away": str(v.get("away") or "").strip(),
+            "sport": str(v.get("sport") or "").strip().lower(),
+        }
+        n += 1
+    if n:
+        log.info("[odds_api_io] event meta disk cache cargada: n=%s path=%s", n, path)
+
+
+def _save_event_meta_disk_cache(cache: dict[str, dict[str, str]]) -> None:
+    path = _event_meta_disk_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {str(k): dict(v) for k, v in cache.items()}
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as e:
+        log.warning("[odds_api_io] event meta disk cache write %s: %s", path, e)
 
 
 @dataclass
@@ -109,6 +175,35 @@ def normalize_name_order(name: str) -> str:
     return name
 
 
+_TEAM_IO_SIMILARITY_MIN = 0.6
+
+
+def _levenshtein_similarity_ratio(a: str, b: str) -> float:
+    """1.0 = iguales; 0.0 = muy distintos (dist / longitud máxima)."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    d = float(levenshtein(a, b))
+    mx = max(len(a), len(b))
+    return 1.0 - (d / mx) if mx else 0.0
+
+
+def _team_similar_for_io_pair(poly_side: str, odds_side: str) -> bool:
+    """
+    Poly vs odds-api.io: compara cadenas ya en minúscula y sin prefijos/sufijos de club
+    (normalize_team_for_match) tras orden nombre/apellido (normalize_name_order).
+    Requiere similitud Levenshtein ≥ 60% salvo igualdad exacta.
+    """
+    a = normalize_team_for_match(normalize_name_order(poly_side))
+    b = normalize_team_for_match(normalize_name_order(odds_side))
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return _levenshtein_similarity_ratio(a, b) >= _TEAM_IO_SIMILARITY_MIN
+
+
 def find_event_matching_teams(
     events: list[OddsEvent],
     poly_home: str,
@@ -123,15 +218,16 @@ def find_event_matching_teams(
             continue
         oh = normalize_name_order(oh_raw)
         oa = normalize_name_order(oa_raw)
-        if (teams_match_odds_gamma(ph, oh) and teams_match_odds_gamma(pa, oa)) or (
-            teams_match_odds_gamma(ph, oa) and teams_match_odds_gamma(pa, oh)
+        if (_team_similar_for_io_pair(ph, oh) and _team_similar_for_io_pair(pa, oa)) or (
+            _team_similar_for_io_pair(ph, oa) and _team_similar_for_io_pair(pa, oh)
         ):
             return ev
     return None
 
 
 def poly_odds_key_to_io_sport(poly_odds_key: str) -> Optional[str]:
-    return ODDS_KEY_TO_IO_SPORT.get(poly_odds_key.strip())
+    k = poly_odds_key.strip().lower()
+    return ODDS_KEY_TO_IO_SPORT.get(k)
 
 
 def _parse_ml_odds_row(raw: dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -239,6 +335,7 @@ class OddsApiIo:
         self._ws_odds_cache: dict[str, dict[str, OddsEvent]] = {}
         self._rest_cache: dict[str, tuple[float, list[OddsEvent]]] = {}
         self._event_meta_cache: dict[str, dict[str, str]] = {}
+        _load_event_meta_disk_cache(self._event_meta_cache)
         self._event_meta_inflight: set[str] = set()
         self._ws_runner_task: Optional[asyncio.Task[None]] = None
         self._ws_cancel = asyncio.Event()
@@ -268,8 +365,8 @@ class OddsApiIo:
 
     def get_cached_odds(self, sport: str) -> list[OddsEvent]:
         """Solo lectura de caché; en REST la caché se rellena vía refresh_rest_cache."""
-        k = sport.strip()
-        sport_slug = ODDS_KEY_TO_IO_SPORT.get(k, k).strip().lower()
+        k = sport.strip().lower()
+        sport_slug = str(ODDS_KEY_TO_IO_SPORT.get(k, k)).strip().lower()
         if self.ws_enabled:
             return self._flatten_ws_cache_io_sport(sport_slug)
         now = time.monotonic()
@@ -299,6 +396,11 @@ class OddsApiIo:
                 return i
         return len(order)
 
+    async def _persist_event_meta_disk(self) -> None:
+        async with self._lock:
+            snap = {str(k): dict(v) for k, v in self._event_meta_cache.items()}
+        await asyncio.to_thread(_save_event_meta_disk_cache, snap)
+
     async def refresh_rest_cache(self, session: aiohttp.ClientSession, poly_sport: str) -> None:
         if self.ws_enabled:
             return
@@ -312,6 +414,8 @@ class OddsApiIo:
                 return
         try:
             events_rows = await self._rest_fetch_sport(session, io_sport)
+        except OddsApiIoRestQuotaError:
+            raise
         except Exception as e:
             log.warning("[odds_api_io] REST fetch sport=%s: %s", io_sport, e)
             return
@@ -326,6 +430,7 @@ class OddsApiIo:
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
+                _raise_if_rest_quota_error(resp.status, text, f"GET /events sport={io_sport}")
                 log.warning("[odds_api_io] GET /events sport=%s HTTP %s: %s", io_sport, resp.status, text[:300])
                 return []
             data = json.loads(text)
@@ -360,6 +465,7 @@ class OddsApiIo:
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
+                _raise_if_rest_quota_error(resp.status, text, "GET /odds/multi")
                 log.warning("[odds_api_io] GET /odds/multi HTTP %s: %s", resp.status, text[:300])
                 return []
             data = json.loads(text)
@@ -390,6 +496,10 @@ class OddsApiIo:
             ) as resp:
                 text = await resp.text()
                 if resp.status != 200:
+                    if resp.status == 404:
+                        log.debug("[odds_api_io] GET /events/%s HTTP 404", event_id)
+                        return out
+                    _raise_if_rest_quota_error(resp.status, text, f"GET /events/{event_id}")
                     log.debug("[odds_api_io] GET /events/%s HTTP %s", event_id, resp.status)
                     return out
                 raw = json.loads(text)
@@ -401,13 +511,27 @@ class OddsApiIo:
             away = normalize_name_order(away_raw) if away_raw else ""
             sp = raw.get("sport")
             if isinstance(sp, dict):
-                sport_slug = str(sp.get("slug") or "").strip().lower()
+                sport_slug = str(sp.get("slug", "") or "").strip().lower()
             else:
                 sport_slug = str(sp or raw.get("sport_slug") or "").strip().lower()
             out = {"home": home, "away": away, "sport": sport_slug}
             async with self._lock:
                 self._event_meta_cache[event_id] = out
+                # WS a veces manda "updated" sin sport/home/away; el filtro por io_sport
+                # descartaba esos OddsEvent hasta el siguiente tick. Rellenar caché en vivo.
+                by_bk = self._ws_odds_cache.get(event_id)
+                if by_bk:
+                    for ev in by_bk.values():
+                        if not (ev.sport or "").strip() and sport_slug:
+                            ev.sport = sport_slug
+                        if not (ev.home or "").strip() and home:
+                            ev.home = home
+                        if not (ev.away or "").strip() and away:
+                            ev.away = away
+            await self._persist_event_meta_disk()
             return dict(out)
+        except OddsApiIoRestQuotaError:
+            raise
         except Exception as e:
             log.warning("[odds_api_io] event meta id=%s: %s", event_id, e)
             return out
@@ -423,6 +547,9 @@ class OddsApiIo:
             try:
                 await self._ws_once(sport_param)
             except asyncio.CancelledError:
+                raise
+            except OddsApiIoRestQuotaError:
+                log.error("[odds_api_io] REST odds-api.io en error de cuota/auth; no se reintenta el WS.")
                 raise
             except Exception as e:
                 attempt += 1
@@ -506,7 +633,7 @@ class OddsApiIo:
                                     self._event_meta_inflight.add(eid_w)
                                     start_meta = True
                             if start_meta:
-                                asyncio.create_task(self._fetch_event_meta(session, eid_w))
+                                await self._fetch_event_meta(session, eid_w)
                         await self._apply_ws_created_updated(session, data, sport_param, typ)
                     elif typ == "deleted":
                         await self._apply_ws_deleted(data)

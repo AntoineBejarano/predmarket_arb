@@ -23,8 +23,10 @@ from clients.odds_api import odds_team_matches_gamma_blob, teams_match_odds_gamm
 from clients.odds_api_io import (
     ODDS_API_IO_SPORTS_EMBEDDED,
     OddsApiIo,
+    OddsApiIoRestQuotaError,
     OddsEvent,
     find_event_matching_teams,
+    normalize_name_order,
     remove_vig as remove_vig_decimal,
 )
 from clients.poly_clob import PolyCLOBClient
@@ -74,6 +76,9 @@ _DEFAULT_HEADERS = {
 }
 
 MIN_DISCOVERY_TTL_SEC = 300
+# Cooldown por partido+lado: solo reemitir si el mid cambia >2% o han pasado 5 minutos.
+_SIGNAL_COOLDOWN_PRICE_EPS = 0.02
+_SIGNAL_COOLDOWN_SEC = 300.0
 
 # Defaults embebidos si Railway (u otro) no define env; `os.getenv` sigue pudiendo sobreescribir en local.
 _EMBEDDED_LATENCY_SPORTS_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
@@ -110,9 +115,67 @@ _ODDS_IO_CLIENT_POLY_KEY: dict[str, str] = {
 }
 
 
-def _client_poly_key_for_odds_io(odds_key: str) -> str:
+def _client_poly_key_for_odds_io(odds_key: str, poly_sport_slug: str = "") -> str:
+    """Clave Odds API IO / caché: tennis en Poly va por slug Gamma (atp vs wta)."""
     k = odds_key.strip()
+    slug = str(poly_sport_slug).strip().lower()
+    if k == "tennis":
+        if slug == "atp":
+            return "tennis_atp"
+        if slug == "wta":
+            return "tennis_wta"
+    if k == "table-tennis" and slug == "wttmen":
+        return "tabletennis_wtt"
     return _ODDS_IO_CLIENT_POLY_KEY.get(k, k)
+
+
+def _latency_sports_skip_doubles() -> bool:
+    """Dobles: nunca procesar. True fijo; no lee ninguna env (p. ej. LATENCY_SPORTS_SKIP_DOUBLES)."""
+    return True
+
+
+def _normalize_slashes(s: str) -> str:
+    t = (s or "").replace("\u2044", "/").replace("\uff0f", "/").replace("／", "/")
+    return t.replace("\u202f", " ").replace("\xa0", " ")
+
+
+def _doubles_hint_in_text(s: str) -> bool:
+    """
+    Indica pareja de jugadores (dobles) o varios jugadores en un mismo string.
+    Cubre slash con/sin espacios y títulos tipo «A / B / C / D» (Poly a veces compacta).
+    """
+    t = _normalize_slashes(s).strip()
+    if not t or "/" not in t:
+        return False
+    if " / " in t:
+        return True
+    if t.count("/") >= 2:
+        return True
+    if re.search(r"[\w.'\-]\s*/\s*[\w.'\-]", t, re.I):
+        return True
+    if re.search(r"[\w.'\-]/[\w.'\-]", t, re.I):
+        return True
+    return False
+
+
+def _gamma_event_doubles_signal(ev: dict[str, Any]) -> bool:
+    """True si en cualquier parte visible del evento Gamma hay formato de dobles."""
+    chunks: list[str] = [
+        str(ev.get("title") or ""),
+        str(ev.get("description") or ""),
+        str(ev.get("slug") or ""),
+    ]
+    for m in ev.get("markets") or []:
+        if not isinstance(m, dict):
+            continue
+        chunks.append(str(m.get("question") or ""))
+        chunks.append(str(m.get("groupItemTitle") or ""))
+        for lab, _tid in _outcome_token_pairs(m):
+            chunks.append(str(lab))
+    for ch in chunks:
+        if _doubles_hint_in_text(ch):
+            return True
+    return False
 
 
 @dataclass
@@ -284,6 +347,8 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
     home_p, away_p = _parse_poly_title_teams(title)
     if not home_p or not away_p:
         return None
+    if _latency_sports_skip_doubles() and _gamma_event_doubles_signal(ev):
+        return None
     end_dt = _parse_iso_utc(ev.get("endDate"))
     end_s = str(ev.get("endDate") or "").strip() or None
     slug_e = str(ev.get("slug") or "")[:240]
@@ -318,10 +383,11 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
         if not cid:
             return None
         token_yes = _yes_token_from_pairs(pairs) or pairs[0][1]
+        # Nombres desde el mercado CLOB (p. ej. "A / B"); el título a veces compacta y pierde el slash.
         return OpenPolymarketGame(
             sport_slug=sport_slug,
-            home=home_p,
-            away=away_p,
+            home=h2,
+            away=a2,
             condition_id=cid,
             token_yes=token_yes,
             end_date=end_dt,
@@ -371,6 +437,10 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
             mk_away.get("conditionId") or mk_away.get("condition_id") or ""
         )
         if not cid:
+            return None
+        if _latency_sports_skip_doubles() and (
+            _doubles_hint_in_text(home_p) or _doubles_hint_in_text(away_p)
+        ):
             return None
         return OpenPolymarketGame(
             sport_slug=sport_slug,
@@ -568,6 +638,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._snapshot_csv_enabled = _env_snapshot_csv_enabled()
         self._snapshot_csv_path = _latency_snapshots_csv_path()
         self._snapshot_csv_lock = threading.Lock()
+        # Cooldown SIGNAL por mercado+lado (clave estable: slug Gamma + YES/NO; no home/away por orden variable).
+        self._last_signal_price: dict[str, float] = {}
+        self._last_signal_mono: dict[str, float] = {}
 
     def _ws_snapshot_match_fields(self, game: OpenPolymarketGame) -> tuple[str, str]:
         """Best-effort desde sports WS cache (esquema variable); vacío si no hay datos."""
@@ -620,7 +693,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         poly_key = POLY_SLUG_TO_ODDS_KEY.get(str(sport_slug).strip().lower())
         if not poly_key:
             return []
-        return self._odds_client.get_cached_odds(_client_poly_key_for_odds_io(poly_key))
+        return self._odds_client.get_cached_odds(_client_poly_key_for_odds_io(poly_key, sport_slug))
 
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
@@ -660,8 +733,20 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     if not enabled:
                         await asyncio.sleep(self.poll_interval)
                         continue
+                    odds_ws = self._odds_client._ws_runner_task
+                    if odds_ws is not None and odds_ws.done() and not odds_ws.cancelled():
+                        exc = odds_ws.exception()
+                        if exc is not None:
+                            raise exc
                     await self._poll_cycle(state_manager)
                 except asyncio.CancelledError:
+                    raise
+                except OddsApiIoRestQuotaError as e:
+                    log.error(
+                        "[latency_arb_sports] odds-api.io REST rechazó la petición (p. ej. límite gratuito); "
+                        "parando estrategia para no seguir consumiendo requests. %s",
+                        e,
+                    )
                     raise
                 except Exception as e:
                     log.exception("[latency_arb_sports] poll error")
@@ -763,6 +848,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
         await self._fetch_polymarket_sports_meta(session)
         games: list[OpenPolymarketGame] = []
+        seen_discovery: set[tuple[str, Any]] = set()
 
         for poly_slug in self.poly_slugs:
             odds_key = POLY_SLUG_TO_ODDS_KEY.get(poly_slug)
@@ -798,8 +884,31 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 if not _gamma_event_usable(ev):
                     continue
                 og = _poly_event_to_open_game(ev, poly_slug)
-                if og is not None:
-                    games.append(og)
+                if og is None:
+                    continue
+                # Por si _poly_event_to_open_game cambia: no indexar dobles.
+                raw_title = str(ev.get("title") or "")
+                if _latency_sports_skip_doubles() and (
+                    _doubles_hint_in_text(og.home)
+                    or _doubles_hint_in_text(og.away)
+                    or _doubles_hint_in_text(raw_title)
+                    or _gamma_event_doubles_signal(ev)
+                ):
+                    continue
+                dedupe_str = (og.slug or og.condition_id or "").strip()
+                if dedupe_str:
+                    dk: tuple[str, Any] = ("s", dedupe_str)
+                else:
+                    dk = (
+                        "s",
+                        frozenset(
+                            (normalize_name_order(og.home), normalize_name_order(og.away))
+                        ),
+                    )
+                if dk in seen_discovery:
+                    continue
+                seen_discovery.add(dk)
+                games.append(og)
 
         self._open_games = games
         self._open_games_cache_mono = now
@@ -842,7 +951,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             if seq == 1 and not self._cache_debug_done:
                 self._cache_debug_done = True
                 odds_key = POLY_SLUG_TO_ODDS_KEY.get("atp", "atp")
-                cached = self._odds_client.get_cached_odds(odds_key)
+                cached = self._odds_client.get_cached_odds(_client_poly_key_for_odds_io(odds_key, "atp"))
                 log.info(
                     "[CACHE_DEBUG] odds_key=%s cached_count=%s ws_cache_raw=%s",
                     odds_key,
@@ -860,9 +969,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     continue
                 if odds_key not in odds_events_by_key:
                     if not self._odds_client.ws_enabled:
-                        await self._odds_client.refresh_rest_cache(sess, _client_poly_key_for_odds_io(odds_key))
+                        await self._odds_client.refresh_rest_cache(
+                            sess, _client_poly_key_for_odds_io(odds_key, game.sport_slug)
+                        )
                     odds_events_by_key[odds_key] = self._odds_client.get_cached_odds(
-                        _client_poly_key_for_odds_io(odds_key)
+                        _client_poly_key_for_odds_io(odds_key, game.sport_slug)
                     )
                     odds_keys_loaded.add(odds_key)
                 events_list = odds_events_by_key.get(odds_key) or []
@@ -881,7 +992,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
             ):
                 for game in open_games[:5]:
                     odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug, game.sport_slug)
-                    odds_events = self._odds_client.get_cached_odds(odds_key)
+                    odds_events = self._odds_client.get_cached_odds(
+                        _client_poly_key_for_odds_io(odds_key, game.sport_slug)
+                    )
                     preview = [f"{ev.home} vs {ev.away}" for ev in odds_events[:3]]
                     log.info(
                         "[REF_DEBUG] game='%s vs %s' sport=%s odds_io_events=%s",
@@ -980,15 +1093,29 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 }
             )
 
+        legs: list[tuple[str, str, float, float]] = []
         for side_label, token_id, p_fair in (
             ("YES", tok_h, p_h_fair),
             ("NO", tok_a, p_a_fair),
         ):
-            mid: Optional[float] = mid_h_val if token_id == tok_h else mid_a_val
-            if mid is None:
-                mid = await _resolve_mid(token_id)
-            if mid is None:
+            mid_i: Optional[float] = mid_h_val if token_id == tok_h else mid_a_val
+            if mid_i is None:
+                mid_i = await _resolve_mid(token_id)
+            if mid_i is None:
                 continue
+            legs.append((side_label, token_id, float(p_fair), float(mid_i)))
+
+        # Como máximo un BUY por partido/ciclo: el mejor raw_edge>0 con |edge|>=min_edge.
+        signal_side: Optional[str] = None
+        buy_candidates: list[tuple[float, str]] = []
+        for side_label, _token_id, p_fair, mid_i in legs:
+            raw_i = float(p_fair) - float(mid_i)
+            if raw_i > 0 and abs(raw_i) >= self.min_edge:
+                buy_candidates.append((raw_i, side_label))
+        if buy_candidates:
+            signal_side = max(buy_candidates, key=lambda x: x[0])[1]
+
+        for side_label, token_id, p_fair, mid in legs:
             clob_read_at = datetime.utcnow().isoformat()
             log.info(
                 "[latency_arb_sports] CLOB_READ game='%s vs %s' poly_mid=%s clob_read_at=%s",
@@ -1011,6 +1138,31 @@ class LatencyArbSportsStrategy(ArbStrategy):
             )
             raw_edge = float(p_fair) - float(mid)
             edge_mag = abs(raw_edge)
+
+            if signal_side is not None and side_label != signal_side:
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:BELOW_MIN_EDGE",
+                        "reason": (
+                            f"not_buy_leg_signal_on_{signal_side}_side={side_label}_"
+                            f"raw={raw_edge:.4f}_mag={edge_mag:.4f}"
+                        ),
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge": f"{edge_mag:.6f}",
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                    }
+                )
+                acc["csv_rows"] += 1
+                continue
+
             if edge_mag < self.min_edge:
                 await self.log_signal_async(
                     {
@@ -1031,12 +1183,15 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
                 acc["csv_rows"] += 1
                 continue
-            buy_side = "BUY"
-            if raw_edge < 0:  # edge >= min_edge pero dirección desfavorable para BUY
+
+            if raw_edge <= 0:
                 await self.log_signal_async(
                     {
-                        "action": "SKIP:LOW_EDGE",
-                        "reason": f"negative_edge_side={side_label}_raw={raw_edge:.4f}",
+                        "action": "SKIP:BELOW_MIN_EDGE",
+                        "reason": (
+                            f"raw<=0_not_buy_leg|edge|={edge_mag:.4f}_min_edge={self.min_edge:.4f}_"
+                            f"side={side_label}_raw={raw_edge:.4f}"
+                        ),
                         "game_slug": g.slug,
                         "league": g.league,
                         "home_team": odds_home,
@@ -1052,6 +1207,33 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
                 acc["csv_rows"] += 1
                 continue
+
+            base_key = (g.slug or game.slug or game.condition_id or "").strip()
+            if not base_key:
+                base_key = (token_id or "unknown")[:32]
+            sig_key = f"{base_key}_{side_label}"
+            now_mono = time.monotonic()
+            prev_p = self._last_signal_price.get(sig_key)
+            prev_t = self._last_signal_mono.get(sig_key)
+            if prev_p is not None and prev_t is not None:
+                if (
+                    abs(float(mid) - float(prev_p)) <= _SIGNAL_COOLDOWN_PRICE_EPS
+                    and (now_mono - float(prev_t)) < _SIGNAL_COOLDOWN_SEC
+                ):
+                    log.debug(
+                        "[latency_arb_sports] COOLDOWN_SKIP game=%s vs %s side=%s slug=%s "
+                        "price_unchanged mid=%.6f prev_mid=%.6f dt_s=%.2f",
+                        game.home,
+                        game.away,
+                        side_label,
+                        g.slug,
+                        float(mid),
+                        float(prev_p),
+                        now_mono - float(prev_t),
+                    )
+                    continue
+
+            buy_side = "BUY"
             size = float(self.max_stake)
             status = "SIGNAL"
             action = "SIGNAL"
@@ -1092,5 +1274,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "status": status,
                 }
             )
+            self._last_signal_price[sig_key] = float(mid)
+            self._last_signal_mono[sig_key] = now_mono
             acc["csv_rows"] += 1
         return acc

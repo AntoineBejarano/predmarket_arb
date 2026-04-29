@@ -37,6 +37,11 @@
           <span id="run-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">motor</span>
           <button type="button" onclick="arbStart()" class="text-xs px-3 py-1.5 border border-slate-600 rounded-md hover:bg-slate-800">Start motor</button>
           <button type="button" onclick="arbStop()" class="text-xs px-3 py-1.5 border border-red-900 text-red-400 rounded-md hover:bg-red-950/30">Stop motor</button>
+          <button type="button" onclick="arbResetData()" class="text-xs px-3 py-1.5 border border-amber-700 text-amber-300 rounded-md hover:bg-amber-950/30" title="Limpia CSV/logs Arb, PnL paper y apaga estrategias">Reiniciar datos</button>
+          <label class="flex items-center gap-1.5 text-[11px] text-slate-500 cursor-pointer select-none max-w-[11rem] leading-tight">
+            <input type="checkbox" id="arb-reset-include-validator" class="rounded border-slate-600 bg-slate-800 shrink-0" />
+            <span>+ <code class="text-slate-600">signals.csv</code></span>
+          </label>
         </div>
       </div>
     </header>
@@ -346,7 +351,7 @@
     async function refreshStatus() {
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
-        const r = await fetch("/api/arb/status");
+        const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
         if (r.ok) data = await r.json();
       } catch (e) {}
       const s = (data.strategies || []).find((x) => x.slug === SLUG) || {};
@@ -424,6 +429,65 @@
       await fetch("/api/arb/stop", { method: "POST" });
       await refreshStatus();
       broadcastArbControlPlaneChanged();
+    }
+
+    function formatApiDetail(d) {
+      if (d == null || d === "") return "";
+      if (typeof d === "string") return d;
+      if (Array.isArray(d)) return d.map((x) => (typeof x === "object" ? JSON.stringify(x) : String(x))).join("; ");
+      return String(d);
+    }
+
+    async function arbResetData() {
+      const chk = document.getElementById("arb-reset-include-validator");
+      const includeVal = chk ? !!chk.checked : false;
+      if (
+        !confirm(
+          "¿Reiniciar datos del motor Arb?\n\n" +
+            "Se detendrá arb_engine (si lo controla esta API), se borrarán CSV/logs, caché odds-api, " +
+            "PnL paper a cero y se desactivarán todas las estrategias. No se arranca el motor." +
+            (includeVal ? "\n\n(Incluirás también el CSV del validador ML.)" : "")
+        )
+      ) {
+        return;
+      }
+      let res;
+      try {
+        const q = includeVal ? "?include_validator=true" : "";
+        res = await fetch("/api/arb/reset-data" + q, {
+          method: "POST",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+      } catch (e) {
+        alert("Error de red al reiniciar datos.");
+        return;
+      }
+      const raw = await res.text();
+      let body = {};
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch (e) {}
+      if (!res.ok) {
+        alert(
+          "Reinicio fallido (" +
+            res.status +
+            "): " +
+            (formatApiDetail(body.detail) || raw.slice(0, 400) || res.statusText)
+        );
+        return;
+      }
+      const errs = body.file_errors || [];
+      if (errs.length) {
+        alert("Datos reiniciados con avisos:\n" + errs.join("\n"));
+      } else {
+        alert("Datos reiniciados.");
+      }
+      await refreshStatus();
+      broadcastArbControlPlaneChanged();
+      await loadLog();
+      if (SLUG === "bundle_arb") await loadBundleScan();
+      if (SLUG === "latency_arb_sports" && typeof loadSnapshots === "function") await loadSnapshots();
     }
 
     function pushLiveLine(payload) {

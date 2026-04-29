@@ -29,6 +29,11 @@
           <span id="run-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400">motor</span>
           <button type="button" onclick="arbStart()" class="text-xs px-3 py-1.5 border border-slate-600 rounded-md hover:bg-slate-800">Start motor</button>
           <button type="button" onclick="arbStop()" class="text-xs px-3 py-1.5 border border-red-900 text-red-400 rounded-md hover:bg-red-950/30">Stop motor</button>
+          <button type="button" onclick="arbResetData()" class="text-xs px-3 py-1.5 border border-amber-700 text-amber-300 rounded-md hover:bg-amber-950/30" title="Reinicia datos Arb, apaga estrategias y no arranca el motor">Reiniciar datos</button>
+          <label class="flex items-center gap-1.5 text-[11px] text-slate-500 cursor-pointer select-none max-w-[11rem] leading-tight">
+            <input type="checkbox" id="arb-reset-include-validator" class="rounded border-slate-600 bg-slate-800 shrink-0" />
+            <span>+ <code class="text-slate-600">signals.csv</code></span>
+          </label>
         </div>
       </div>
     </header>
@@ -126,6 +131,18 @@
           <tbody id="log-body" class="divide-y divide-slate-800 font-mono"></tbody>
         </table>
       </div>
+      <p class="text-[10px] text-slate-500 mt-2">
+        Color fila por <code class="text-slate-400">edge</code>: ≥0.05 rojo · ≥0.03 naranja · ≥0.01 amarillo · &lt;0.01 normal
+      </p>
+    </section>
+
+    <section class="mt-8">
+      <h2 class="text-sm font-medium text-slate-300 mb-1">Convergencia Poly vs referencia (últimos 3 partidos con señal)</h2>
+      <p class="text-xs text-slate-500 mb-3">
+        Azul = <code class="text-sky-300">price_poly</code> (mid CLOB) · Naranja = <code class="text-orange-300">prob_pinnacle</code> (referencia sharp).
+        Datos: últimas 100 filas CSV, orden temporal por partido.
+      </p>
+      <div id="convergence-charts" class="flex flex-col gap-5 w-full max-w-full"></div>
     </section>
   </div>
 
@@ -133,6 +150,7 @@
     const SLUG = "latency_arb_sports";
     let _enabled = false;
     let _chart = null;
+    let _convCharts = [];
 
     function esc(s) {
       return String(s == null ? "" : s)
@@ -154,7 +172,7 @@
     async function refreshStatus() {
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
-        const r = await fetch("/api/arb/status");
+        const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
         if (r.ok) data = await r.json();
       } catch (e) {}
       const s = (data.strategies || []).find((x) => x.slug === SLUG) || {};
@@ -197,12 +215,115 @@
       await refreshStatus();
     }
 
+    function broadcastArbRefresh() {
+      try {
+        if (typeof BroadcastChannel !== "undefined") {
+          if (!window.__arbBus) window.__arbBus = new BroadcastChannel("predmarket_arb_control");
+          window.__arbBus.postMessage({ type: "arb_refresh", t: Date.now() });
+        }
+      } catch (e) {}
+      try {
+        localStorage.setItem("arb_control_plane_ts", String(Date.now()));
+      } catch (e) {}
+    }
+
+    function formatApiDetail(d) {
+      if (d == null || d === "") return "";
+      if (typeof d === "string") return d;
+      if (Array.isArray(d)) return d.map((x) => (typeof x === "object" ? JSON.stringify(x) : String(x))).join("; ");
+      return String(d);
+    }
+
+    async function arbResetData() {
+      const chk = document.getElementById("arb-reset-include-validator");
+      const includeVal = chk ? !!chk.checked : false;
+      if (
+        !confirm(
+          "¿Reiniciar datos del motor Arb?\n\n" +
+            "Se detendrá arb_engine (si lo controla esta API), se borrarán CSV/logs y caché odds-api, " +
+            "PnL paper a cero y se desactivarán todas las estrategias. No se arranca el motor." +
+            (includeVal ? "\n\n(Incluirás también el CSV del validador ML.)" : "")
+        )
+      ) {
+        return;
+      }
+      let res;
+      try {
+        const q = includeVal ? "?include_validator=true" : "";
+        res = await fetch("/api/arb/reset-data" + q, {
+          method: "POST",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+      } catch (e) {
+        alert("Error de red al reiniciar datos.");
+        return;
+      }
+      const raw = await res.text();
+      let body = {};
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch (e) {}
+      if (!res.ok) {
+        alert(
+          "Reinicio fallido (" +
+            res.status +
+            "): " +
+            (formatApiDetail(body.detail) || raw.slice(0, 400) || res.statusText)
+        );
+        return;
+      }
+      const errs = body.file_errors || [];
+      if (errs.length) {
+        alert("Datos reiniciados con avisos:\n" + errs.join("\n"));
+      } else {
+        alert("Datos reiniciados.");
+      }
+      await refreshStatus();
+      broadcastArbRefresh();
+      await loadLog();
+    }
+
+    function edgeBadgeHtml(edgeVal) {
+      const e = parseFloat(edgeVal);
+      if (isNaN(e)) return "";
+      if (e > 0.05) {
+        return (
+          '<span class="inline-block align-middle ml-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-600 text-white">edge&gt;5%</span>'
+        );
+      }
+      if (e >= 0.03 && e <= 0.05) {
+        return (
+          '<span class="inline-block align-middle ml-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-orange-500 text-slate-900">edge 3–5%</span>'
+        );
+      }
+      return "";
+    }
+
     function pushLiveLine(payload) {
       if (String(payload.strategy || "") !== SLUG) return;
       const feed = document.getElementById("live-feed");
       if (feed.querySelector("p.text-slate-600")) feed.innerHTML = "";
       const p = document.createElement("p");
-      const a = payload.action || "—";
+      const a = String(payload.action || "");
+      const edgeNum = parseFloat(payload.edge);
+      const isSig = a === "SIGNAL" || a === "EXECUTED";
+      let extra = "";
+      if (isSig) {
+        const badge = edgeBadgeHtml(payload.edge);
+        const pp = esc(String(payload.price_poly ?? ""));
+        const ref = esc(String(payload.prob_pinnacle ?? ""));
+        extra =
+          badge +
+          ' <span class="text-sky-300">Poly ' +
+          pp +
+          '</span> <span class="text-orange-300">Ref ' +
+          ref +
+          "</span>";
+        if (!isNaN(edgeNum)) {
+          extra += ' <span class="text-slate-500">|e|=' + edgeNum.toFixed(4) + "</span>";
+        }
+      }
       p.className = "text-slate-300";
       p.innerHTML =
         '<span class="text-slate-500">' +
@@ -210,7 +331,8 @@
         '</span> <span class="text-yellow-300">' +
         esc(a) +
         "</span> " +
-        esc((payload.home_team || "") + " vs " + (payload.away_team || "")).slice(0, 80);
+        esc((payload.home_team || "") + " vs " + (payload.away_team || "")).slice(0, 80) +
+        extra;
       feed.prepend(p);
       while (feed.children.length > 60) feed.removeChild(feed.lastChild);
     }
@@ -256,6 +378,151 @@
       }
     }
 
+    function partidoKey(row) {
+      const h = String(row.home_team || "").trim().toLowerCase();
+      const a = String(row.away_team || "").trim().toLowerCase();
+      if (!h && !a) return "";
+      return [h, a].filter(Boolean).sort().join("||");
+    }
+
+    function partidoLabel(row) {
+      const h = String(row.home_team || "").trim();
+      const a = String(row.away_team || "").trim();
+      if (h && a) return h + " vs " + a;
+      return String(row.game_slug || "—");
+    }
+
+    function edgeRowClass(edgeStr) {
+      const v = parseFloat(edgeStr);
+      if (isNaN(v)) return "hover:bg-slate-800/50";
+      if (v >= 0.05) return "bg-red-600 text-white hover:bg-red-500";
+      if (v >= 0.03) return "bg-orange-500 text-slate-950 hover:bg-orange-400";
+      if (v >= 0.01) return "bg-yellow-400 text-slate-900 hover:bg-yellow-300";
+      return "hover:bg-slate-800/50";
+    }
+
+    function destroyConvCharts() {
+      _convCharts.forEach((c) => {
+        try {
+          c.destroy();
+        } catch (err) {}
+      });
+      _convCharts = [];
+    }
+
+    function pickTop3PartidosConSenal(rows) {
+      const rev = [...rows].reverse();
+      const out = [];
+      const seen = new Set();
+      for (const r of rev) {
+        const k = partidoKey(r);
+        if (!k) continue;
+        const act = String(r.action || "");
+        if (act === "SIGNAL" || act === "EXECUTED") {
+          if (!seen.has(k)) {
+            seen.add(k);
+            out.push(k);
+            if (out.length >= 3) break;
+          }
+        }
+      }
+      return out;
+    }
+
+    function updateConvergenceCharts(rows) {
+      destroyConvCharts();
+      const host = document.getElementById("convergence-charts");
+      if (!host) return;
+      host.innerHTML = "";
+      const keys = pickTop3PartidosConSenal(rows);
+      if (!keys.length) {
+        host.innerHTML =
+          '<p class="text-xs text-slate-500 w-full">Sin filas SIGNAL/EXECUTED en el tramo reciente.</p>';
+        return;
+      }
+      keys.forEach((key, idx) => {
+        const pts = rows
+          .filter((r) => partidoKey(r) === key)
+          .map((r) => ({
+            ts: String(r.ts || ""),
+            poly: parseFloat(r.price_poly),
+            ref: parseFloat(r.prob_pinnacle),
+          }))
+          .filter((p) => p.ts && !isNaN(p.poly) && !isNaN(p.ref));
+        pts.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+        if (!pts.length) return;
+        const wrap = document.createElement("div");
+        wrap.className =
+          "rounded-xl border border-slate-700 bg-slate-950 p-3 w-full max-w-full shrink-0";
+        const title = document.createElement("p");
+        title.className = "text-[11px] text-slate-300 mb-2 font-medium leading-snug break-words";
+        title.textContent = partidoLabel(rows.find((r) => partidoKey(r) === key) || {});
+        const chartBox = document.createElement("div");
+        chartBox.className = "relative w-full h-56 sm:h-64";
+        const cv = document.createElement("canvas");
+        cv.id = "conv-canvas-" + idx;
+        cv.setAttribute("aria-label", "Convergencia precios " + (idx + 1));
+        chartBox.appendChild(cv);
+        wrap.appendChild(title);
+        wrap.appendChild(chartBox);
+        host.appendChild(wrap);
+        const labels = pts.map((p) => (p.ts.length >= 19 ? p.ts.slice(11, 19) : p.ts));
+        const ch = new Chart(cv, {
+          type: "line",
+          data: {
+            labels,
+            datasets: [
+              {
+                label: "Poly mid",
+                data: pts.map((p) => p.poly),
+                borderColor: "rgb(56, 189, 248)",
+                backgroundColor: "rgba(56, 189, 248, 0.1)",
+                tension: 0.2,
+                pointRadius: 2,
+              },
+              {
+                label: "Prob ref (sharp)",
+                data: pts.map((p) => p.ref),
+                borderColor: "rgb(249, 115, 22)",
+                backgroundColor: "rgba(249, 115, 22, 0.08)",
+                tension: 0.2,
+                pointRadius: 2,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            layout: { padding: { top: 6, right: 10, bottom: 6, left: 6 } },
+            scales: {
+              y: {
+                min: 0,
+                max: 1,
+                grid: { color: "#334155" },
+                ticks: { color: "#94a3b8", font: { size: 9 } },
+              },
+              x: {
+                grid: { color: "#334155" },
+                ticks: { color: "#94a3b8", maxRotation: 45, font: { size: 9 } },
+              },
+            },
+            plugins: {
+              legend: { labels: { color: "#cbd5e1", boxWidth: 10, font: { size: 10 } } },
+              tooltip: {
+                callbacks: {
+                  title: (items) => {
+                    const i = items[0]?.dataIndex;
+                    return i != null ? pts[i].ts : "";
+                  },
+                },
+              },
+            },
+          },
+        });
+        _convCharts.push(ch);
+      });
+    }
+
     function countToday(rows) {
       const day = todayUtcPrefix();
       let sig = 0,
@@ -280,10 +547,21 @@
       } catch (e) {}
       const tb = document.getElementById("log-body");
       tb.innerHTML = rows
-        .map(
-          (row) =>
-            "<tr class='hover:bg-slate-800/50'>" +
-            "<td class='p-2 text-slate-500'>" +
+        .map((row) => {
+          const ec = edgeRowClass(row.edge);
+          const ev = parseFloat(row.edge);
+          const hi = !isNaN(ev) && ev >= 0.01;
+          const tsCls = hi ? "p-2 opacity-90" : "p-2 text-slate-500";
+          const edgeCell = hi
+            ? "<td class='p-2 font-semibold'>" + esc(row.edge) + "</td>"
+            : "<td class='p-2 text-yellow-200'>" + esc(row.edge) + "</td>";
+          return (
+            "<tr class='" +
+            ec +
+            "'>" +
+            "<td class='" +
+            tsCls +
+            "'>" +
             esc((row.ts || "").slice(11, 22)) +
             "</td>" +
             "<td class='p-2'>" +
@@ -298,9 +576,7 @@
             "<td class='p-2'>" +
             esc(row.prob_pinnacle) +
             "</td>" +
-            "<td class='p-2 text-yellow-200'>" +
-            esc(row.edge) +
-            "</td>" +
+            edgeCell +
             "<td class='p-2'>" +
             esc(row.size_usdc) +
             "</td>" +
@@ -310,13 +586,15 @@
             "<td class='p-2'>" +
             esc(row.action) +
             "</td></tr>"
-        )
+          );
+        })
         .join("");
       const c = countToday(rows);
       document.getElementById("c-sig").textContent = String(c.sig);
       document.getElementById("c-exec").textContent = String(c.ex);
       document.getElementById("c-skip").textContent = String(c.sk);
       updateChartFromRows(rows);
+      updateConvergenceCharts(rows);
     }
 
     refreshStatus();

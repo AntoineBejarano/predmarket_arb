@@ -55,7 +55,7 @@
             Start/Stop = proceso <strong class="text-slate-400">arb_engine</strong>. Con otra pestaña en detalle de estrategia, el estado se sincroniza al instante.
           </p>
         </div>
-        <div class="flex gap-2">
+        <div class="flex flex-wrap items-center gap-2">
           <button type="button" onclick="arbStart()"
             class="text-xs px-3 py-1.5 border border-slate-600 rounded-md hover:bg-slate-800 text-slate-200">
             Start
@@ -64,6 +64,15 @@
             class="text-xs px-3 py-1.5 border border-red-800 text-red-400 rounded-md hover:bg-red-950/40">
             Stop
           </button>
+          <button type="button" onclick="arbResetData()"
+            class="text-xs px-3 py-1.5 border border-amber-700 text-amber-300 rounded-md hover:bg-amber-950/30"
+            title="Detiene el motor, borra datos, resetea PnL paper y apaga todas las estrategias (no las vuelve a encender ni arranca el motor)">
+            Reiniciar datos
+          </button>
+          <label class="flex items-center gap-1.5 text-[11px] text-slate-500 cursor-pointer select-none max-w-[11rem] leading-tight">
+            <input type="checkbox" id="arb-reset-include-validator" class="rounded border-slate-600 bg-slate-800 shrink-0" />
+            <span>También borrar <code class="text-slate-600">signals.csv</code> (validador)</span>
+          </label>
         </div>
       </div>
 
@@ -321,10 +330,66 @@
       broadcastArbControlPlaneChanged();
     }
 
+    function formatApiDetail(d) {
+      if (d == null || d === "") return "";
+      if (typeof d === "string") return d;
+      if (Array.isArray(d)) return d.map((x) => (typeof x === "object" ? JSON.stringify(x) : String(x))).join("; ");
+      return String(d);
+    }
+
+    async function arbResetData() {
+      const chk = document.getElementById("arb-reset-include-validator");
+      const includeVal = chk ? !!chk.checked : false;
+      if (
+        !confirm(
+          "¿Reiniciar datos del motor Arb?\n\n" +
+            "Se detendrá arb_engine (si lo controla esta API), se borrarán CSV/logs, caché odds-api, " +
+            "PnL paper a cero y se desactivarán todas las estrategias. No se arranca el motor ni se reactiva nada." +
+            (includeVal ? "\n\n(Incluirás también el CSV del validador ML.)" : "")
+        )
+      ) {
+        return;
+      }
+      let res;
+      try {
+        const q = includeVal ? "?include_validator=true" : "";
+        res = await fetch("/api/arb/reset-data" + q, {
+          method: "POST",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+      } catch (e) {
+        alert("Error de red al reiniciar datos.");
+        return;
+      }
+      const raw = await res.text();
+      let body = {};
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch (e) {}
+      if (!res.ok) {
+        alert(
+          "Reinicio fallido (" +
+            res.status +
+            "): " +
+            (formatApiDetail(body.detail) || raw.slice(0, 400) || res.statusText)
+        );
+        return;
+      }
+      const errs = body.file_errors || [];
+      if (errs.length) {
+        alert("Datos reiniciados con avisos al borrar archivos:\n" + errs.join("\n"));
+      } else {
+        alert("Datos reiniciados.");
+      }
+      await refreshArbStatus();
+      broadcastArbControlPlaneChanged();
+    }
+
     async function refreshArbStatus() {
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
-        const r = await fetch("/api/arb/status");
+        const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
         if (r.ok) data = await r.json();
       } catch (e) {}
       if (!Array.isArray(data.strategies)) data.strategies = [];
