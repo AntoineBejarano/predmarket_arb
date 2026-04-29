@@ -699,6 +699,15 @@ def _csv_ts_date_spain(ts: Any) -> str:
         return ""
 
 
+def _csv_file_stat(path: Path) -> dict[str, Any]:
+    """Existencia y tamaño en disco (útil en Railway: DATA_DIR efímero vs volumen)."""
+    try:
+        st = path.stat()
+        return {"path": str(path), "exists": True, "bytes": int(st.st_size)}
+    except OSError:
+        return {"path": str(path), "exists": False, "bytes": 0}
+
+
 def _csv_stats_today(path: Path) -> dict[str, Any]:
     today = pd.Timestamp.now(tz=_TZ_ES).strftime("%Y-%m-%d")
     rows = _read_arb_csv_tail(path, n=15000)
@@ -864,6 +873,10 @@ async def arb_status() -> JSONResponse:
         "engine_running": running,
         "dry_run": os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         "strategies": strategies,
+        # Diagnóstico: CSV de arb viven bajo DATA_DIR; strategy_state sigue en data/ del repo (ver risk/strategy_state.py).
+        "data_dir": str(DATA_DIR),
+        "strategy_state_file": str(REPO_ROOT / "data" / "strategy_state.json"),
+        "arb_csv_files": {slug: _csv_file_stat(ARB_CSV_PATHS[slug]) for slug in STRATEGY_SLUGS},
     }
     return JSONResponse(
         content=payload,
