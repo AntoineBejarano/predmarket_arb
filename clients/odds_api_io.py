@@ -178,6 +178,19 @@ def normalize_name_order(name: str) -> str:
 _TEAM_IO_SIMILARITY_MIN = 0.6
 
 
+def _coerce_io_sport_slug(sport_val: Any) -> str:
+    """WS/REST: slug IO (p. ej. tennis) desde string o dict tipo {slug: tennis}."""
+    if sport_val is None:
+        return ""
+    if isinstance(sport_val, dict):
+        return str(sport_val.get("slug") or sport_val.get("sport_slug") or "").strip().lower()
+    return str(sport_val).strip().lower()
+
+
+def _event_meta_has_io_sport(meta: dict[str, str]) -> bool:
+    return bool((meta.get("sport") or "").strip())
+
+
 def _levenshtein_similarity_ratio(a: str, b: str) -> float:
     """1.0 = iguales; 0.0 = muy distintos (dist / longitud máxima)."""
     if not a and not b:
@@ -487,8 +500,9 @@ class OddsApiIo:
             return out
         try:
             async with self._lock:
-                if event_id in self._event_meta_cache:
-                    return dict(self._event_meta_cache[event_id])
+                cached = self._event_meta_cache.get(event_id)
+            if cached is not None and _event_meta_has_io_sport(cached):
+                return dict(cached)
             url = f"{BASE_REST}/events/{event_id}"
             params = {"apiKey": self.api_key}
             async with session.get(
@@ -629,7 +643,9 @@ class OddsApiIo:
                         if eid_w:
                             start_meta = False
                             async with self._lock:
-                                if eid_w not in self._event_meta_cache and eid_w not in self._event_meta_inflight:
+                                prev = self._event_meta_cache.get(eid_w)
+                                need_meta = prev is None or not _event_meta_has_io_sport(prev)
+                                if need_meta and eid_w not in self._event_meta_inflight:
                                     self._event_meta_inflight.add(eid_w)
                                     start_meta = True
                             if start_meta:
@@ -665,7 +681,7 @@ class OddsApiIo:
             return
         home = str(data.get("home") or "").strip()
         away = str(data.get("away") or "").strip()
-        sport_guess = str(data.get("sport") or "").strip().lower()
+        sport_guess = _coerce_io_sport_slug(data.get("sport"))
         meta: dict[str, str] = {}
         async with self._lock:
             if eid in self._event_meta_cache:

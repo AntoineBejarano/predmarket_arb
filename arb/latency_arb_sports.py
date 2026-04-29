@@ -108,6 +108,35 @@ POLY_SLUG_TO_ODDS_KEY: dict[str, str] = {
     "nfl": "americanfootball_nfl",
 }
 
+# odds-api.io slug deporte (OddsEvent.sport) → prefijos esperados en slug Gamma (public-search mezcla deportes).
+_IO_SPORT_TO_GAMMA_SLUG_PREFIXES: dict[str, tuple[str, ...]] = {
+    "tennis": ("atp-", "wta-", "wtt-"),
+    "football": ("epl-", "mls-", "ucl-", "uel-", "soccer-", "premier-"),
+    "soccer": ("epl-", "mls-", "ucl-", "uel-", "soccer-", "premier-"),
+    "basketball": ("nba-",),
+    "american-football": ("nfl-",),
+    "ice-hockey": ("nhl-",),
+    "baseball": ("mlb-",),
+    "mixed-martial-arts": ("ufc-", "mma-",),
+    "table-tennis": ("wttmen-", "wtt-",),
+}
+
+_IO_SPORT_ALIASES: dict[str, str] = {"american_football": "american-football", "ice_hockey": "ice-hockey"}
+
+# Valor POLY_SLUG_TO_ODDS_KEY → slug IO odds-api.io (alineado con clients.odds_api_io ODDS_KEY_TO_IO_SPORT).
+_ODDS_KEY_TO_IO_SPORT: dict[str, str] = {
+    "tennis": "tennis",
+    "table-tennis": "table-tennis",
+    "basketball_nba": "basketball",
+    "icehockey_nhl": "ice-hockey",
+    "baseball_mlb": "baseball",
+    "mma_mixed_martial_arts": "mixed-martial-arts",
+    "soccer_uefa_champs_league": "football",
+    "soccer_uefa_europa_league": "football",
+    "soccer_epl": "football",
+    "americanfootball_nfl": "american-football",
+}
+
 # Claves que espera clients.odds_api_io.poly_odds_key_to_io_sport (valores POLY arriba = slugs IO).
 _ODDS_IO_CLIENT_POLY_KEY: dict[str, str] = {
     "tennis": "tennis_wta",
@@ -477,6 +506,195 @@ def _event_matches_odds_teams(ev: dict[str, Any], home_odds: str, away_odds: str
     return odds_team_matches_gamma_blob(home_odds, blob) and odds_team_matches_gamma_blob(away_odds, blob)
 
 
+def _io_sport_slug_coerce(raw: str) -> str:
+    return str(raw or "").strip().lower()
+
+
+def _io_surname_token(name_normalized: str) -> str:
+    parts = [p for p in str(name_normalized or "").strip().split() if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return parts[-1]
+
+
+def _flatten_ws_odds_best_per_event(client: OddsApiIo) -> list[OddsEvent]:
+    """Un OddsEvent por event_id IO (mejor bookie según prioridad del cliente)."""
+    out: list[OddsEvent] = []
+    for _eid, by_bk in client._ws_odds_cache.items():
+        if not by_bk:
+            continue
+        best = min(by_bk.values(), key=lambda ev: (client._bookie_priority(ev.bookie), str(ev.event_id)))
+        out.append(best)
+    out.sort(key=lambda e: str(e.event_id))
+    return out
+
+
+def _gamma_slug_prefixes_for_io_sport(io_sport: str) -> tuple[str, ...]:
+    sl = _IO_SPORT_ALIASES.get(_io_sport_slug_coerce(io_sport), _io_sport_slug_coerce(io_sport))
+    return _IO_SPORT_TO_GAMMA_SLUG_PREFIXES.get(sl, ())
+
+
+def _gamma_slug_matches_io_prefix(gamma_slug: str, io_sport: str) -> bool:
+    prefs = _gamma_slug_prefixes_for_io_sport(io_sport)
+    if not prefs:
+        return True
+    s = str(gamma_slug or "").strip().lower()
+    return any(s.startswith(p) for p in prefs)
+
+
+def _title_has_both_surname_tokens(title: str, ah: str, aa: str) -> bool:
+    if not ah or not aa:
+        return False
+    t = str(title or "").casefold()
+    return ah.casefold() in t and aa.casefold() in t
+
+
+def _parse_public_search_response(text: str) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Gamma /public-search devuelve wrapper {events, markets}; nunca lista plana en la raíz."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return [], []
+    if not isinstance(data, dict):
+        return [], []
+    evs = data.get("events", [])
+    mks = data.get("markets", [])
+    if not isinstance(evs, list):
+        evs = []
+    if not isinstance(mks, list):
+        mks = []
+    out_e: list[dict[str, Any]] = []
+    for x in evs:
+        if isinstance(x, dict):
+            out_e.append(x)
+    return out_e, mks
+
+
+def _event_id_for_gamma_merge(ev: dict[str, Any]) -> str:
+    return str(ev.get("id") or ev.get("eventId") or ev.get("event_id") or "").strip()
+
+
+def _merge_root_markets_into_event(ev: dict[str, Any], root_markets: list[Any]) -> dict[str, Any]:
+    """Si el evento no trae markets[], adjuntar los de la raíz con mismo event id."""
+    mk = ev.get("markets")
+    if isinstance(mk, list) and len(mk) > 0:
+        return ev
+    eid = _event_id_for_gamma_merge(ev)
+    if not eid or not root_markets:
+        return ev
+    attached: list[dict[str, Any]] = []
+    for m in root_markets:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("eventId") or m.get("event_id") or m.get("event") or "").strip()
+        if mid == eid:
+            attached.append(m)
+    if not attached:
+        return ev
+    merged = dict(ev)
+    merged["markets"] = attached
+    return merged
+
+
+def _infer_poly_slug_from_gamma_slug(gamma_slug: str, poly_slugs_enabled: set[str]) -> Optional[str]:
+    s = str(gamma_slug or "").strip().lower()
+    if not s:
+        return None
+    ordered: list[tuple[str, str]] = [
+        ("atp-", "atp"),
+        ("wta-", "wta"),
+        ("wttmen-", "wttmen"),
+        ("nba-", "nba"),
+        ("nfl-", "nfl"),
+        ("nhl-", "nhl"),
+        ("mlb-", "mlb"),
+        ("ufc-", "ufc"),
+        ("epl-", "epl"),
+        ("ucl-", "ucl"),
+        ("uel-", "uel"),
+        ("mls-", "epl"),
+    ]
+    for pref, poly in ordered:
+        if poly not in poly_slugs_enabled:
+            continue
+        if s.startswith(pref):
+            return poly
+    if s.startswith("wtt-"):
+        if "wttmen" in poly_slugs_enabled:
+            return "wttmen"
+        if "atp" in poly_slugs_enabled:
+            return "atp"
+    return None
+
+
+def _default_poly_slug_for_io_sport(io_sport: str, poly_slugs_order: list[str]) -> Optional[str]:
+    raw = _io_sport_slug_coerce(io_sport)
+    want = _IO_SPORT_ALIASES.get(raw, raw)
+    for p in poly_slugs_order:
+        ok = POLY_SLUG_TO_ODDS_KEY.get(p)
+        if not ok:
+            continue
+        mapped = _ODDS_KEY_TO_IO_SPORT.get(ok, "")
+        if mapped == want:
+            return p
+    return None
+
+
+def _pick_open_game_from_public_search_page(
+    events_raw: list[dict[str, Any]],
+    root_markets: list[Any],
+    odds_ev: OddsEvent,
+    ah: str,
+    aa: str,
+    poly_slugs_order: list[str],
+) -> Optional[OpenPolymarketGame]:
+    """Filtra eventos Gamma; prefijo slug IO; fallback título con ambos apellidos; construye OpenPolymarketGame."""
+    poly_set = frozenset(poly_slugs_order)
+    base: list[dict[str, Any]] = []
+    for raw in events_raw:
+        ev0 = _merge_root_markets_into_event(raw, root_markets)
+        if not _gamma_event_usable(ev0):
+            continue
+        if not _event_matches_odds_teams(ev0, odds_ev.home, odds_ev.away):
+            continue
+        tit = str(ev0.get("title") or "")
+        if _latency_sports_skip_doubles() and (
+            _doubles_hint_in_text(tit)
+            or _doubles_hint_in_text(str(ev0.get("slug") or ""))
+            or _gamma_event_doubles_signal(ev0)
+        ):
+            continue
+        base.append(ev0)
+
+    io_raw = _io_sport_slug_coerce(odds_ev.sport)
+    io_sport = _IO_SPORT_ALIASES.get(io_raw, io_raw)
+
+    def try_build(ev1: dict[str, Any], require_slug_prefix: bool) -> Optional[OpenPolymarketGame]:
+        gslug = str(ev1.get("slug") or "")
+        if require_slug_prefix and not _gamma_slug_matches_io_prefix(gslug, io_sport):
+            return None
+        poly_slug = _infer_poly_slug_from_gamma_slug(gslug, poly_set) or _default_poly_slug_for_io_sport(
+            io_sport, poly_slugs_order
+        )
+        if not poly_slug:
+            return None
+        return _poly_event_to_open_game(ev1, poly_slug)
+
+    for ev in base:
+        og = try_build(ev, True)
+        if og is not None:
+            return og
+    for ev in base:
+        if not _title_has_both_surname_tokens(str(ev.get("title") or ""), ah, aa):
+            continue
+        og = try_build(ev, False)
+        if og is not None:
+            return og
+    return None
+
+
 def _pick_best_market_in_event(
     ev_gamma: dict[str, Any],
     sport_key: str,
@@ -641,6 +859,13 @@ class LatencyArbSportsStrategy(ArbStrategy):
         # Cooldown SIGNAL por mercado+lado (clave estable: slug Gamma + YES/NO; no home/away por orden variable).
         self._last_signal_price: dict[str, float] = {}
         self._last_signal_mono: dict[str, float] = {}
+        # Betfair-first: resultado de public-search por event_id IO (TTL corto, independiente del discovery por series).
+        self._betfair_gamma_search_cache: dict[str, tuple[float, Optional[OpenPolymarketGame]]] = {}
+        self._betfair_gamma_search_ttl = float(
+            os.getenv("LATENCY_SPORTS_BETFAIR_GAMMA_SEARCH_TTL") or "60"
+        )
+        self._cycle_public_search_http = 0
+        self._cycle_public_search_cache_hits = 0
 
     def _ws_snapshot_match_fields(self, game: OpenPolymarketGame) -> tuple[str, str]:
         """Best-effort desde sports WS cache (esquema variable); vacío si no hay datos."""
@@ -915,6 +1140,60 @@ class LatencyArbSportsStrategy(ArbStrategy):
         log.info("[latency_arb_sports] open games discovery: n=%s poly_slugs=%s", len(games), self.poly_slugs)
         return games
 
+    async def _gamma_public_search_fetch(
+        self, session: aiohttp.ClientSession, q: str, limit: int
+    ) -> tuple[list[dict[str, Any]], list[Any]]:
+        self._cycle_public_search_http += 1
+        url = f"{GAMMA_API_URL}/public-search"
+        params = {"q": q, "limit": str(int(limit))}
+        async with session.get(
+            url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
+        ) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                log.warning("[latency_arb_sports] Gamma public-search HTTP %s q=%r", resp.status, q[:120])
+                return [], []
+        return _parse_public_search_response(text)
+
+    async def _resolve_open_game_betfair_public_search(
+        self,
+        session: aiohttp.ClientSession,
+        odds_ev: OddsEvent,
+    ) -> Optional[OpenPolymarketGame]:
+        eid = str(odds_ev.event_id or "").strip()
+        if not eid:
+            return None
+        now = time.monotonic()
+        cached = self._betfair_gamma_search_cache.get(eid)
+        if cached is not None and now - cached[0] < self._betfair_gamma_search_ttl:
+            self._cycle_public_search_cache_hits += 1
+            return cached[1]
+
+        nh = normalize_name_order(str(odds_ev.home or ""))
+        na = normalize_name_order(str(odds_ev.away or ""))
+        ah = _io_surname_token(nh)
+        aa = _io_surname_token(na)
+        if not ah:
+            self._betfair_gamma_search_cache[eid] = (now, None)
+            return None
+
+        limit = int(os.getenv("LATENCY_SPORTS_GAMMA_PUBLIC_SEARCH_LIMIT") or "3")
+        poly_order = list(self.poly_slugs)
+
+        async def one_round(q: str) -> Optional[OpenPolymarketGame]:
+            evs, mks = await self._gamma_public_search_fetch(session, q, limit)
+            return _pick_open_game_from_public_search_page(evs, mks, odds_ev, ah, aa, poly_order)
+
+        game: Optional[OpenPolymarketGame] = None
+        if aa:
+            q1 = f"{ah} {aa}"
+            game = await one_round(q1)
+        if game is None:
+            game = await one_round(ah)
+
+        self._betfair_gamma_search_cache[eid] = (time.monotonic(), game)
+        return game
+
     async def _poll_cycle(self, state_manager: Any) -> None:
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
@@ -947,6 +1226,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
         ) as clob:
             self._cycle_seq += 1
             seq = self._cycle_seq
+            self._cycle_public_search_http = 0
+            self._cycle_public_search_cache_hits = 0
             open_games = await self._fetch_open_polymarket_sports(sess)
             if seq == 1 and not self._cache_debug_done:
                 self._cache_debug_done = True
@@ -962,8 +1243,28 @@ class LatencyArbSportsStrategy(ArbStrategy):
             reference_matched = 0
             csv_rows = 0
             odds_events_by_key: dict[str, list[OddsEvent]] = {}
+            processed_condition_ids: set[str] = set()
+
+            if self._odds_client.ws_enabled:
+                for odds_ev in _flatten_ws_odds_best_per_event(self._odds_client):
+                    game_bf = await self._resolve_open_game_betfair_public_search(sess, odds_ev)
+                    if game_bf is None:
+                        continue
+                    cid_bf = (game_bf.condition_id or "").strip()
+                    if not cid_bf or cid_bf in processed_condition_ids:
+                        continue
+                    odds_key_bf = POLY_SLUG_TO_ODDS_KEY.get(game_bf.sport_slug)
+                    if odds_key_bf is None:
+                        continue
+                    reference_matched += 1
+                    processed_condition_ids.add(cid_bf)
+                    st_bf = await self._process_matched_poly_odds(sess, clob, game_bf, odds_key_bf, odds_ev)
+                    csv_rows += st_bf["csv_rows"]
 
             for game in open_games:
+                cid_g = (game.condition_id or "").strip()
+                if cid_g and cid_g in processed_condition_ids:
+                    continue
                 odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug)
                 if odds_key is None:
                     continue
@@ -981,6 +1282,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 if odds_ev is None:
                     continue
                 reference_matched += 1
+                if cid_g:
+                    processed_condition_ids.add(cid_g)
                 st = await self._process_matched_poly_odds(sess, clob, game, odds_key, odds_ev)
                 csv_rows += st["csv_rows"]
 
@@ -1008,7 +1311,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
                 "open_poly_games=%s odds_io_keys=%s reference_matched=%s csv_rows=%s "
-                "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_cache_size=%s",
+                "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_cache_size=%s "
+                "public_search_http=%s public_search_cache_hits=%s",
                 seq,
                 self.regions,
                 self.min_edge,
@@ -1021,6 +1325,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self._is_in_active_window(open_games),
                 self.dry_run,
                 len(self._odds_client._ws_odds_cache),
+                self._cycle_public_search_http,
+                self._cycle_public_search_cache_hits,
             )
             self._write_cycle_metrics_json(len(open_games), reference_matched, len(self._odds_client._ws_odds_cache))
 
