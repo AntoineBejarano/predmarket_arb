@@ -55,7 +55,7 @@ Convenciones detalladas (inglés): [strategies/README.md](strategies/README.md).
 - `clients/kalshi_rest.py` — cliente REST Kalshi (stubs donde aplique).
 - `scripts/healthcheck.py` — handler HTTP mínimo usado por el worker.
 - `static/ml_models.html` — **catálogo ML** (`/ml`). `static/ml_model_detail.html` — **monitor validador** (métricas, tablas, Gamma debug, START/STOP) en **`/`** y **`/ml/model/<slug>`**; slugs no implementados muestran vista “en desarrollo”. `static/arb.html` — **motor Arb (CLOB)** (`/arb`). `static/arb_strategy_detail.html` — detalle por estrategia (`/arb/strategy/<slug>`). `static/latency_sports.html` — dashboard **latency_arb_sports** (`/arb/strategy/latency_arb_sports`). Navegación cruzada con nombres: Catálogo ML · Monitor validador · Motor Arb (CLOB).
-- `Dockerfile` / `railway.toml` — arranque con `python scripts/api.py`; healthcheck Railway en `/health` del API.
+- `Dockerfile` / `railway.json` (config as code Railway) — arranque con `python scripts/api.py`; healthcheck en `/health` del API.
 
 En `**python:3.12-slim`** hace falta el paquete `**libgomp1`** (OpenMP) o LightGBM falla al cargar PKL: `libgomp.so.1: cannot open shared object file` — ya instalado en el `Dockerfile`.
 
