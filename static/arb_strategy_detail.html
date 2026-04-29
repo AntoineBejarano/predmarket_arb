@@ -142,7 +142,12 @@
     <section>
       <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
         <h2 class="text-sm font-medium text-slate-300">Log CSV (últimas filas)</h2>
-        <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
+        <div class="flex flex-wrap items-center gap-2">
+          <a id="btn-csv-download" href="#" download
+            class="text-xs px-2 py-1 border border-emerald-800 text-emerald-300 rounded hover:bg-emerald-950/40">Descargar CSV completo</a>
+          <a id="btn-snapshots-csv-download" href="#" download class="hidden text-xs px-2 py-1 border border-cyan-800 text-cyan-300 rounded hover:bg-cyan-950/40">Descargar snapshots CSV</a>
+          <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
+        </div>
       </div>
       <div class="overflow-x-auto rounded-xl border border-slate-700">
         <table class="w-full text-xs text-left min-w-[720px]">
@@ -203,7 +208,20 @@
     if (SLUG === "latency_arb_sports") {
       const snap = document.getElementById("snapshots-section");
       if (snap) snap.classList.remove("hidden");
+      const snapDl = document.getElementById("btn-snapshots-csv-download");
+      if (snapDl) {
+        snapDl.href = "/api/arb/strategy/" + encodeURIComponent(SLUG) + "/snapshots-csv-download";
+        snapDl.download = "latency_arb_sports_snapshots.csv";
+        snapDl.classList.remove("hidden");
+      }
     }
+    (function () {
+      const a = document.getElementById("btn-csv-download");
+      if (a) {
+        a.href = "/api/arb/strategy/" + encodeURIComponent(SLUG) + "/csv-download";
+        a.download = SLUG + ".csv";
+      }
+    })();
 
     const SNAPSHOT_PREFIX = [
       "snapshot_at",

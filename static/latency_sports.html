@@ -109,9 +109,15 @@
     </section>
 
     <section>
-      <div class="flex items-center justify-between mb-2">
+      <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
         <h2 class="text-sm font-medium text-slate-300">Últimas 100 filas CSV</h2>
-        <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
+        <div class="flex flex-wrap items-center gap-2">
+          <a href="/api/arb/strategy/latency_arb_sports/csv-download" download="latency_arb_sports.csv"
+            class="text-xs px-2 py-1 border border-emerald-800 text-emerald-300 rounded hover:bg-emerald-950/40">Descargar CSV completo</a>
+          <a href="/api/arb/strategy/latency_arb_sports/snapshots-csv-download" download="latency_arb_sports_snapshots.csv"
+            class="text-xs px-2 py-1 border border-cyan-800 text-cyan-300 rounded hover:bg-cyan-950/40">Descargar snapshots CSV</a>
+          <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
+        </div>
       </div>
       <div class="overflow-x-auto rounded-xl border border-slate-700">
         <table class="w-full text-xs text-left min-w-[900px]">

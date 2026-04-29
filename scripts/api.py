@@ -403,6 +403,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             log.error("AUTO_START falló: %s", err)
     else:
         log.info("AUTO_START desactivado: pulsa START en el dashboard o llama POST /api/start")
+    try:
+        (DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("No se pudo asegurar DATA_DIR/logs (%s): %s", DATA_DIR / "logs", e)
     yield
     if supervisor.is_running():
         log.info("Apagado API: deteniendo validate_edge…")
@@ -538,6 +542,36 @@ async def api_signals_download() -> Union[FileResponse, JSONResponse]:
         path=str(p),
         media_type="text/csv; charset=utf-8",
         filename="signals.csv",
+    )
+
+
+@app.get("/api/arb/strategy/{slug}/csv-download", response_model=None)
+async def arb_strategy_csv_download(slug: str) -> Union[FileResponse, JSONResponse]:
+    """Descarga el CSV completo de señales paper de la estrategia (``DATA_DIR/logs/{slug}.csv``)."""
+    if slug not in STRATEGY_SLUGS:
+        raise HTTPException(status_code=404, detail="Unknown strategy")
+    path = ARB_CSV_PATHS[slug]
+    if not path.is_file():
+        return JSONResponse({"detail": f"CSV not found: {path.name}"}, status_code=404)
+    return FileResponse(
+        path=str(path),
+        media_type="text/csv; charset=utf-8",
+        filename=f"{slug}.csv",
+    )
+
+
+@app.get("/api/arb/strategy/{slug}/snapshots-csv-download", response_model=None)
+async def arb_strategy_snapshots_csv_download(slug: str) -> Union[FileResponse, JSONResponse]:
+    """Descarga ``latency_arb_sports_snapshots.csv`` completo (solo ``latency_arb_sports``)."""
+    if slug != "latency_arb_sports":
+        raise HTTPException(status_code=404, detail="Snapshots CSV only for latency_arb_sports")
+    p = LATENCY_ARB_SPORTS_SNAPSHOTS_CSV
+    if not p.is_file():
+        return JSONResponse({"detail": f"CSV not found: {p.name}"}, status_code=404)
+    return FileResponse(
+        path=str(p),
+        media_type="text/csv; charset=utf-8",
+        filename="latency_arb_sports_snapshots.csv",
     )
 
 
