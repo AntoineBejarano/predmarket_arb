@@ -76,9 +76,9 @@ _DEFAULT_HEADERS = {
 }
 
 MIN_DISCOVERY_TTL_SEC = 300
-# Cooldown por partido+lado: solo reemitir si el mid cambia >2% o han pasado 5 minutos.
-_SIGNAL_COOLDOWN_PRICE_EPS = 0.02
-_SIGNAL_COOLDOWN_SEC = 300.0
+# Cooldown por partido+lado: solo reemitir si el mid cambia >0.5% o han pasado 30 s.
+_SIGNAL_COOLDOWN_PRICE_EPS = 0.005
+_SIGNAL_COOLDOWN_SEC = 30.0
 
 # Defaults embebidos si Railway (u otro) no define env; `os.getenv` sigue pudiendo sobreescribir en local.
 _EMBEDDED_LATENCY_SPORTS_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
