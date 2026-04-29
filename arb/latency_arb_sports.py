@@ -168,7 +168,8 @@ _HARDCODE_DISCOVERY_TTL = 300.0
 _HARDCODE_DISCOVERY_TTL_ACTIVE = 30.0
 _HARDCODE_WINDOW_HOURS_BEFORE = 3.0
 _HARDCODE_BETFAIR_GAMMA_SEARCH_TTL = 60.0
-_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL_ACTIVE = 10.0
+_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL_ACTIVE = 30.0
+_HARDCODE_CLOB_WS_WARMUP_SEC = 0.35
 _HARDCODE_GAMMA_PUBLIC_SEARCH_LIMIT = 40
 _HARDCODE_MATCH_PARALLELISM = 8
 _SNAPSHOT_CSV_ENABLED = True
@@ -1328,62 +1329,67 @@ class LatencyArbSportsStrategy(ArbStrategy):
             io_sports = [s.strip() for s in str(raw_io_sports).split(",") if s.strip()]
             self._odds_client.start_ws_stream(sports=io_sports)
         try:
-            while True:
-                try:
-                    enabled = await state_manager.is_enabled(self.slug)
-                    if not enabled:
-                        await asyncio.sleep(self.poll_interval)
-                        continue
-                    odds_ws = self._odds_client._ws_runner_task
-                    if odds_ws is not None and odds_ws.done() and not odds_ws.cancelled():
-                        exc = odds_ws.exception()
-                        if exc is not None:
-                            raise exc
-                    await self._poll_cycle(state_manager)
-                except asyncio.CancelledError:
-                    raise
-                except OddsApiIoRestQuotaError as e:
-                    log.error(
-                        "[latency_arb_sports] odds-api.io REST rechazó la petición (p. ej. límite gratuito); "
-                        "parando estrategia para no seguir consumiendo requests. %s",
-                        e,
-                    )
-                    raise
-                except Exception as e:
-                    log.exception("[latency_arb_sports] poll error")
-                    await self.log_signal_async(
-                        {
-                            "action": "ERROR:INTERNAL",
-                            "reason": str(e)[:200],
-                            "game_slug": "",
-                            "league": "",
-                            "home_team": "",
-                            "away_team": "",
-                            "side": "",
-                            "token_id": "",
-                            "price_poly": "",
-                            "prob_pinnacle": "",
-                            "edge": "",
-                            "size_usdc": "",
-                            "status": "ERROR",
-                            "odds_io_updated_at": "",
-                            "clob_best_bid": "",
-                            "clob_best_bid_size": "",
-                            "clob_best_ask": "",
-                            "clob_best_ask_size": "",
-                            "clob_liquidity_at_price": "",
-                            "poly_price_30s": "",
-                            "poly_price_60s": "",
-                            "poly_price_120s": "",
-                            "betfair_depth_home": "",
-                            "betfair_depth_away": "",
-                            "match_score": "",
-                            "signal_anchor_ts": "",
-                        }
-                    )
-                games = self._open_games
-                interval = self.poll_interval_active if self._is_in_active_window(games) else self.poll_interval
-                await asyncio.sleep(interval)
+            async with PolyCLOBClient(
+                api_key=os.getenv("POLY_API_KEY", ""),
+                private_key=os.getenv("POLY_PRIVATE_KEY", ""),
+                dry_run=self.dry_run,
+            ) as clob:
+                while True:
+                    try:
+                        enabled = await state_manager.is_enabled(self.slug)
+                        if not enabled:
+                            await asyncio.sleep(self.poll_interval)
+                            continue
+                        odds_ws = self._odds_client._ws_runner_task
+                        if odds_ws is not None and odds_ws.done() and not odds_ws.cancelled():
+                            exc = odds_ws.exception()
+                            if exc is not None:
+                                raise exc
+                        await self._poll_cycle(state_manager, clob)
+                    except asyncio.CancelledError:
+                        raise
+                    except OddsApiIoRestQuotaError as e:
+                        log.error(
+                            "[latency_arb_sports] odds-api.io REST rechazó la petición (p. ej. límite gratuito); "
+                            "parando estrategia para no seguir consumiendo requests. %s",
+                            e,
+                        )
+                        raise
+                    except Exception as e:
+                        log.exception("[latency_arb_sports] poll error")
+                        await self.log_signal_async(
+                            {
+                                "action": "ERROR:INTERNAL",
+                                "reason": str(e)[:200],
+                                "game_slug": "",
+                                "league": "",
+                                "home_team": "",
+                                "away_team": "",
+                                "side": "",
+                                "token_id": "",
+                                "price_poly": "",
+                                "prob_pinnacle": "",
+                                "edge": "",
+                                "size_usdc": "",
+                                "status": "ERROR",
+                                "odds_io_updated_at": "",
+                                "clob_best_bid": "",
+                                "clob_best_bid_size": "",
+                                "clob_best_ask": "",
+                                "clob_best_ask_size": "",
+                                "clob_liquidity_at_price": "",
+                                "poly_price_30s": "",
+                                "poly_price_60s": "",
+                                "poly_price_120s": "",
+                                "betfair_depth_home": "",
+                                "betfair_depth_away": "",
+                                "match_score": "",
+                                "signal_anchor_ts": "",
+                            }
+                        )
+                    games = self._open_games
+                    interval = self.poll_interval_active if self._is_in_active_window(games) else self.poll_interval
+                    await asyncio.sleep(interval)
         finally:
             self._shutdown.set()
             await self._odds_client.stop_ws_stream()
@@ -1620,7 +1626,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._betfair_gamma_search_cache[eid] = (time.monotonic(), game)
         return game
 
-    async def _poll_cycle(self, state_manager: Any) -> None:
+    async def _poll_cycle(self, state_manager: Any, clob: PolyCLOBClient) -> None:
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
@@ -1670,17 +1676,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
         async with aiohttp.ClientSession(
             headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
-        ) as sess, PolyCLOBClient(
-            api_key=os.getenv("POLY_API_KEY", ""),
-            private_key=os.getenv("POLY_PRIVATE_KEY", ""),
-            dry_run=self.dry_run,
-        ) as clob:
+        ) as sess:
             self._cycle_seq += 1
             seq = self._cycle_seq
             self._cycle_public_search_http = 0
             self._cycle_public_search_cache_hits = 0
             open_games = await self._fetch_open_polymarket_sports(sess)
             await clob.ensure_market_ws_subscription(_poly_token_ids_from_open_games(open_games))
+            await asyncio.sleep(min(float(_HARDCODE_CLOB_WS_WARMUP_SEC), 1.0))
             if seq == 1 and not self._cache_debug_done:
                 self._cache_debug_done = True
                 odds_key = POLY_SLUG_TO_ODDS_KEY.get("atp", "atp")
