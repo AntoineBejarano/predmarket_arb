@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,6 +77,7 @@ ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SL
 BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
 LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snapshots.csv"
 LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
+LATENCY_SPORTS_SCHEDULE_JSON = DATA_DIR / "logs" / "latency_sports_schedule.json"
 ODDS_EVENT_META_CACHE_JSON = DATA_DIR / "logs" / "odds_event_meta_cache.json"
 # Sentinel: latency_arb_sports vacía `_event_meta_cache` del OddsApiIo al ver este archivo.
 ODDS_EVENT_META_CACHE_CLEAR_FLAG = DATA_DIR / "logs" / ".odds_event_meta_cache_clear_requested"
@@ -392,6 +394,8 @@ def build_status_payload() -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    from arb.latency_sports_schedule import scheduler_env_enabled, scheduler_poll_sec
+
     log.info(
         "API arrancando: DATA_DIR=%s PORT=%s AUTO_START=%s VALIDATOR_HEALTH_PORT=%s",
         DATA_DIR,
@@ -413,7 +417,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         (DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
     except OSError as e:
         log.warning("No se pudo asegurar DATA_DIR/logs (%s): %s", DATA_DIR / "logs", e)
-    yield
+    sched_task: Optional[asyncio.Task[None]] = None
+    if scheduler_env_enabled():
+        log.info(
+            "LATENCY_SPORTS_SCHEDULER activo: ajustará enabled de latency_arb_sports cada ~%ss (POST /api/arb/start sigue siendo manual)",
+            int(scheduler_poll_sec()),
+        )
+        sched_task = asyncio.create_task(_latency_sports_scheduler_loop(), name="latency_sports_scheduler")
+    try:
+        yield
+    finally:
+        if sched_task is not None:
+            sched_task.cancel()
+            try:
+                await sched_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                log.warning("latency_sports_scheduler join: %s", e)
     if supervisor.is_running():
         log.info("Apagado API: deteniendo validate_edge…")
         supervisor.stop()
@@ -479,6 +500,19 @@ async def arb_latency_sports_detail_page() -> Union[FileResponse, JSONResponse]:
     if not LATENCY_SPORTS_HTML.is_file():
         return JSONResponse({"detail": "static/latency_sports.html not found"}, status_code=404)
     return FileResponse(path=str(LATENCY_SPORTS_HTML), media_type="text/html; charset=utf-8")
+
+
+@app.get("/api/arb/latency_sports/schedule")
+async def api_latency_sports_schedule(refresh: bool = Query(False)) -> JSONResponse:
+    """
+    Próximos partidos desde Gamma (Polymarket) + flags del planificador LATENCY_SPORTS_SCHEDULER.
+    Sin odds-api.io. Caché ~50s; `refresh=true` fuerza nueva consulta Gamma.
+    """
+    payload = await refresh_latency_sports_schedule(force=refresh)
+    return JSONResponse(
+        content=payload,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/arb/strategy/{slug}", response_model=None)
@@ -675,6 +709,49 @@ _arb_proc: Optional[subprocess.Popen[Any]] = None
 _arb_lock = threading.Lock()
 _state_manager = StrategyStateManager()
 
+_latency_schedule_lock = asyncio.Lock()
+_latency_schedule_cache: dict[str, Any] = {}
+_latency_schedule_mono: float = 0.0
+
+
+async def refresh_latency_sports_schedule(*, force: bool = False) -> dict[str, Any]:
+    """Refresca próximos eventos IO + should_run; caché ~50s salvo force."""
+    global _latency_schedule_cache, _latency_schedule_mono
+    from arb.latency_sports_schedule import build_schedule_payload, write_schedule_cache
+    async with _latency_schedule_lock:
+        now_m = time.monotonic()
+        if not force and _latency_schedule_cache and (now_m - _latency_schedule_mono) < 50.0:
+            return _latency_schedule_cache
+        timeout = aiohttp.ClientTimeout(total=90)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            payload = await build_schedule_payload(session, upcoming_limit=10)
+        _latency_schedule_cache = payload
+        _latency_schedule_mono = now_m
+        write_schedule_cache(LATENCY_SPORTS_SCHEDULE_JSON, payload)
+        return payload
+
+
+async def _latency_sports_scheduler_loop() -> None:
+    from arb.latency_sports_schedule import scheduler_env_enabled, scheduler_poll_sec
+
+    slug = "latency_arb_sports"
+    while True:
+        try:
+            payload = await refresh_latency_sports_schedule(force=True)
+            should = bool(payload.get("should_run_latency_sports"))
+            cur = await _state_manager.is_enabled(slug)
+            if should and not cur:
+                await _state_manager.enable(slug)
+                log.info("[api] LATENCY_SPORTS_SCHEDULER: estrategia %s → enabled", slug)
+            elif not should and cur:
+                await _state_manager.disable(slug)
+                log.info("[api] LATENCY_SPORTS_SCHEDULER: estrategia %s → disabled", slug)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("[api] LATENCY_SPORTS_SCHEDULER tick")
+        await asyncio.sleep(scheduler_poll_sec())
+
 def _read_arb_csv_tail(path: Path, n: int = 200) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -804,6 +881,7 @@ def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
             BUNDLE_ARB_SCAN_JSON,
             LATENCY_ARB_SPORTS_SNAPSHOTS_CSV,
             LATENCY_SPORTS_CYCLE_METRICS_JSON,
+            LATENCY_SPORTS_SCHEDULE_JSON,
             ODDS_EVENT_META_CACHE_JSON,
         ]
     )

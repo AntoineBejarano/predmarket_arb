@@ -25,6 +25,9 @@ dependencies = [
     "websocket-client>=1.6.0",
 ]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.uv]
 dev-dependencies = [
     "jupyterlab>=4.0.0",

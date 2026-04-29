@@ -89,6 +89,45 @@
       </div>
     </section>
 
+    <section class="rounded-xl border border-slate-700 bg-slate-800/30 p-4 space-y-3">
+      <div class="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h2 class="text-sm font-medium text-slate-200">Próximos eventos (Gamma / Polymarket)</h2>
+          <p class="text-xs text-slate-500 mt-0.5">
+            Hora estimada en <span class="text-slate-400">Europe/Madrid</span> desde metadata Gamma (sin llamadas a
+            odds-api.io). Solo filas con <code class="text-slate-600">kickoff_utc</code> inferido; partidos con kickoff hace
+            &gt;45 min no se listan.
+          </p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <span id="schedule-banner" class="text-[11px] px-2 py-1 rounded border border-slate-600 text-slate-400">—</span>
+          <button type="button" onclick="loadSchedule(true)" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar ahora</button>
+        </div>
+      </div>
+      <p id="schedule-meta" class="text-[11px] text-slate-500 font-mono">—</p>
+      <div class="overflow-x-auto rounded-lg border border-slate-700">
+        <table class="w-full text-xs text-left min-w-[720px]">
+          <thead>
+            <tr class="bg-slate-800 text-slate-400 uppercase">
+              <th class="p-2">Inicio (España)</th>
+              <th class="p-2">UTC</th>
+              <th class="p-2">Respecto al inicio</th>
+              <th class="p-2">Estado</th>
+              <th class="p-2">Liga</th>
+              <th class="p-2">Partido</th>
+              <th class="p-2">Poly</th>
+            </tr>
+          </thead>
+          <tbody id="upcoming-body" class="divide-y divide-slate-800 font-mono text-slate-300"></tbody>
+        </table>
+      </div>
+      <p class="text-[10px] text-slate-600 leading-relaxed">
+        Con <code class="text-slate-500">LATENCY_SPORTS_SCHEDULER=true</code>, el planificador usa solo ventanas inferidas desde Gamma
+        (<span class="text-slate-500">kickoff ± márgenes</span>; solapes: basta una ventana activa). No consulta odds-api.io aquí.
+        El subproceso <code class="text-slate-500">arb_engine</code> sigue arrancando manualmente (<strong>Start motor</strong>).
+      </p>
+    </section>
+
     <section class="grid grid-cols-3 gap-3">
       <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-3">
         <p class="text-xs text-slate-500">Señales hoy <span class="text-slate-600">(día España)</span></p>
@@ -229,6 +268,100 @@
         month: "2-digit",
         day: "2-digit",
       }).format(d);
+    }
+
+    function formatKickoffUtc(iso) {
+      if (!iso) return "—";
+      const d = new Date(String(iso));
+      if (Number.isNaN(d.getTime())) return "—";
+      return new Intl.DateTimeFormat("es-ES", {
+        timeZone: "UTC",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).format(d) + " UTC";
+    }
+
+    async function loadSchedule(force) {
+      const q = force ? "?refresh=true" : "";
+      let j = {};
+      try {
+        const r = await fetch("/api/arb/latency_sports/schedule" + q, {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (r.ok) j = await r.json();
+      } catch (e) {}
+      const schedOn = !!j.scheduler_enabled;
+      const should = !!j.should_run_latency_sports;
+      const ban = document.getElementById("schedule-banner");
+      if (schedOn) {
+        ban.textContent = should ? "Planificador ON · ventana activa" : "Planificador ON · fuera de ventana";
+        ban.className =
+          "text-[11px] px-2 py-1 rounded border " +
+          (should ? "border-amber-600 text-amber-200 bg-amber-950/40" : "border-slate-600 text-slate-400");
+      } else {
+        ban.textContent = "Planificador OFF (solo lectura)";
+        ban.className = "text-[11px] px-2 py-1 rounded border border-slate-600 text-slate-500";
+      }
+      const meta = [
+        "updated_at=" + esc(j.updated_at || "—"),
+        "gamma_open=" + String(j.gamma_open_games ?? "—"),
+        "con_kickoff=" + String(j.gamma_games_with_kickoff ?? "—"),
+        "windows=" + String(j.active_windows_count ?? "—"),
+        "should_run=" + String(!!j.should_run_latency_sports),
+        j.error ? "error=" + esc(j.error) : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      document.getElementById("schedule-meta").textContent = meta;
+      const rows = j.upcoming || [];
+      document.getElementById("upcoming-body").innerHTML =
+        rows.length === 0
+          ? '<tr><td colspan="7" class="p-3 text-slate-500">Sin filas (sin datos IO o error de cuota).</td></tr>'
+          : rows
+              .map(function (r) {
+                const es = esc(r.kickoff_es_label || "—");
+                const utc = esc(formatKickoffUtc(r.kickoff_utc));
+                const dm =
+                  r.kickoff_delta_label != null && r.kickoff_delta_label !== ""
+                    ? esc(r.kickoff_delta_label)
+                    : r.minutes_to_kickoff != null
+                      ? esc(String(r.minutes_to_kickoff)) + " min"
+                      : "—";
+                const st = esc(r.status || "—");
+                const lg = esc((r.league || "").slice(0, 48));
+                const pt = esc((r.home || "") + " vs " + (r.away || ""));
+                const poly = r.polymarket_slug ? esc(r.polymarket_slug) : "—";
+                return (
+                  "<tr class='hover:bg-slate-800/40'>" +
+                  "<td class='p-2 text-emerald-200/90'>" +
+                  es +
+                  "</td>" +
+                  "<td class='p-2 text-slate-500'>" +
+                  utc +
+                  "</td>" +
+                  "<td class='p-2'>" +
+                  dm +
+                  "</td>" +
+                  "<td class='p-2'>" +
+                  st +
+                  "</td>" +
+                  "<td class='p-2 text-slate-400'>" +
+                  lg +
+                  "</td>" +
+                  "<td class='p-2'>" +
+                  pt +
+                  "</td>" +
+                  "<td class='p-2 text-cyan-300/80'>" +
+                  poly +
+                  "</td></tr>"
+                );
+              })
+              .join("");
     }
 
     async function refreshStatus() {
@@ -664,10 +797,12 @@
     }
 
     refreshStatus();
+    loadSchedule(false);
     loadLog();
     startLive();
     setInterval(() => {
       refreshStatus();
+      loadSchedule(false);
       loadLog();
     }, 12000);
   </script>

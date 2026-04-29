@@ -308,6 +308,7 @@ class OpenPolymarketGame:
     slug: str
     outcome_tokens: list[tuple[str, str]]
     end_date_s: Optional[str]
+    kickoff_utc: Optional[datetime] = None
 
 
 def _odds_io_updated_age_sec(odds_event: OddsEvent) -> Optional[float]:
@@ -518,6 +519,71 @@ def _yes_token_from_pairs(pairs: list[tuple[str, str]]) -> Optional[str]:
     return pairs[0][1] if pairs else None
 
 
+def _first_two_team_tradeable_market(ev: dict[str, Any]) -> Optional[dict[str, Any]]:
+    for m in ev.get("markets") or []:
+        if not isinstance(m, dict):
+            continue
+        if api_bool_true(m.get("closed")):
+            continue
+        ok, _why = clob_market_tradeable(m)
+        if not ok:
+            continue
+        pairs = _outcome_token_pairs(m)
+        if len(pairs) < 2:
+            continue
+        labs = [p[0].strip().lower() for p in pairs]
+        if labs in (["yes", "no"], ["no", "yes"]):
+            continue
+        return m
+    return None
+
+
+def _kickoff_naive_utc_from_gamma_slug(slug: str) -> Optional[datetime]:
+    m = _TENNISLIKE_GAMMA_SLUG_RE.match(str(slug or "").strip().lower())
+    if not m:
+        return None
+    ds = m.group("d")
+    try:
+        y, mo, d = int(ds[0:4]), int(ds[5:7]), int(ds[8:10])
+        return datetime(y, mo, d, 12, 0, 0, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def gamma_event_kickoff_utc(ev: dict[str, Any], *, ref: datetime) -> Optional[datetime]:
+    """
+    Mejor esfuerzo de inicio del partido solo con datos Gamma (sin odds-api).
+    Orden de señales: startDate evento, mercado 2-way (pregunta / startDate), fecha en slug tenis,
+    y solo si no hay nada más, endDate del evento.
+    """
+    candidates: list[datetime] = []
+    t0 = _parse_iso_utc(ev.get("startDate"))
+    if t0 is not None:
+        candidates.append(t0)
+    tm = _first_two_team_tradeable_market(ev)
+    if tm is not None:
+        pq = _parse_commence_from_question(str(tm.get("question") or ""), ref)
+        if pq is not None:
+            candidates.append(pq)
+        for raw in (tm.get("startDate"), tm.get("endDate")):
+            t = _parse_iso_utc(raw)
+            if t is not None:
+                candidates.append(t)
+    slug_dt = _kickoff_naive_utc_from_gamma_slug(str(ev.get("slug") or ""))
+    if slug_dt is not None:
+        candidates.append(slug_dt)
+    if not candidates:
+        end_ev = _parse_iso_utc(ev.get("endDate"))
+        if end_ev is not None:
+            candidates.append(end_ev)
+    if not candidates:
+        return None
+    pruned = [c for c in candidates if abs((c - ref).total_seconds()) < 86400 * 400]
+    if not pruned:
+        return None
+    return min(pruned, key=lambda c: abs((c - ref).total_seconds()))
+
+
 def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[OpenPolymarketGame]:
     title = str(ev.get("title") or "")
     home_p, away_p = _parse_poly_title_teams(title)
@@ -551,6 +617,9 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
         two_team_m = m
         break
 
+    ref_k = datetime.now(timezone.utc)
+    kfu = gamma_event_kickoff_utc(ev, ref=ref_k)
+
     if two_team_m is not None:
         h2, a2 = _teams_from_market(two_team_m)
         if not h2 or not a2:
@@ -574,6 +643,7 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
             slug=slug_e,
             outcome_tokens=list(pairs),
             end_date_s=end_s,
+            kickoff_utc=kfu,
         )
 
     home_yes: Optional[str] = None
@@ -632,6 +702,7 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
             slug=slug_e,
             outcome_tokens=outcome_tokens,
             end_date_s=end_s,
+            kickoff_utc=kfu,
         )
     return None
 
