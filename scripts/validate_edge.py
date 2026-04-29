@@ -23,7 +23,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import requests
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -34,18 +33,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lab.paths import data_dir  # noqa: E402
 from scripts.healthcheck import start_health_server  # noqa: E402
 from scripts import polymarket_feed  # noqa: E402
 
-load_dotenv(REPO_ROOT / ".env")
-
-import os  # noqa: E402
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "0.08"))
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/")
-GAMMA_API_URL = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com").rstrip("/")
-DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
+LOG_LEVEL = "INFO"
+SIGNAL_THRESHOLD = 0.08
+BINANCE_BASE_URL = "https://api.binance.com"
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
+DATA_DIR = data_dir()
+VALIDATOR_HEALTH_PORT = 18088
 SIGNALS_CSV = DATA_DIR / "logs" / "signals.csv"
 REPORTS_DIR = DATA_DIR / "reports"
 
@@ -101,15 +98,15 @@ BINANCE_POLL_SEC = 30.0
 MAIN_LOOP_SEC = 30.0
 GAMMA_CACHE_SEC = 60.0
 GAMMA_PAGE_SLEEP = 1.0
-GAMMA_MAX_PAGES = int(os.getenv("GAMMA_MAX_PAGES", "120"))
+GAMMA_MAX_PAGES = 120
 # slug: GET /markets/slug/{btc|eth|...}-updown-5m-{unix_5m_utc} (recomendado). scan: paginación legacy.
-GAMMA_FETCH_MODE = os.getenv("GAMMA_FETCH_MODE", "slug").strip().lower()
-GAMMA_SLUG_CACHE_SEC = float(os.getenv("GAMMA_SLUG_CACHE_SEC", "15"))
-POLYMARKET_WS_URL = os.getenv("POLYMARKET_WS_URL", "wss://ws-live-data.polymarket.com").strip()
+GAMMA_FETCH_MODE = "slug"
+GAMMA_SLUG_CACHE_SEC = 15.0
+POLYMARKET_WS_URL = "wss://ws-live-data.polymarket.com"
 # polymarket: RTDS crypto_prices (btc/eth/sol/xrp) + Binance REST solo BNB. binance: los 5 por REST.
-PRICE_FEED = os.getenv("PRICE_FEED", "polymarket").strip().lower()
+PRICE_FEED = "polymarket"
 # Ventana 5m: no procesar mercado fuera de [0, WINDOW_DURATION_MIN) minutos.
-WINDOW_DURATION_MIN = float(os.getenv("WINDOW_DURATION_MIN", "5"))
+WINDOW_DURATION_MIN = 5.0
 CSV_WRITE_RETRIES = 3
 
 log = logging.getLogger("validate_edge")
@@ -873,9 +870,8 @@ def run_main(hours: float | None, threshold: float) -> None:
             ", ".join(sorted(models.keys())),
         )
 
-    port = int(os.getenv("PORT", "8080"))
-    start_health_server(port)
-    log.info("Health server en 0.0.0.0:%s /health", port)
+    start_health_server(VALIDATOR_HEALTH_PORT)
+    log.info("Health server en 0.0.0.0:%s /health", VALIDATOR_HEALTH_PORT)
     ensure_signals_csv_header()
 
     stop_event = threading.Event()
@@ -1364,13 +1360,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     thr = float(args.threshold) if args.threshold is not None else SIGNAL_THRESHOLD
-    env_hours = os.getenv("RUN_HOURS")
     hours_limit = args.hours
-    if hours_limit is None and env_hours:
-        try:
-            hours_limit = float(env_hours)
-        except ValueError:
-            pass
     if args.analyze:
         analyze_csv_only()
         return

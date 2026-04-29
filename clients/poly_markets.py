@@ -152,8 +152,9 @@ def _diag_query_params(params: dict[str, str]) -> dict[str, str]:
 
 
 def _logs_dir() -> Path:
-    base = Path(os.getenv("DATA_DIR", ".")).resolve()
-    out = base / "logs"
+    from lab.paths import data_dir
+
+    out = data_dir() / "logs"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

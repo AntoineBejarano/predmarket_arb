@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from clients.poly_clob import PolyCLOBClient
+from lab.paths import data_dir
 
 
 def negrisk_maker_paths() -> dict[str, Path]:
-    base = Path(os.getenv("DATA_DIR", ".")).resolve() / "logs"
+    base = data_dir() / "logs"
     base.mkdir(parents=True, exist_ok=True)
     return {
         "state": base / "negrisk_maker_state.json",

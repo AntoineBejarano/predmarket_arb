@@ -10,6 +10,8 @@ import os
 import re
 import threading
 import time
+import types
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +31,7 @@ from clients.odds_api_io import (
     normalize_name_order,
     remove_vig as remove_vig_decimal,
 )
-from clients.poly_clob import PolyCLOBClient
+from clients.poly_clob import PolyCLOBClient, _level_price, _level_size, _size_at_price
 from clients.poly_markets import GAMMA_API_URL
 from clients.poly_parse import api_bool_true, clob_market_tradeable, parse_json_list_maybe, parse_outcomes_list
 
@@ -60,12 +62,87 @@ _SNAPSHOT_CSV_COLUMNS: list[str] = [
 
 
 def _latency_snapshots_csv_path() -> Path:
-    return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "latency_arb_sports_snapshots.csv"
+    from lab.paths import data_dir
+
+    return data_dir() / "logs" / "latency_arb_sports_snapshots.csv"
 
 
 def _odds_event_meta_cache_clear_flag_path() -> Path:
     """Sentinel escrito por POST /api/admin/clear-meta-cache; el motor vacía RAM del cliente IO."""
-    return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / ".odds_event_meta_cache_clear_requested"
+    from lab.paths import data_dir
+
+    return data_dir() / "logs" / ".odds_event_meta_cache_clear_requested"
+
+
+def _fmt_opt_float(x: Optional[float], nd: int = 6) -> str:
+    if x is None:
+        return ""
+    try:
+        return f"{float(x):.{nd}f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _orderbook_best_bid_size(ob: dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    bids = ob.get("bids") or []
+    if not isinstance(bids, list):
+        return None, None
+    best: Optional[float] = None
+    for lvl in bids:
+        p = _level_price(lvl)
+        if p is None:
+            continue
+        if best is None or p > best:
+            best = p
+    if best is None:
+        return None, None
+    sz = _size_at_price(bids, best)
+    return best, sz
+
+
+def _asks_notional_usdc_in_band(ob: dict[str, Any], center: float, half: float = 0.01) -> Optional[float]:
+    asks = ob.get("asks") or []
+    if not isinstance(asks, list):
+        return None
+    lo, hi = float(center) - float(half), float(center) + float(half)
+    tot = 0.0
+    any_hit = False
+    for lvl in asks:
+        p = _level_price(lvl)
+        if p is None:
+            continue
+        if p < lo - 1e-12 or p > hi + 1e-12:
+            continue
+        sz = _level_size(lvl)
+        if sz is None:
+            continue
+        tot += float(p) * float(sz)
+        any_hit = True
+    return tot if any_hit else 0.0
+
+
+def _depth_pair_from_ws_payload(data: dict[str, Any]) -> tuple[str, str]:
+    """depthHome/depthAway en mensaje WS odds-api.io (o dentro del primer odds ML)."""
+    dh = data.get("depthHome") if data.get("depthHome") is not None else data.get("depth_home")
+    da = data.get("depthAway") if data.get("depthAway") is not None else data.get("depth_away")
+    if dh not in (None, "") or da not in (None, ""):
+        return str(dh if dh is not None else ""), str(da if da is not None else "")
+    mk = data.get("markets")
+    if not isinstance(mk, list):
+        return "", ""
+    for item in mk:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").upper() != "ML":
+            continue
+        odds_list = item.get("odds") or []
+        if not isinstance(odds_list, list) or not odds_list or not isinstance(odds_list[0], dict):
+            break
+        row0 = odds_list[0]
+        dh2 = row0.get("depthHome") if row0.get("depthHome") is not None else row0.get("depth_home")
+        da2 = row0.get("depthAway") if row0.get("depthAway") is not None else row0.get("depth_away")
+        return str(dh2 if dh2 is not None else ""), str(da2 if da2 is not None else "")
+    return "", ""
 
 
 _DEFAULT_HEADERS = {
@@ -79,7 +156,7 @@ _SIGNAL_COOLDOWN_PRICE_EPS = 0.005
 _SIGNAL_COOLDOWN_SEC = 30.0
 
 # Parámetros fijos de la estrategia (no se leen LATENCY_SPORTS_* ni ODDS_API_IO_SPORTS del entorno).
-# Siguen por env: DATA_DIR, POLY_* (CLOB), claves Odds API en clients/odds_api_io.
+# Rutas de datos: ``lab.paths.data_dir()`` (fijo ``<repo>/data``). Siguen por env: POLY_* (CLOB), claves Odds API en clients/odds_api_io.
 _HARDCODE_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
 _HARDCODE_MIN_EDGE = 0.005
 _HARDCODE_MAX_STAKE_USDC = 10.0
@@ -870,6 +947,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "edge",
             "size_usdc",
             "status",
+            "odds_io_updated_at",
+            "clob_best_bid",
+            "clob_best_bid_size",
+            "clob_best_ask",
+            "clob_best_ask_size",
+            "clob_liquidity_at_price",
+            "poly_price_30s",
+            "poly_price_60s",
+            "poly_price_120s",
+            "betfair_depth_home",
+            "betfair_depth_away",
+            "match_score",
+            "signal_anchor_ts",
         ]
 
     def __init__(self, config: dict[str, Any], dry_run: bool = True) -> None:
@@ -917,6 +1007,182 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._betfair_gamma_search_ttl = float(_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL)
         self._cycle_public_search_http = 0
         self._cycle_public_search_cache_hits = 0
+        # Última profundidad Betfair por (event_id, bookie) desde WS IO (hook en _apply_ws_created_updated).
+        self._io_betfair_depth_last: dict[tuple[str, str], tuple[str, str]] = {}
+        self._io_ws_depth_hook_installed = False
+        # Follow-up precios Poly a 30/60/120s tras SIGNAL/SKIP (clave uuid).
+        self._pending_poly_followups: dict[str, dict[str, Any]] = {}
+
+    def _ensure_csv(self) -> None:
+        """Migra cabecera si hay columnas nuevas (base solo fusiona ficticio)."""
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        want = self.all_csv_columns
+        if not self.csv_path.exists():
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=want, extrasaction="ignore")
+                w.writeheader()
+            return
+        with open(self.csv_path, newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            old_fields = list(r.fieldnames or [])
+            rows = list(r)
+        if tuple(old_fields) == tuple(want):
+            return
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=want, extrasaction="ignore")
+            w.writeheader()
+            for row in rows:
+                out = {k: row.get(k, "") for k in want}
+                w.writerow(out)
+
+    def _install_io_ws_depth_capture_hook(self) -> None:
+        if self._io_ws_depth_hook_installed:
+            return
+        self._io_ws_depth_hook_installed = True
+        c = self._odds_client
+        if not getattr(c, "ws_enabled", False):
+            return
+        orig = c._apply_ws_created_updated
+
+        async def wrapped(
+            self_c: OddsApiIo,
+            session: aiohttp.ClientSession,
+            data: dict[str, Any],
+            sport_param: str,
+            message_type: str,
+        ) -> None:
+            if isinstance(data, dict):
+                eid = str(data.get("id") or "").strip()
+                bk = str(data.get("bookie") or "").strip()
+                if eid and bk:
+                    dh, da = _depth_pair_from_ws_payload(data)
+                    self._io_betfair_depth_last[(eid, bk.casefold())] = (dh, da)
+            return await orig(session, data, sport_param, message_type)
+
+        c._apply_ws_created_updated = types.MethodType(wrapped, c)
+
+    def _betfair_depth_for_event(self, odds_event: OddsEvent) -> tuple[str, str]:
+        eid = (odds_event.event_id or "").strip()
+        bk = (odds_event.bookie or "").strip().casefold()
+        if not eid:
+            return "", ""
+        return self._io_betfair_depth_last.get((eid, bk), ("", ""))
+
+    async def _clob_trace_for_token(
+        self, clob: PolyCLOBClient, token_id: str, mid_signal: float
+    ) -> dict[str, str]:
+        ob = await clob.get_orderbook(token_id)
+        if not isinstance(ob, dict) or ob.get("error"):
+            return {
+                "clob_best_bid": "",
+                "clob_best_bid_size": "",
+                "clob_best_ask": "",
+                "clob_best_ask_size": "",
+                "clob_liquidity_at_price": "",
+            }
+        bb = ob.get("best_bid")
+        ba = ob.get("best_ask")
+        bb_f = float(bb) if bb is not None else None
+        ba_f = float(ba) if ba is not None else None
+        _, bb_sz = _orderbook_best_bid_size(ob)
+        ba_sz = ob.get("best_ask_size")
+        try:
+            ba_sz_f = float(ba_sz) if ba_sz is not None else None
+        except (TypeError, ValueError):
+            ba_sz_f = None
+        liq = _asks_notional_usdc_in_band(ob, float(mid_signal), 0.01)
+        return {
+            "clob_best_bid": _fmt_opt_float(bb_f),
+            "clob_best_bid_size": _fmt_opt_float(bb_sz),
+            "clob_best_ask": _fmt_opt_float(ba_f),
+            "clob_best_ask_size": _fmt_opt_float(ba_sz_f),
+            "clob_liquidity_at_price": _fmt_opt_float(liq, nd=4) if liq is not None else "",
+        }
+
+    async def _poly_mid_for_followup(self, clob: PolyCLOBClient, token_id: str) -> Optional[float]:
+        m = await clob.get_midpoint(token_id)
+        if m is not None:
+            return float(m)
+        ob = await clob.get_orderbook(token_id)
+        if not isinstance(ob, dict) or ob.get("error"):
+            return None
+        bb, ba = ob.get("best_bid"), ob.get("best_ask")
+        if bb is not None and ba is not None:
+            return (float(bb) + float(ba)) / 2.0
+        return None
+
+    def _register_poly_followup(self, snap: dict[str, Any], anchor_iso: str) -> None:
+        uid = str(uuid.uuid4())
+        self._pending_poly_followups[uid] = {
+            "t0": time.time(),
+            "anchor_iso": anchor_iso,
+            "snap": snap,
+            "p30": None,
+            "p60": None,
+            "p120": None,
+        }
+
+    async def _drain_poly_followups(self, clob: PolyCLOBClient) -> None:
+        now = time.time()
+        to_emit: list[tuple[str, dict[str, Any], str]] = []
+        for uid, p in list(self._pending_poly_followups.items()):
+            age = now - float(p["t0"])
+            tok = str(p["snap"].get("token_id") or "")
+            if not tok:
+                del self._pending_poly_followups[uid]
+                continue
+            if p["p30"] is None and age >= 30.0:
+                p["p30"] = await self._poly_mid_for_followup(clob, tok)
+            if p["p60"] is None and age >= 60.0:
+                p["p60"] = await self._poly_mid_for_followup(clob, tok)
+            if p["p120"] is None and age >= 120.0:
+                p["p120"] = await self._poly_mid_for_followup(clob, tok)
+            if p["p120"] is not None:
+                to_emit.append((uid, p, "ok"))
+            elif age >= 150.0:
+                to_emit.append((uid, p, "partial"))
+
+        for uid, p, mode in to_emit:
+            self._pending_poly_followups.pop(uid, None)
+            if mode == "partial" and p["p30"] is None and p["p60"] is None and p["p120"] is None:
+                continue
+            snap = p["snap"]
+            empty_clob = {
+                "odds_io_updated_at": "",
+                "clob_best_bid": "",
+                "clob_best_bid_size": "",
+                "clob_best_ask": "",
+                "clob_best_ask_size": "",
+                "clob_liquidity_at_price": "",
+            }
+            oe = snap.get("_odds_event")
+            dh, da = ("", "")
+            if isinstance(oe, OddsEvent):
+                dh, da = self._betfair_depth_for_event(oe)
+            row: dict[str, Any] = {
+                "action": "FOLLOWUP_POLY",
+                "reason": f"poly_mid_{mode}_after_signal",
+                "game_slug": snap.get("game_slug", ""),
+                "league": snap.get("league", ""),
+                "home_team": snap.get("home_team", ""),
+                "away_team": snap.get("away_team", ""),
+                "side": snap.get("side", ""),
+                "token_id": snap.get("token_id", ""),
+                "price_poly": snap.get("price_poly", ""),
+                "prob_pinnacle": snap.get("prob_pinnacle", ""),
+                "edge": snap.get("edge", ""),
+                "size_usdc": "0",
+                "status": "INFO",
+                **empty_clob,
+                "poly_price_30s": _fmt_opt_float(p["p30"]),
+                "poly_price_60s": _fmt_opt_float(p["p60"]),
+                "poly_price_120s": _fmt_opt_float(p["p120"]),
+                "betfair_depth_home": dh,
+                "betfair_depth_away": da,
+                "match_score": snap.get("match_score", ""),
+                "signal_anchor_ts": p["anchor_iso"],
+            }
+            await self.log_signal_async(row)
 
     def _ws_snapshot_match_fields(self, game: OpenPolymarketGame) -> tuple[str, str]:
         """Best-effort desde sports WS cache (esquema variable); vacío si no hay datos."""
@@ -953,7 +1219,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
     def _write_cycle_metrics_json(self, open_poly_games: int, reference_matched: int, ws_cache_size: int) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
-            path = Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "latency_arb_sports_cycle_metrics.json"
+            from lab.paths import data_dir
+
+            path = data_dir() / "logs" / "latency_arb_sports_cycle_metrics.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "open_poly_games": int(open_poly_games),
@@ -998,6 +1266,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._state_manager = state_manager
         self._shutdown.clear()
         self._ws_task = asyncio.create_task(self._ws_runner(), name="latency_arb_sports_ws")
+        self._install_io_ws_depth_capture_hook()
         if self._odds_client.ws_enabled:
             raw_io_sports = ODDS_API_IO_SPORTS_EMBEDDED
             io_sports = [s.strip() for s in str(raw_io_sports).split(",") if s.strip()]
@@ -1041,6 +1310,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
                             "edge": "",
                             "size_usdc": "",
                             "status": "ERROR",
+                            "odds_io_updated_at": "",
+                            "clob_best_bid": "",
+                            "clob_best_bid_size": "",
+                            "clob_best_ask": "",
+                            "clob_best_ask_size": "",
+                            "clob_liquidity_at_price": "",
+                            "poly_price_30s": "",
+                            "poly_price_60s": "",
+                            "poly_price_120s": "",
+                            "betfair_depth_home": "",
+                            "betfair_depth_away": "",
+                            "match_score": "",
+                            "signal_anchor_ts": "",
                         }
                     )
                 games = self._open_games
@@ -1285,6 +1567,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "edge": "",
                         "size_usdc": "",
                         "status": "SKIP",
+                        "odds_io_updated_at": "",
+                        "clob_best_bid": "",
+                        "clob_best_bid_size": "",
+                        "clob_best_ask": "",
+                        "clob_best_ask_size": "",
+                        "clob_liquidity_at_price": "",
+                        "poly_price_30s": "",
+                        "poly_price_60s": "",
+                        "poly_price_120s": "",
+                        "betfair_depth_home": "",
+                        "betfair_depth_away": "",
+                        "match_score": "",
+                        "signal_anchor_ts": "",
                     }
                 )
                 return
@@ -1412,6 +1707,57 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self._cycle_public_search_cache_hits,
             )
             self._write_cycle_metrics_json(len(open_games), reference_matched, len(self._odds_client._ws_odds_cache))
+            await self._drain_poly_followups(clob)
+
+    async def _enrich_signal_csv_fields(
+        self,
+        clob: PolyCLOBClient,
+        token_id: str,
+        mid: float,
+        odds_event: OddsEvent,
+        match_score_s: str,
+    ) -> dict[str, str]:
+        clob_t = await self._clob_trace_for_token(clob, token_id, float(mid))
+        dh, da = self._betfair_depth_for_event(odds_event)
+        anchor_iso = datetime.now(timezone.utc).isoformat()
+        return {
+            "odds_io_updated_at": str(odds_event.updated_at or ""),
+            **clob_t,
+            "poly_price_30s": "",
+            "poly_price_60s": "",
+            "poly_price_120s": "",
+            "betfair_depth_home": dh,
+            "betfair_depth_away": da,
+            "match_score": match_score_s,
+            "signal_anchor_ts": anchor_iso,
+        }
+
+    def _followup_snap(
+        self,
+        g: GammaSportMarket,
+        odds_home: str,
+        odds_away: str,
+        side_label: str,
+        token_id: str,
+        mid: float,
+        p_fair: float,
+        edge_mag: float,
+        odds_event: OddsEvent,
+        match_score_s: str,
+    ) -> dict[str, Any]:
+        return {
+            "game_slug": g.slug,
+            "league": g.league,
+            "home_team": odds_home,
+            "away_team": odds_away,
+            "side": side_label,
+            "token_id": token_id,
+            "price_poly": f"{mid:.6f}",
+            "prob_pinnacle": f"{p_fair:.6f}",
+            "edge": f"{edge_mag:.6f}",
+            "match_score": match_score_s,
+            "_odds_event": odds_event,
+        }
 
     async def _process_matched_poly_odds(
         self,
@@ -1432,6 +1778,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         tok_h, tok_a = _map_outcomes_to_tokens(g, odds_home, odds_away)
         if not tok_h or not tok_a:
             return acc
+        _mset_snap, mscr_live = self._ws_snapshot_match_fields(game)
 
         async def _resolve_mid(tid: str) -> Optional[float]:
             m = await clob.get_midpoint(tid)
@@ -1459,7 +1806,6 @@ class LatencyArbSportsStrategy(ArbStrategy):
             )
             snap_ts = datetime.now(timezone.utc).isoformat()
             game_label = (game.raw_title or "").strip() or f"{game.home} vs {game.away}"
-            mset, mscr = self._ws_snapshot_match_fields(game)
             self._append_latency_snapshot_row(
                 {
                     "snapshot_at": snap_ts,
@@ -1477,8 +1823,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "betfair_home_odds": f"{float(dec_h):.10f}".rstrip("0").rstrip("."),
                     "betfair_away_odds": f"{float(dec_a):.10f}".rstrip("0").rstrip("."),
                     "betfair_updated_at": str(odds_event.updated_at or ""),
-                    "match_set": mset,
-                    "match_score": mscr,
+                    "match_set": _mset_snap,
+                    "match_score": mscr_live,
                 }
             )
 
@@ -1529,6 +1875,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             edge_mag = abs(raw_edge)
 
             if signal_side is not None and side_label != signal_side:
+                ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
                 await self.log_signal_async(
                     {
                         "action": "SKIP:BELOW_MIN_EDGE",
@@ -1547,12 +1894,20 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "edge": f"{edge_mag:.6f}",
                         "size_usdc": "0",
                         "status": "SKIP",
+                        **ex,
                     }
+                )
+                self._register_poly_followup(
+                    self._followup_snap(
+                        g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                    ),
+                    ex["signal_anchor_ts"],
                 )
                 acc["csv_rows"] += 1
                 continue
 
             if edge_mag < self.min_edge:
+                ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
                 await self.log_signal_async(
                     {
                         "action": "SKIP:BELOW_MIN_EDGE",
@@ -1568,12 +1923,20 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "edge": f"{edge_mag:.6f}",
                         "size_usdc": "0",
                         "status": "SKIP",
+                        **ex,
                     }
+                )
+                self._register_poly_followup(
+                    self._followup_snap(
+                        g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                    ),
+                    ex["signal_anchor_ts"],
                 )
                 acc["csv_rows"] += 1
                 continue
 
             if raw_edge <= 0:
+                ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
                 await self.log_signal_async(
                     {
                         "action": "SKIP:BELOW_MIN_EDGE",
@@ -1592,7 +1955,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "edge": f"{edge_mag:.6f}",
                         "size_usdc": "0",
                         "status": "SKIP",
+                        **ex,
                     }
+                )
+                self._register_poly_followup(
+                    self._followup_snap(
+                        g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                    ),
+                    ex["signal_anchor_ts"],
                 )
                 acc["csv_rows"] += 1
                 continue
@@ -1646,6 +2016,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     action = "ERROR:ORDER_FAIL"
                     status = "SKIP"
                     reason = str(e)[:200]
+            ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
             await self.log_signal_async(
                 {
                     "action": action,
@@ -1661,7 +2032,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "edge": f"{edge_mag:.6f}",
                     "size_usdc": f"{size:.4f}",
                     "status": status,
+                    **ex,
                 }
+            )
+            self._register_poly_followup(
+                self._followup_snap(
+                    g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                ),
+                ex["signal_anchor_ts"],
             )
             self._last_signal_price[sig_key] = float(mid)
             self._last_signal_mono[sig_key] = now_mono

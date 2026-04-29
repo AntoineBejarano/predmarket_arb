@@ -9,7 +9,6 @@ dependencies = [
     "pyarrow>=14.0.0",
     "tqdm>=4.65.0",
     "requests>=2.31.0",
-    "python-dotenv>=1.0.0",
     "lightgbm>=4.0.0",
     # Alinear con la versión usada al serializar calibradores IsotonicRegression en models/saved
     "scikit-learn>=1.6.1,<1.7",

@@ -100,8 +100,10 @@ _WS_BACKOFF_SEC = (2, 4, 8, 16, 30)
 
 
 def _event_meta_disk_path() -> Path:
-    """Misma convención que el resto del repo (DATA_DIR → logs bajo ese directorio)."""
-    return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "odds_event_meta_cache.json"
+    """Caché en disco bajo ``<repo>/data/logs`` (misma convención que arb/validador)."""
+    from lab.paths import data_dir
+
+    return data_dir() / "logs" / "odds_event_meta_cache.json"
 
 
 def _load_event_meta_disk_cache(into: dict[str, dict[str, str]]) -> None:

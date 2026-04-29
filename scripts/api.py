@@ -23,7 +23,6 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import uvicorn
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -33,11 +32,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lab.paths import data_dir
 from scripts.debug_markets import run_polymarket_market_debug
 from risk.ml_model_registry import ML_MODELS, ML_MODEL_SLUGS
 from risk.model_state import ModelStateManager
-
-load_dotenv(REPO_ROOT / ".env")
 
 log = logging.getLogger("api")
 log.setLevel(logging.INFO)
@@ -50,7 +48,13 @@ if not log.handlers:
     log.addHandler(_h)
 log.propagate = False
 
-DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
+DATA_DIR = data_dir()
+# Entrada fija (sin .env): mismo comportamiento en local y en deploy.
+API_PORT = 8080
+VALIDATOR_HEALTH_PORT = 18088
+AUTO_START = False
+ARB_ENGINE_DRY_RUN = True
+
 SIGNALS_CSV = DATA_DIR / "logs" / "signals.csv"
 STATIC_DIR = REPO_ROOT / "static"
 ML_MODELS_HTML = STATIC_DIR / "ml_models.html"
@@ -305,7 +309,7 @@ class ValidatorSupervisor:
             try:
                 child_env = os.environ.copy()
                 # validate_edge también abre /health; evitar colisión con el PORT del API
-                child_env["PORT"] = str(int(os.getenv("VALIDATOR_HEALTH_PORT", "18088")))
+                child_env["PORT"] = str(VALIDATOR_HEALTH_PORT)
                 # Heredar stdout/stderr del API para que los logs de validate_edge
                 # (logging + Rich) salgan en los Deploy Logs de Railway.
                 self._proc = subprocess.Popen(
@@ -388,15 +392,14 @@ def build_status_payload() -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    auto = os.getenv("AUTO_START", "").lower() in ("true", "1", "yes")
     log.info(
         "API arrancando: DATA_DIR=%s PORT=%s AUTO_START=%s VALIDATOR_HEALTH_PORT=%s",
         DATA_DIR,
-        os.getenv("PORT", "8080"),
-        auto,
-        os.getenv("VALIDATOR_HEALTH_PORT", "18088"),
+        API_PORT,
+        AUTO_START,
+        VALIDATOR_HEALTH_PORT,
     )
-    if auto:
+    if AUTO_START:
         ok, pid, err = supervisor.start()
         if ok:
             log.info("AUTO_START: validate_edge en marcha pid=%s (logs mezclados en stderr)", pid)
@@ -746,27 +749,6 @@ def _csv_stats_today(path: Path) -> dict[str, Any]:
     }
 
 
-def _warn_if_experimental_enabled_in_state_but_env_off() -> None:
-    """Evita confusión en Railway: toggles ON en JSON no cargan estrategias sin env."""
-    if os.getenv("ENABLE_EXPERIMENTAL", "true").lower() in ("true", "1", "yes"):
-        return
-    experimental_slugs = ("combinatorial_arb", "term_structure", "latency_arb", "latency_arb_sports")
-    try:
-        p = REPO_ROOT / "data" / "strategy_state.json"
-        if not p.is_file():
-            return
-        raw = json.loads(p.read_text(encoding="utf-8"))
-        bad = [s for s in experimental_slugs if (raw.get(s) or {}).get("enabled")]
-        if bad:
-            log.warning(
-                "[api] Hay estrategias enabled en strategy_state.json que el motor NO ejecutará "
-                "porque ENABLE_EXPERIMENTAL=false: %s. Añade ENABLE_EXPERIMENTAL=true al servicio y redeploy.",
-                ", ".join(bad),
-            )
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
-
-
 def _arb_engine_start() -> tuple[bool, Optional[int], Optional[str]]:
     global _arb_proc
     with _arb_lock:
@@ -774,16 +756,17 @@ def _arb_engine_start() -> tuple[bool, Optional[int], Optional[str]]:
             return False, _arb_proc.pid, "already_running"
         cmd = [sys.executable, str(REPO_ROOT / "scripts" / "arb_engine.py")]
         try:
+            child_env = os.environ.copy()
+            child_env["DATA_DIR"] = str(DATA_DIR)
             _arb_proc = subprocess.Popen(
                 cmd,
                 cwd=str(REPO_ROOT),
-                env=os.environ.copy(),
+                env=child_env,
                 stdout=None,
                 stderr=None,
                 start_new_session=True,
             )
             log.info("POST /api/arb/start -> arb_engine pid=%s", _arb_proc.pid)
-            _warn_if_experimental_enabled_in_state_but_env_off()
             return True, _arb_proc.pid, None
         except OSError as e:
             _arb_proc = None
@@ -873,7 +856,7 @@ async def arb_status() -> JSONResponse:
             running = True
     payload = {
         "engine_running": running,
-        "dry_run": os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
+        "dry_run": ARB_ENGINE_DRY_RUN,
         "strategies": strategies,
         # Diagnóstico: CSV de arb viven bajo DATA_DIR; strategy_state sigue en data/ del repo (ver risk/strategy_state.py).
         "data_dir": str(DATA_DIR),
@@ -1079,5 +1062,4 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 if __name__ == "__main__":
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT, reload=False)

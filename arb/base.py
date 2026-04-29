@@ -5,20 +5,19 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
-import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from lab.paths import data_dir
 from risk.strategy_state import FICTIONAL_CSV_FIELDS
 
 log = logging.getLogger("arb.base")
 
 
 def logs_csv_path(slug: str) -> Path:
-    base = Path(os.getenv("DATA_DIR", ".")).resolve()
-    return base / "logs" / f"{slug}.csv"
+    return data_dir() / "logs" / f"{slug}.csv"
 
 
 class ArbStrategy(ABC):

@@ -75,8 +75,9 @@ def _market_mini(m: dict[str, Any]) -> dict[str, Any]:
 
 
 def _bundle_scan_path() -> Path:
-    base = Path(os.getenv("DATA_DIR", ".")).resolve()
-    return base / "logs" / "bundle_arb_scan.json"
+    from lab.paths import data_dir
+
+    return data_dir() / "logs" / "bundle_arb_scan.json"
 
 
 class BundleArbStrategy(ArbStrategy):

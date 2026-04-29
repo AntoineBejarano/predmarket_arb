@@ -9,17 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-load_dotenv(REPO_ROOT / ".env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,10 +23,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("arb_engine")
 
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
-# Default true: carga combinatorial / term / latency / latency_sports sin tocar Railway.
-# Desactivar explícitamente con ENABLE_EXPERIMENTAL=false.
-ENABLE_EXPERIMENTAL = os.getenv("ENABLE_EXPERIMENTAL", "true").lower() in ("true", "1", "yes")
+DRY_RUN = True
+ENABLE_EXPERIMENTAL = True
 
 from arb.bundle_arb import BundleArbStrategy
 from arb.combinatorial_arb import CombinatorialArbStrategy
@@ -54,43 +47,43 @@ async def main() -> None:
         len(_st),
     )
 
-    breaker = CircuitBreaker(max_daily_drawdown=float(os.getenv("MAX_DAILY_DRAWDOWN", "0.08")))
+    breaker = CircuitBreaker(max_daily_drawdown=0.08)
 
     base_cap = {
         "circuit_breaker": breaker,
-        "start_capital": float(os.getenv("ARB_START_CAPITAL", "10000")),
-        "current_capital": float(os.getenv("ARB_CURRENT_CAPITAL", "10000")),
+        "start_capital": 10_000.0,
+        "current_capital": 10_000.0,
     }
 
     config_bundle = {
         **base_cap,
-        "poll_interval": float(os.getenv("BUNDLE_POLL_INTERVAL", "10")),
-        "min_edge": float(os.getenv("BUNDLE_MIN_EDGE", "0.025")),
-        "max_size_usdc": float(os.getenv("BUNDLE_MAX_SIZE_USDC", "300")),
-        "max_outcomes": int(os.getenv("BUNDLE_MAX_OUTCOMES", "8")),
-        "discovery": os.getenv("BUNDLE_DISCOVERY", "gamma_events").strip().lower(),
-        "bundle_mode": os.getenv("BUNDLE_MODE", "taker_scan").strip().lower(),
-        "target_bundle_usdc": float(os.getenv("BUNDLE_TARGET_BUNDLE_USDC", "50")),
-        "max_outcomes_live": int(os.getenv("BUNDLE_MAX_OUTCOMES_LIVE", "4")),
-        "maker_live_enabled": os.getenv("BUNDLE_MAKER_LIVE", "false").lower() in ("1", "true", "yes"),
-        "maker_post_only": os.getenv("BUNDLE_POST_ONLY", "true").lower() in ("1", "true", "yes"),
-        "maker_order_type": os.getenv("BUNDLE_ORDER_TYPE", "GTD").strip().upper(),
-        "use_ws": os.getenv("BUNDLE_USE_WS", "false").lower() in ("1", "true", "yes"),
-        "use_vwap": os.getenv("BUNDLE_USE_VWAP", "false").lower() in ("1", "true", "yes"),
-        "target_vwap_usdc": float(os.getenv("BUNDLE_TARGET_SIZE_USDC", "50")),
-        "exec_buffer_per_leg": float(os.getenv("BUNDLE_EXEC_BUFFER_PER_LEG", "0.0025")),
-        "min_depth_per_leg_usdc": float(os.getenv("BUNDLE_MIN_DEPTH_PER_LEG_USDC", "0")),
-        "max_candidates_per_cycle": int(os.getenv("BUNDLE_MAX_CANDIDATES_PER_CYCLE", "120")),
-        "exclude_neg_risk": os.getenv("BUNDLE_EXCLUDE_NEG_RISK", "true").lower() in ("1", "true", "yes"),
+        "poll_interval": 10.0,
+        "min_edge": 0.025,
+        "max_size_usdc": 300.0,
+        "max_outcomes": 8,
+        "discovery": "gamma_events",
+        "bundle_mode": "taker_scan",
+        "target_bundle_usdc": 50.0,
+        "max_outcomes_live": 4,
+        "maker_live_enabled": False,
+        "maker_post_only": True,
+        "maker_order_type": "GTD",
+        "use_ws": False,
+        "use_vwap": False,
+        "target_vwap_usdc": 50.0,
+        "exec_buffer_per_leg": 0.0025,
+        "min_depth_per_leg_usdc": 0.0,
+        "max_candidates_per_cycle": 120,
+        "exclude_neg_risk": True,
     }
     config_cross = {
         **base_cap,
-        "poll_interval": float(os.getenv("CROSS_POLL_INTERVAL", "30")),
-        "min_edge": float(os.getenv("CROSS_MIN_EDGE", "0.030")),
+        "poll_interval": 30.0,
+        "min_edge": 0.030,
     }
     config_mm = {
         **base_cap,
-        "poll_interval": float(os.getenv("MM_QUOTE_INTERVAL", "30")),
+        "poll_interval": 30.0,
     }
 
     strategies = [
@@ -100,9 +93,9 @@ async def main() -> None:
     ]
 
     if ENABLE_EXPERIMENTAL:
-        config_combo = {**base_cap, "poll_interval": float(os.getenv("COMBO_SCAN_INTERVAL", "60"))}
-        config_term = {**base_cap, "poll_interval": float(os.getenv("TERM_SCAN_INTERVAL", "300"))}
-        config_lat = {**base_cap, "poll_interval": float(os.getenv("LAT_POLL_INTERVAL", "15"))}
+        config_combo = {**base_cap, "poll_interval": 60.0}
+        config_term = {**base_cap, "poll_interval": 300.0}
+        config_lat = {**base_cap, "poll_interval": 15.0}
         # latency_arb_sports: umbrales y poll fijados en arb/latency_arb_sports.py (_HARDCODE_*), no por env.
         config_lat_sports = {**base_cap}
         strategies += [

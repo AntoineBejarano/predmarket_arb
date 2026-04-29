@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from pathlib import Path
 import unittest
 from datetime import datetime, timezone
 from typing import Any
@@ -356,14 +357,17 @@ class TestGammaEventsDiscoveryAudit(unittest.IsolatedAsyncioTestCase):
         reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=10)
         payload = {"events": [bad], "next_cursor": ""}
         with tempfile.TemporaryDirectory() as td:
+            logs = Path(td) / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
             env = {
-                "DATA_DIR": td,
                 "BUNDLE_DISCOVERY_AUDIT": "true",
                 "BUNDLE_DISCOVERY_AUDIT_RAW_SAMPLES": "20",
                 "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
                 "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
             }
-            with patch.dict(os.environ, env, clear=False):
+            with patch.dict(os.environ, env, clear=False), patch(
+                "clients.poly_markets._logs_dir", return_value=logs
+            ):
                 cands, diag = await reg.discover_gamma_events_keyset(_FakeSession(payload))
             self.assertEqual(len(cands), 0)
             self.assertTrue(diag.get("sample_rejects_available"))
@@ -397,14 +401,17 @@ class TestGammaEventsDiscoveryAudit(unittest.IsolatedAsyncioTestCase):
         reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=50)
         payload = {"events": events, "next_cursor": ""}
         with tempfile.TemporaryDirectory() as td:
+            logs = Path(td) / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
             env = {
-                "DATA_DIR": td,
                 "BUNDLE_DISCOVERY_AUDIT": "true",
                 "BUNDLE_DISCOVERY_AUDIT_RAW_SAMPLES": "7",
                 "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
                 "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
             }
-            with patch.dict(os.environ, env, clear=False):
+            with patch.dict(os.environ, env, clear=False), patch(
+                "clients.poly_markets._logs_dir", return_value=logs
+            ):
                 await reg.discover_gamma_events_keyset(_FakeSession(payload))
             p = os.path.join(td, "logs", "negrisk_discovery_reject_samples.json")
             with open(p, "r", encoding="utf-8") as fh:
@@ -459,14 +466,17 @@ class TestGammaEventsDiscoveryAudit(unittest.IsolatedAsyncioTestCase):
         reg = MarketsRegistry(min_outcomes=2, max_outcomes=5, gamma_events_max_pages=1, gamma_events_limit=10)
         payload = {"events": [ev], "next_cursor": ""}
         with tempfile.TemporaryDirectory() as td:
+            logs = Path(td) / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
             env = {
-                "DATA_DIR": td,
                 "DRY_RUN": "true",
                 "BUNDLE_DISCOVERY_AUDIT": "false",
                 "BUNDLE_MIN_DAYS_TO_EXPIRY": "0",
                 "BUNDLE_MAX_DAYS_TO_EXPIRY": "50000",
             }
-            with patch.dict(os.environ, env, clear=False):
+            with patch.dict(os.environ, env, clear=False), patch(
+                "clients.poly_markets._logs_dir", return_value=logs
+            ):
                 cands, diag = await reg.discover_gamma_events_keyset(_FakeSession(payload))
             self.assertEqual(len(cands), 0)
             self.assertTrue(diag.get("discovery_audit_path"))

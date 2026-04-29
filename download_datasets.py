@@ -21,10 +21,7 @@ from typing import Iterator
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
 from tqdm import tqdm
-
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
