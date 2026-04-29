@@ -63,13 +63,6 @@ def _latency_snapshots_csv_path() -> Path:
     return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "latency_arb_sports_snapshots.csv"
 
 
-def _env_snapshot_csv_enabled() -> bool:
-    raw = os.getenv("LATENCY_SPORTS_SNAPSHOT_CSV")
-    if raw is None or not str(raw).strip():
-        return True
-    return str(raw).strip().lower() not in ("false", "0", "no", "off")
-
-
 _DEFAULT_HEADERS = {
     "User-Agent": "predmarket-arb/latency-arb-sports (aiohttp; +https://github.com)",
     "Accept": "application/json",
@@ -80,16 +73,20 @@ MIN_DISCOVERY_TTL_SEC = 300
 _SIGNAL_COOLDOWN_PRICE_EPS = 0.005
 _SIGNAL_COOLDOWN_SEC = 30.0
 
-# Defaults embebidos si Railway (u otro) no define env; `os.getenv` sigue pudiendo sobreescribir en local.
-_EMBEDDED_LATENCY_SPORTS_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
-_EMBEDDED_LATENCY_MIN_EDGE = "0.005"
-_EMBEDDED_LATENCY_MAX_STAKE_USDC = "10"
-_EMBEDDED_LATENCY_REGIONS = "eu"
-_EMBEDDED_LATENCY_POLL_INTERVAL = "5"
-_EMBEDDED_LATENCY_POLL_INTERVAL_ACTIVE = "2"
-_EMBEDDED_LATENCY_DISCOVERY_TTL = "300"
-_EMBEDDED_LATENCY_DISCOVERY_TTL_ACTIVE = "30"
-_EMBEDDED_LATENCY_WINDOW_HOURS_BEFORE = "3"
+# Parámetros fijos de la estrategia (no se leen LATENCY_SPORTS_* ni ODDS_API_IO_SPORTS del entorno).
+# Siguen por env: DATA_DIR, POLY_* (CLOB), claves Odds API en clients/odds_api_io.
+_HARDCODE_POLY_SLUGS = "atp,wta,wttmen,epl,nba,nfl,ucl,uel,nhl"
+_HARDCODE_MIN_EDGE = 0.005
+_HARDCODE_MAX_STAKE_USDC = 10.0
+_HARDCODE_REGIONS = "eu"
+_HARDCODE_POLL_INTERVAL = 5.0
+_HARDCODE_POLL_INTERVAL_ACTIVE = 2.0
+_HARDCODE_DISCOVERY_TTL = 300.0
+_HARDCODE_DISCOVERY_TTL_ACTIVE = 30.0
+_HARDCODE_WINDOW_HOURS_BEFORE = 3.0
+_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL = 60.0
+_HARDCODE_GAMMA_PUBLIC_SEARCH_LIMIT = 40
+_SNAPSHOT_CSV_ENABLED = True
 
 # Gamma /events con ?sport= no filtra de forma fiable; usamos series_id del GET /sports nativo.
 GAMMA_SPORTS_META_TTL_SEC = 3600.0
@@ -808,39 +805,26 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
     def __init__(self, config: dict[str, Any], dry_run: bool = True) -> None:
         super().__init__(config, dry_run=dry_run)
-        raw_slugs = os.getenv("LATENCY_SPORTS_POLY_SLUGS") or _EMBEDDED_LATENCY_SPORTS_POLY_SLUGS
-        self.poly_slugs = [s.strip().lower() for s in str(raw_slugs).split(",") if s.strip()]
-        self.min_edge = float(
-            config.get("min_edge", os.getenv("LATENCY_SPORTS_MIN_EDGE") or _EMBEDDED_LATENCY_MIN_EDGE)
-        )
-        self.max_stake = float(
-            config.get("max_stake_usdc", os.getenv("LATENCY_SPORTS_MAX_STAKE_USDC") or _EMBEDDED_LATENCY_MAX_STAKE_USDC)
-        )
-        self.regions = (os.getenv("LATENCY_SPORTS_REGIONS") or _EMBEDDED_LATENCY_REGIONS).strip()
-        self.poll_interval = float(
-            config.get("poll_interval", os.getenv("LATENCY_SPORTS_POLL_INTERVAL") or _EMBEDDED_LATENCY_POLL_INTERVAL)
-        )
-        self.poll_interval_active = float(
-            os.getenv("LATENCY_SPORTS_POLL_INTERVAL_ACTIVE") or _EMBEDDED_LATENCY_POLL_INTERVAL_ACTIVE
-        )
-        ttl_raw = float(os.getenv("LATENCY_SPORTS_DISCOVERY_TTL") or _EMBEDDED_LATENCY_DISCOVERY_TTL)
+        self.poly_slugs = [s.strip().lower() for s in _HARDCODE_POLY_SLUGS.split(",") if s.strip()]
+        self.min_edge = float(_HARDCODE_MIN_EDGE)
+        self.max_stake = float(_HARDCODE_MAX_STAKE_USDC)
+        self.regions = _HARDCODE_REGIONS.strip()
+        self.poll_interval = float(_HARDCODE_POLL_INTERVAL)
+        self.poll_interval_active = float(_HARDCODE_POLL_INTERVAL_ACTIVE)
+        ttl_raw = float(_HARDCODE_DISCOVERY_TTL)
         if ttl_raw < MIN_DISCOVERY_TTL_SEC:
             log.warning(
-                "[latency_arb_sports] LATENCY_SPORTS_DISCOVERY_TTL clamped to %ss (was %s)",
+                "[latency_arb_sports] discovery TTL clamped to %ss (was %s)",
                 MIN_DISCOVERY_TTL_SEC,
                 ttl_raw,
             )
         self.discovery_ttl = max(MIN_DISCOVERY_TTL_SEC, ttl_raw)
-        self.discovery_ttl_active = float(
-            os.getenv("LATENCY_SPORTS_DISCOVERY_TTL_ACTIVE") or _EMBEDDED_LATENCY_DISCOVERY_TTL_ACTIVE
-        )
-        self.window_hours_before = float(
-            os.getenv("LATENCY_SPORTS_WINDOW_HOURS_BEFORE") or _EMBEDDED_LATENCY_WINDOW_HOURS_BEFORE
-        )
+        self.discovery_ttl_active = float(_HARDCODE_DISCOVERY_TTL_ACTIVE)
+        self.window_hours_before = float(_HARDCODE_WINDOW_HOURS_BEFORE)
         self._window_past_hours = 2.0
         self._breaker = config.get("circuit_breaker")
-        self._start_capital = float(config.get("start_capital", os.getenv("ARB_START_CAPITAL", "10000")))
-        self._current_capital = float(config.get("current_capital", os.getenv("ARB_CURRENT_CAPITAL", "10000")))
+        self._start_capital = float(config.get("start_capital", 10_000.0))
+        self._current_capital = float(config.get("current_capital", 10_000.0))
         self._gamma_sports_meta_mono = 0.0
         self._gamma_sports_meta: list[dict[str, Any]] = []
         self._poly_series_by_slug: dict[str, str] = {}
@@ -853,7 +837,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._odds_client = OddsApiIo()
         self._ref_debug_done = False
         self._cache_debug_done = False
-        self._snapshot_csv_enabled = _env_snapshot_csv_enabled()
+        self._snapshot_csv_enabled = _SNAPSHOT_CSV_ENABLED
         self._snapshot_csv_path = _latency_snapshots_csv_path()
         self._snapshot_csv_lock = threading.Lock()
         # Cooldown SIGNAL por mercado+lado (clave estable: slug Gamma + YES/NO; no home/away por orden variable).
@@ -861,9 +845,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._last_signal_mono: dict[str, float] = {}
         # Betfair-first: resultado de public-search por event_id IO (TTL corto, independiente del discovery por series).
         self._betfair_gamma_search_cache: dict[str, tuple[float, Optional[OpenPolymarketGame]]] = {}
-        self._betfair_gamma_search_ttl = float(
-            os.getenv("LATENCY_SPORTS_BETFAIR_GAMMA_SEARCH_TTL") or "60"
-        )
+        self._betfair_gamma_search_ttl = float(_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL)
         self._cycle_public_search_http = 0
         self._cycle_public_search_cache_hits = 0
 
@@ -948,7 +930,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._shutdown.clear()
         self._ws_task = asyncio.create_task(self._ws_runner(), name="latency_arb_sports_ws")
         if self._odds_client.ws_enabled:
-            raw_io_sports = os.getenv("ODDS_API_IO_SPORTS") or ODDS_API_IO_SPORTS_EMBEDDED
+            raw_io_sports = ODDS_API_IO_SPORTS_EMBEDDED
             io_sports = [s.strip() for s in str(raw_io_sports).split(",") if s.strip()]
             self._odds_client.start_ws_stream(sports=io_sports)
         try:
@@ -1177,7 +1159,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             self._betfair_gamma_search_cache[eid] = (now, None)
             return None
 
-        limit = int(os.getenv("LATENCY_SPORTS_GAMMA_PUBLIC_SEARCH_LIMIT") or "3")
+        limit = int(_HARDCODE_GAMMA_PUBLIC_SEARCH_LIMIT)
         poly_order = list(self.poly_slugs)
 
         async def one_round(q: str) -> Optional[OpenPolymarketGame]:
