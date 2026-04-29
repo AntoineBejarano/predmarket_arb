@@ -25,6 +25,8 @@ _SLUGS = [
 # Columnas extra en CSV de arb (unidad «EUR» = notionale paper, mismo escala que USDC del CLOB)
 FICTIONAL_CSV_FIELDS = (
     "fict_stake_eur",
+    "fict_pnl_signal_est_eur",
+    "fict_pnl_exec_est_eur",
     "fict_pnl_est_eur",
     "fict_pnl_cum_eur",
     "fict_roi",
@@ -162,8 +164,10 @@ class StrategyStateManager:
 
     async def enrich_row_with_fictional(self, slug: str, row: dict[str, Any]) -> dict[str, Any]:
         """
-        Para SIGNAL / EXECUTED con edge y size_usdc: estima PnL paper = stake * edge,
-        acumula en fict_pnl_cumulative_eur y rellena columnas CSV.
+        Para SIGNAL / EXECUTED con size_usdc:
+        - pnl_signal_est = stake * edge_signal (teórico)
+        - pnl_exec_est = stake * edge_exec (ejecutable)
+        Acumula el ejecutable y rellena columnas CSV.
         Unidad «EUR» es notionale (misma magnitud que presupuesto paper en USDC).
         """
         empty = {k: "" for k in FICTIONAL_CSV_FIELDS}
@@ -172,12 +176,19 @@ class StrategyStateManager:
             return {**row, **empty}
 
         try:
-            edge = float(row.get("edge") or 0)
             stake = float(row.get("size_usdc") or 0)
         except (TypeError, ValueError):
             return {**row, **empty}
 
-        if stake <= 0 or edge <= 0:
+        def _as_float(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        edge_signal = _as_float(row.get("edge_signal", row.get("edge")))
+        edge_exec = _as_float(row.get("edge_exec", row.get("edge")))
+        if stake <= 0 or edge_exec <= 0:
             return {**row, **empty}
 
         async with self._lock:
@@ -185,20 +196,24 @@ class StrategyStateManager:
             ent = self._merge_entry(slug, self._state.get(slug, {}))
             cap = float(ent.get("fict_capital_eur") or _default_fictional_capital())
             stake_use = min(stake, cap)
-            pnl_est = stake_use * edge
-            cum = float(ent.get("fict_pnl_cumulative_eur") or 0.0) + pnl_est
+            pnl_signal_est = stake_use * edge_signal
+            pnl_exec_est = stake_use * edge_exec
+            cum = float(ent.get("fict_pnl_cumulative_eur") or 0.0) + pnl_exec_est
             n_tr = int(ent.get("fict_trades") or 0) + 1
             ent["fict_pnl_cumulative_eur"] = cum
             ent["fict_trades"] = n_tr
             ent["fict_last_stake_eur"] = stake_use
-            ent["fict_last_pnl_est_eur"] = pnl_est
+            ent["fict_last_pnl_est_eur"] = pnl_exec_est
             roi = cum / cap if cap > 0 else 0.0
             self._state[slug] = ent
             self._save()
 
         out = dict(row)
         out["fict_stake_eur"] = f"{stake_use:.4f}"
-        out["fict_pnl_est_eur"] = f"{pnl_est:.6f}"
+        out["fict_pnl_signal_est_eur"] = f"{pnl_signal_est:.6f}"
+        out["fict_pnl_exec_est_eur"] = f"{pnl_exec_est:.6f}"
+        # Compat hacia atrás para dashboards que aún lean la columna legacy.
+        out["fict_pnl_est_eur"] = f"{pnl_exec_est:.6f}"
         out["fict_pnl_cum_eur"] = f"{cum:.6f}"
         out["fict_roi"] = f"{roi:.6f}"
         return out

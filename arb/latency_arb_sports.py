@@ -160,6 +160,7 @@ _SIGNAL_COOLDOWN_SEC = 30.0
 # Rutas de datos: ``lab.paths.data_dir()`` (fijo ``<repo>/data``). Siguen por env: POLY_* (CLOB), claves Odds API en clients/odds_api_io.
 _HARDCODE_POLY_SLUGS = "atp,wta,wttmen"
 _HARDCODE_MIN_EDGE = 0.005
+_HARDCODE_MIN_EDGE_EXEC = 0.005
 _HARDCODE_MAX_STAKE_USDC = 10.0
 _HARDCODE_REGIONS = "eu"
 _HARDCODE_POLL_INTERVAL = 5.0
@@ -178,6 +179,10 @@ _HARDCODE_MAX_REFERENCE_LAG_SEC = 30.0
 _HARDCODE_STALE_ODDS_IO_SEC = 120.0
 _HARDCODE_PRE_GAME_END_MARGIN_SEC = 172800.0
 _HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC = 120.0
+_HARDCODE_MAX_SPREAD = 0.04
+_HARDCODE_MIN_TOP_ASK_NOTIONAL_USDC = 10.0
+_HARDCODE_MIN_ASK_BAND_NOTIONAL_USDC = 25.0
+_HARDCODE_KILL_SWITCH_REF_BACKOFF_SEC = 600.0
 
 # Gamma /events con ?sport= no filtra de forma fiable; usamos series_id del GET /sports nativo.
 GAMMA_SPORTS_META_TTL_SEC = 3600.0
@@ -980,6 +985,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "action",
             "reason",
             "dry_run",
+            "signal_id",
             "game_slug",
             "league",
             "home_team",
@@ -988,9 +994,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "token_id",
             "price_poly",
             "prob_pinnacle",
+            "edge_mid",
+            "edge_exec",
             "edge",
+            "spread",
             "size_usdc",
             "status",
+            "latency_ms_ref_to_clob",
+            "order_attempted",
+            "fill_price",
+            "fill_size",
+            "fee_est",
             "odds_io_updated_at",
             "clob_best_bid",
             "clob_best_bid_size",
@@ -1010,7 +1024,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
         super().__init__(config, dry_run=dry_run)
         self.poly_slugs = [s.strip().lower() for s in _HARDCODE_POLY_SLUGS.split(",") if s.strip()]
         self.min_edge = float(_HARDCODE_MIN_EDGE)
+        self.min_edge_exec = float(_HARDCODE_MIN_EDGE_EXEC)
         self.max_stake = float(_HARDCODE_MAX_STAKE_USDC)
+        self.max_spread = float(_HARDCODE_MAX_SPREAD)
+        self.min_top_ask_notional = float(_HARDCODE_MIN_TOP_ASK_NOTIONAL_USDC)
+        self.min_ask_band_notional = float(_HARDCODE_MIN_ASK_BAND_NOTIONAL_USDC)
+        self.ref_backoff_kill_switch_sec = float(_HARDCODE_KILL_SWITCH_REF_BACKOFF_SEC)
         self.regions = _HARDCODE_REGIONS.strip()
         self.poll_interval = float(_HARDCODE_POLL_INTERVAL)
         self.poll_interval_active = float(_HARDCODE_POLL_INTERVAL_ACTIVE)
@@ -1214,6 +1233,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             row: dict[str, Any] = {
                 "action": "FOLLOWUP_POLY",
                 "reason": f"poly_mid_{mode}_after_signal",
+                "signal_id": snap.get("signal_id", ""),
                 "game_slug": snap.get("game_slug", ""),
                 "league": snap.get("league", ""),
                 "home_team": snap.get("home_team", ""),
@@ -1222,9 +1242,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "token_id": snap.get("token_id", ""),
                 "price_poly": snap.get("price_poly", ""),
                 "prob_pinnacle": snap.get("prob_pinnacle", ""),
+                "edge_mid": snap.get("edge_mid", ""),
+                "edge_exec": snap.get("edge_exec", ""),
                 "edge": snap.get("edge", ""),
+                "spread": snap.get("spread", ""),
                 "size_usdc": "0",
                 "status": "INFO",
+                "latency_ms_ref_to_clob": snap.get("latency_ms_ref_to_clob", ""),
+                "order_attempted": "false",
+                "fill_price": "",
+                "fill_size": "",
+                "fee_est": "",
                 **empty_clob,
                 "poly_price_30s": _fmt_opt_float(p["p30"]),
                 "poly_price_60s": _fmt_opt_float(p["p60"]),
@@ -1318,6 +1346,30 @@ class LatencyArbSportsStrategy(ArbStrategy):
         if self._is_in_active_window(self._open_games):
             return max(5.0, self.discovery_ttl_active)
         return self.discovery_ttl
+
+    async def _paper_equity_snapshot(self, state_manager: Any) -> tuple[float, float]:
+        """Devuelve (capital_base, equity_actual) para cablear breaker a paper PnL."""
+        try:
+            st = await state_manager.get_all()
+        except Exception:
+            return self._start_capital, self._current_capital
+        ent = st.get(self.slug, {}) if isinstance(st, dict) else {}
+        try:
+            cap = float(ent.get("fict_capital_eur") or self._start_capital)
+        except (TypeError, ValueError):
+            cap = self._start_capital
+        try:
+            pnl_cum = float(ent.get("fict_pnl_cumulative_eur") or 0.0)
+        except (TypeError, ValueError):
+            pnl_cum = 0.0
+        return cap, cap + pnl_cum
+
+    def _reference_feed_degraded(self) -> tuple[bool, float]:
+        """Kill-switch: WS sin datos + REST en backoff prolongado."""
+        ws_cache_size = len(self._odds_client._ws_odds_cache)
+        backoff_left_s = float(self._odds_client._rest_backoff_until - time.monotonic())
+        degraded = ws_cache_size == 0 and backoff_left_s >= self.ref_backoff_kill_switch_sec
+        return degraded, max(0.0, backoff_left_s)
 
     async def run_loop(self, state_manager: Any) -> None:
         self._state_manager = state_manager
@@ -1627,6 +1679,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         return game
 
     async def _poll_cycle(self, state_manager: Any, clob: PolyCLOBClient) -> None:
+        self._start_capital, self._current_capital = await self._paper_equity_snapshot(state_manager)
         if self._breaker:
             ok = await self._breaker.check(self._current_capital, self._start_capital)
             if not ok:
@@ -1661,6 +1714,27 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     }
                 )
                 return
+
+        degraded_feed, backoff_left = self._reference_feed_degraded()
+        if degraded_feed:
+            await self.log_signal_async(
+                {
+                    "action": "SKIP:REF_DEGRADED",
+                    "reason": f"ws_empty_and_rest_backoff_left_s={backoff_left:.1f}",
+                    "game_slug": "",
+                    "league": "",
+                    "home_team": "",
+                    "away_team": "",
+                    "side": "",
+                    "token_id": "",
+                    "price_poly": "",
+                    "prob_pinnacle": "",
+                    "edge": "",
+                    "size_usdc": "",
+                    "status": "SKIP",
+                }
+            )
+            return
 
         clear_p = _odds_event_meta_cache_clear_flag_path()
         if clear_p.is_file():
@@ -1812,13 +1886,13 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self._ref_debug_done = True
 
             log.info(
-                "[latency_arb_sports] cycle #%s regions=%s min_edge=%.4f max_stake=%.2f "
+                "[latency_arb_sports] cycle #%s regions=%s min_edge_exec=%.4f max_stake=%.2f "
                 "open_poly_games=%s odds_io_keys=%s reference_matched=%s csv_rows=%s "
                 "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_cache_size=%s "
                 "public_search_http=%s public_search_cache_hits=%s",
                 seq,
                 self.regions,
-                self.min_edge,
+                self.min_edge_exec,
                 self.max_stake,
                 len(open_games),
                 len(odds_keys_loaded),
@@ -1841,11 +1915,30 @@ class LatencyArbSportsStrategy(ArbStrategy):
         mid: float,
         odds_event: OddsEvent,
         match_score_s: str,
+        *,
+        signal_id: str = "",
+        edge_mid: Optional[float] = None,
+        edge_exec: Optional[float] = None,
+        spread: Optional[float] = None,
+        latency_ms_ref_to_clob: Optional[float] = None,
+        order_attempted: bool = False,
+        fill_price: Optional[float] = None,
+        fill_size: Optional[float] = None,
+        fee_est: Optional[float] = None,
     ) -> dict[str, str]:
         clob_t = await self._clob_trace_for_token(clob, token_id, float(mid))
         dh, da = self._betfair_depth_for_event(odds_event)
         anchor_iso = datetime.now(timezone.utc).isoformat()
         return {
+            "signal_id": signal_id,
+            "edge_mid": _fmt_opt_float(edge_mid),
+            "edge_exec": _fmt_opt_float(edge_exec),
+            "spread": _fmt_opt_float(spread),
+            "latency_ms_ref_to_clob": _fmt_opt_float(latency_ms_ref_to_clob, nd=1),
+            "order_attempted": "true" if order_attempted else "false",
+            "fill_price": _fmt_opt_float(fill_price),
+            "fill_size": _fmt_opt_float(fill_size, nd=4),
+            "fee_est": _fmt_opt_float(fee_est, nd=6),
             "odds_io_updated_at": str(odds_event.updated_at or ""),
             **clob_t,
             "poly_price_30s": "",
@@ -1866,11 +1959,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
         token_id: str,
         mid: float,
         p_fair: float,
-        edge_mag: float,
+        edge_mid: float,
+        edge_exec: Optional[float],
+        spread: Optional[float],
+        latency_ms_ref_to_clob: Optional[float],
+        signal_id: str,
         odds_event: OddsEvent,
         match_score_s: str,
     ) -> dict[str, Any]:
+        edge_use = edge_exec if edge_exec is not None else edge_mid
         return {
+            "signal_id": signal_id,
             "game_slug": g.slug,
             "league": g.league,
             "home_team": odds_home,
@@ -1879,7 +1978,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "token_id": token_id,
             "price_poly": f"{mid:.6f}",
             "prob_pinnacle": f"{p_fair:.6f}",
-            "edge": f"{edge_mag:.6f}",
+            "edge_mid": f"{edge_mid:.6f}",
+            "edge_exec": f"{edge_use:.6f}",
+            "edge": f"{edge_use:.6f}",
+            "spread": _fmt_opt_float(spread),
+            "latency_ms_ref_to_clob": _fmt_opt_float(latency_ms_ref_to_clob, nd=1),
             "match_score": match_score_s,
             "_odds_event": odds_event,
         }
@@ -1960,29 +2063,82 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 }
             )
 
-        legs: list[tuple[str, str, float, float]] = []
-        for side_label, token_id, p_fair in (
-            ("YES", tok_h, p_h_fair),
-            ("NO", tok_a, p_a_fair),
-        ):
+        ref_age_s = _odds_io_updated_age_sec(odds_event)
+        latency_ms_ref_to_clob = ref_age_s * 1000.0 if ref_age_s is not None else None
+        legs: list[dict[str, Any]] = []
+        for side_label, token_id, p_fair in (("YES", tok_h, p_h_fair), ("NO", tok_a, p_a_fair)):
             mid_i: Optional[float] = mid_h_val if token_id == tok_h else mid_a_val
             if mid_i is None:
                 mid_i = await _resolve_mid(token_id)
             if mid_i is None:
                 continue
-            legs.append((side_label, token_id, float(p_fair), float(mid_i)))
+            ob = clob.get_cached_orderbook_snapshot(token_id)
+            if ob is None:
+                ob = await clob.get_orderbook(token_id)
+            best_bid: Optional[float] = None
+            best_ask: Optional[float] = None
+            best_ask_size: Optional[float] = None
+            top_ask_notional: Optional[float] = None
+            ask_band_notional: Optional[float] = None
+            spread: Optional[float] = None
+            if isinstance(ob, dict) and not ob.get("error"):
+                bb = ob.get("best_bid")
+                ba = ob.get("best_ask")
+                best_bid = float(bb) if bb is not None else None
+                best_ask = float(ba) if ba is not None else None
+                try:
+                    ba_sz = ob.get("best_ask_size")
+                    best_ask_size = float(ba_sz) if ba_sz is not None else None
+                except (TypeError, ValueError):
+                    best_ask_size = None
+                if best_bid is not None and best_ask is not None:
+                    spread = best_ask - best_bid
+                if best_ask is not None and best_ask_size is not None:
+                    top_ask_notional = best_ask * best_ask_size
+                ask_center = best_ask if best_ask is not None else float(mid_i)
+                ask_band_notional = _asks_notional_usdc_in_band(ob, ask_center, 0.01)
+            edge_mid_i = float(p_fair) - float(mid_i)
+            edge_exec_i = float(p_fair) - float(best_ask) if best_ask is not None else None
+            legs.append(
+                {
+                    "side_label": side_label,
+                    "token_id": token_id,
+                    "p_fair": float(p_fair),
+                    "mid": float(mid_i),
+                    "edge_mid": edge_mid_i,
+                    "edge_exec": edge_exec_i,
+                    "best_ask": best_ask,
+                    "spread": spread,
+                    "top_ask_notional": top_ask_notional,
+                    "ask_band_notional": ask_band_notional,
+                    "latency_ms_ref_to_clob": latency_ms_ref_to_clob,
+                }
+            )
 
-        # Como máximo un BUY por partido/ciclo: el mejor raw_edge>0 con |edge|>=min_edge.
+        # Como máximo un BUY por partido/ciclo: el mejor edge ejecutable.
         signal_side: Optional[str] = None
         buy_candidates: list[tuple[float, str]] = []
-        for side_label, _token_id, p_fair, mid_i in legs:
-            raw_i = float(p_fair) - float(mid_i)
-            if raw_i > 0 and abs(raw_i) >= self.min_edge:
-                buy_candidates.append((raw_i, side_label))
+        for leg in legs:
+            edge_exec_i = leg["edge_exec"]
+            if edge_exec_i is not None and edge_exec_i > 0 and edge_exec_i >= self.min_edge_exec:
+                buy_candidates.append((float(edge_exec_i), str(leg["side_label"])))
         if buy_candidates:
             signal_side = max(buy_candidates, key=lambda x: x[0])[1]
 
-        for side_label, token_id, p_fair, mid in legs:
+        for leg in legs:
+            side_label = str(leg["side_label"])
+            token_id = str(leg["token_id"])
+            p_fair = float(leg["p_fair"])
+            mid = float(leg["mid"])
+            edge_mid = float(leg["edge_mid"])
+            edge_exec = leg["edge_exec"]
+            spread = leg["spread"]
+            best_ask = leg["best_ask"]
+            top_ask_notional = leg["top_ask_notional"]
+            ask_band_notional = leg["ask_band_notional"]
+            latency_ms_ref = leg["latency_ms_ref_to_clob"]
+            signal_id = str(uuid.uuid4())
+            edge_for_log = float(edge_exec) if edge_exec is not None else float(edge_mid)
             clob_read_at = datetime.utcnow().isoformat()
             log.info(
                 "[latency_arb_sports] CLOB_READ game='%s vs %s' poly_mid=%s clob_read_at=%s",
@@ -1999,21 +2155,31 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 game.away,
                 p_fair,
                 mid,
-                float(p_fair) - float(mid),
+                edge_mid,
                 odds_event.updated_at,
                 clob_read_at,
             )
-            raw_edge = float(p_fair) - float(mid)
-            edge_mag = abs(raw_edge)
+            edge_mag = abs(edge_for_log)
 
             if signal_side is not None and side_label != signal_side:
-                ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                )
                 await self.log_signal_async(
                     {
                         "action": "SKIP:BELOW_MIN_EDGE",
                         "reason": (
                             f"not_buy_leg_signal_on_{signal_side}_side={side_label}_"
-                            f"raw={raw_edge:.4f}_mag={edge_mag:.4f}"
+                            f"edge_exec={_fmt_opt_float(edge_exec)}_edge_mid={edge_mid:.4f}"
                         ),
                         "game_slug": g.slug,
                         "league": g.league,
@@ -2023,7 +2189,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "token_id": token_id,
                         "price_poly": f"{mid:.6f}",
                         "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": _fmt_opt_float(edge_exec),
                         "edge": f"{edge_mag:.6f}",
+                        "spread": _fmt_opt_float(spread),
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
@@ -2031,19 +2200,42 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
                 self._register_poly_followup(
                     self._followup_snap(
-                        g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                        g,
+                        odds_home,
+                        odds_away,
+                        side_label,
+                        token_id,
+                        float(mid),
+                        float(p_fair),
+                        edge_mid,
+                        edge_exec,
+                        spread,
+                        latency_ms_ref,
+                        signal_id,
+                        odds_event,
+                        mscr_live,
                     ),
                     ex["signal_anchor_ts"],
                 )
                 acc["csv_rows"] += 1
                 continue
 
-            if edge_mag < self.min_edge:
-                ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
+            if edge_exec is None:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                )
                 await self.log_signal_async(
                     {
                         "action": "SKIP:BELOW_MIN_EDGE",
-                        "reason": f"|edge|={edge_mag:.4f}<min_edge={self.min_edge:.4f}_side={side_label}_raw={raw_edge:.4f}",
+                        "reason": "missing_best_ask_for_exec_edge",
                         "game_slug": g.slug,
                         "league": g.league,
                         "home_team": odds_home,
@@ -2052,7 +2244,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "token_id": token_id,
                         "price_poly": f"{mid:.6f}",
                         "prob_pinnacle": f"{p_fair:.6f}",
-                        "edge": f"{edge_mag:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": "",
+                        "edge": f"{edge_mid:.6f}",
+                        "spread": _fmt_opt_float(spread),
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
@@ -2060,21 +2255,45 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
                 self._register_poly_followup(
                     self._followup_snap(
-                        g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                        g,
+                        odds_home,
+                        odds_away,
+                        side_label,
+                        token_id,
+                        float(mid),
+                        float(p_fair),
+                        edge_mid,
+                        edge_exec,
+                        spread,
+                        latency_ms_ref,
+                        signal_id,
+                        odds_event,
+                        mscr_live,
                     ),
                     ex["signal_anchor_ts"],
                 )
                 acc["csv_rows"] += 1
                 continue
 
-            if raw_edge <= 0:
-                ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
+            if edge_exec < self.min_edge_exec:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                )
                 await self.log_signal_async(
                     {
                         "action": "SKIP:BELOW_MIN_EDGE",
                         "reason": (
-                            f"raw<=0_not_buy_leg|edge|={edge_mag:.4f}_min_edge={self.min_edge:.4f}_"
-                            f"side={side_label}_raw={raw_edge:.4f}"
+                            f"edge_exec={edge_exec:.4f}<min_edge_exec={self.min_edge_exec:.4f}_"
+                            f"side={side_label}_edge_mid={edge_mid:.4f}"
                         ),
                         "game_slug": g.slug,
                         "league": g.league,
@@ -2084,7 +2303,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "token_id": token_id,
                         "price_poly": f"{mid:.6f}",
                         "prob_pinnacle": f"{p_fair:.6f}",
-                        "edge": f"{edge_mag:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": f"{edge_exec:.6f}",
+                        "edge": f"{edge_exec:.6f}",
+                        "spread": _fmt_opt_float(spread),
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
@@ -2092,9 +2314,198 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
                 self._register_poly_followup(
                     self._followup_snap(
-                        g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                        g,
+                        odds_home,
+                        odds_away,
+                        side_label,
+                        token_id,
+                        float(mid),
+                        float(p_fair),
+                        edge_mid,
+                        edge_exec,
+                        spread,
+                        latency_ms_ref,
+                        signal_id,
+                        odds_event,
+                        mscr_live,
                     ),
                     ex["signal_anchor_ts"],
+                )
+                acc["csv_rows"] += 1
+                continue
+
+            if edge_exec <= 0:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:BELOW_MIN_EDGE",
+                        "reason": (
+                            f"edge_exec<=0_not_buy_leg_edge_exec={edge_exec:.4f}_"
+                            f"min_edge_exec={self.min_edge_exec:.4f}_side={side_label}"
+                        ),
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": f"{edge_exec:.6f}",
+                        "edge": f"{edge_exec:.6f}",
+                        "spread": _fmt_opt_float(spread),
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex,
+                    }
+                )
+                self._register_poly_followup(
+                    self._followup_snap(
+                        g,
+                        odds_home,
+                        odds_away,
+                        side_label,
+                        token_id,
+                        float(mid),
+                        float(p_fair),
+                        edge_mid,
+                        edge_exec,
+                        spread,
+                        latency_ms_ref,
+                        signal_id,
+                        odds_event,
+                        mscr_live,
+                    ),
+                    ex["signal_anchor_ts"],
+                )
+                acc["csv_rows"] += 1
+                continue
+
+            if spread is not None and spread > self.max_spread:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:WIDE_SPREAD",
+                        "reason": f"spread={spread:.4f}>max_spread={self.max_spread:.4f}",
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": f"{edge_exec:.6f}",
+                        "edge": f"{edge_exec:.6f}",
+                        "spread": _fmt_opt_float(spread),
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex,
+                    }
+                )
+                acc["csv_rows"] += 1
+                continue
+
+            if top_ask_notional is not None and top_ask_notional < self.min_top_ask_notional:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:LOW_LIQUIDITY",
+                        "reason": (
+                            f"top_ask_notional={top_ask_notional:.4f}<min_top_ask_notional="
+                            f"{self.min_top_ask_notional:.4f}"
+                        ),
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": f"{edge_exec:.6f}",
+                        "edge": f"{edge_exec:.6f}",
+                        "spread": _fmt_opt_float(spread),
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex,
+                    }
+                )
+                acc["csv_rows"] += 1
+                continue
+
+            if ask_band_notional is not None and ask_band_notional < self.min_ask_band_notional:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:LOW_LIQUIDITY",
+                        "reason": (
+                            f"ask_band_notional={ask_band_notional:.4f}<min_ask_band_notional="
+                            f"{self.min_ask_band_notional:.4f}"
+                        ),
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": f"{edge_exec:.6f}",
+                        "edge": f"{edge_exec:.6f}",
+                        "spread": _fmt_opt_float(spread),
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex,
+                    }
                 )
                 acc["csv_rows"] += 1
                 continue
@@ -2114,7 +2525,16 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         and (now_mono - prev_mono) < float(_HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC)
                     ):
                         ex = await self._enrich_signal_csv_fields(
-                            clob, token_id, float(mid), odds_event, mscr_live
+                            clob,
+                            token_id,
+                            float(mid),
+                            odds_event,
+                            mscr_live,
+                            signal_id=signal_id,
+                            edge_mid=edge_mid,
+                            edge_exec=edge_exec,
+                            spread=spread,
+                            latency_ms_ref_to_clob=latency_ms_ref,
                         )
                         await self.log_signal_async(
                             {
@@ -2131,7 +2551,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                                 "token_id": token_id,
                                 "price_poly": f"{mid:.6f}",
                                 "prob_pinnacle": f"{p_fair:.6f}",
-                                "edge": f"{edge_mag:.6f}",
+                                "edge_mid": f"{edge_mid:.6f}",
+                                "edge_exec": f"{edge_exec:.6f}",
+                                "edge": f"{edge_exec:.6f}",
+                                "spread": _fmt_opt_float(spread),
                                 "size_usdc": "0",
                                 "status": "SKIP",
                                 **ex,
@@ -2163,11 +2586,16 @@ class LatencyArbSportsStrategy(ArbStrategy):
             size = float(self.max_stake)
             status = "SIGNAL"
             action = "SIGNAL"
-            reason = f"{buy_side}_{side_label}_fair_minus_mid={raw_edge:.4f}"
+            reason = f"{buy_side}_{side_label}_fair_minus_exec={edge_exec:.4f}_fair_minus_mid={edge_mid:.4f}"
+            order_attempted = False
+            fill_price = float(best_ask) if best_ask is not None else float(mid)
+            fill_size = size
+            fee_est: Optional[float] = None
             if not self.dry_run:
                 try:
+                    order_attempted = True
                     ba = (await clob.get_orderbook(token_id)).get("best_ask")
-                    price = float(ba) if ba is not None else float(mid)
+                    price = float(ba) if ba is not None else float(fill_price)
                     await clob.place_order(
                         token_id,
                         "BUY",
@@ -2179,15 +2607,33 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     action = "EXECUTED"
                     status = "EXECUTED"
                     reason = f"FOK_BUY_{side_label}@{price:.4f}"
+                    fill_price = price
                 except Exception as e:
                     action = "ERROR:ORDER_FAIL"
                     status = "SKIP"
                     reason = str(e)[:200]
-            ex = await self._enrich_signal_csv_fields(clob, token_id, float(mid), odds_event, mscr_live)
+                    fill_size = 0.0
+            ex = await self._enrich_signal_csv_fields(
+                clob,
+                token_id,
+                float(mid),
+                odds_event,
+                mscr_live,
+                signal_id=signal_id,
+                edge_mid=edge_mid,
+                edge_exec=edge_exec,
+                spread=spread,
+                latency_ms_ref_to_clob=latency_ms_ref,
+                order_attempted=order_attempted,
+                fill_price=fill_price,
+                fill_size=fill_size,
+                fee_est=fee_est,
+            )
             await self.log_signal_async(
                 {
                     "action": action,
                     "reason": reason,
+                    "signal_id": signal_id,
                     "game_slug": g.slug,
                     "league": g.league,
                     "home_team": odds_home,
@@ -2196,7 +2642,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "token_id": token_id,
                     "price_poly": f"{mid:.6f}",
                     "prob_pinnacle": f"{p_fair:.6f}",
-                    "edge": f"{edge_mag:.6f}",
+                    "edge_mid": f"{edge_mid:.6f}",
+                    "edge_exec": f"{edge_exec:.6f}",
+                    "edge": f"{edge_exec:.6f}",
+                    "spread": _fmt_opt_float(spread),
                     "size_usdc": f"{size:.4f}",
                     "status": status,
                     **ex,
@@ -2204,7 +2653,20 @@ class LatencyArbSportsStrategy(ArbStrategy):
             )
             self._register_poly_followup(
                 self._followup_snap(
-                    g, odds_home, odds_away, side_label, token_id, float(mid), float(p_fair), edge_mag, odds_event, mscr_live
+                    g,
+                    odds_home,
+                    odds_away,
+                    side_label,
+                    token_id,
+                    float(mid),
+                    float(p_fair),
+                    edge_mid,
+                    edge_exec,
+                    spread,
+                    latency_ms_ref,
+                    signal_id,
+                    odds_event,
+                    mscr_live,
                 ),
                 ex["signal_anchor_ts"],
             )
