@@ -73,6 +73,8 @@ BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
 LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snapshots.csv"
 LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
 ODDS_EVENT_META_CACHE_JSON = DATA_DIR / "logs" / "odds_event_meta_cache.json"
+# Sentinel: latency_arb_sports vacía `_event_meta_cache` del OddsApiIo al ver este archivo.
+ODDS_EVENT_META_CACHE_CLEAR_FLAG = DATA_DIR / "logs" / ".odds_event_meta_cache_clear_requested"
 
 
 def _read_latency_sports_cycle_metrics() -> dict[str, Any]:
@@ -882,6 +884,39 @@ async def arb_status() -> JSONResponse:
         content=payload,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
     )
+
+
+@app.post("/api/admin/clear-meta-cache")
+async def admin_clear_meta_cache() -> dict[str, Any]:
+    """Borra caché meta odds-api.io en disco y señala al motor para vaciar RAM (sin restart)."""
+    path = ODDS_EVENT_META_CACHE_JSON
+    try:
+        (DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("clear-meta-cache: no se pudo asegurar DATA_DIR/logs: %s", e)
+        return JSONResponse(
+            {"cleared": False, "path": str(path), "error": f"mkdir logs: {e}"},
+            status_code=500,
+        )
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError as e:
+            log.warning("clear-meta-cache: unlink %s: %s", path, e)
+            return JSONResponse(
+                {"cleared": False, "path": str(path), "error": str(e)},
+                status_code=500,
+            )
+    try:
+        ODDS_EVENT_META_CACHE_CLEAR_FLAG.write_text("", encoding="utf-8")
+    except OSError as e:
+        log.warning("clear-meta-cache: sentinel %s: %s", ODDS_EVENT_META_CACHE_CLEAR_FLAG, e)
+        return JSONResponse(
+            {"cleared": False, "path": str(path), "error": f"sentinel: {e}"},
+            status_code=500,
+        )
+    log.info("POST /api/admin/clear-meta-cache path=%s", path)
+    return {"cleared": True, "path": str(path)}
 
 
 @app.post("/api/arb/start")

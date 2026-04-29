@@ -19,7 +19,7 @@ import aiohttp
 from aiohttp import WSMsgType
 
 from arb.base import ArbStrategy
-from clients.odds_api import odds_team_matches_gamma_blob, teams_match_odds_gamma
+from clients.odds_api import normalize_team_for_match, odds_team_matches_gamma_blob, teams_match_odds_gamma
 from clients.odds_api_io import (
     ODDS_API_IO_SPORTS_EMBEDDED,
     OddsApiIo,
@@ -61,6 +61,11 @@ _SNAPSHOT_CSV_COLUMNS: list[str] = [
 
 def _latency_snapshots_csv_path() -> Path:
     return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / "latency_arb_sports_snapshots.csv"
+
+
+def _odds_event_meta_cache_clear_flag_path() -> Path:
+    """Sentinel escrito por POST /api/admin/clear-meta-cache; el motor vacía RAM del cliente IO."""
+    return Path(os.getenv("DATA_DIR", ".")).resolve() / "logs" / ".odds_event_meta_cache_clear_requested"
 
 
 _DEFAULT_HEADERS = {
@@ -177,18 +182,22 @@ def _doubles_hint_in_text(s: str) -> bool:
         return True
     if t.count("/") >= 2:
         return True
-    if re.search(r"[\w.'\-]\s*/\s*[\w.'\-]", t, re.I):
-        return True
-    if re.search(r"[\w.'\-]/[\w.'\-]", t, re.I):
-        return True
+    for rx in (r"[\w.'\-]\s*/\s*[\w.'\-]", r"[\w.'\-]/[\w.'\-]"):
+        for m in re.finditer(rx, t, re.I):
+            seg = re.sub(r"\s+", "", m.group(0)).lower()
+            # Props (O/U, H/E) no son dobles; el regex anterior los confunde con «jugador / jugador».
+            if seg in ("o/u", "h/e", "n/a", "y/n"):
+                continue
+            return True
     return False
 
 
 def _gamma_event_doubles_signal(ev: dict[str, Any]) -> bool:
     """True si en cualquier parte visible del evento Gamma hay formato de dobles."""
+    # No incluir description: URLs tipo ``…com/en/…`` disparan el regex ``[\w.'\-]/[\w.'\-]``
+    # y bloquean moneylines ATP válidos (p. ej. Sinner vs Jodar).
     chunks: list[str] = [
         str(ev.get("title") or ""),
-        str(ev.get("description") or ""),
         str(ev.get("slug") or ""),
     ]
     for m in ev.get("markets") or []:
@@ -361,6 +370,33 @@ def _parse_poly_title_teams(raw: str) -> tuple[str, str]:
     return parts[0].strip(), parts[1].strip()
 
 
+_TENNISLIKE_GAMMA_SLUG_RE = re.compile(
+    r"^(?:atp|wta|wttmen|wtt)-(?P<mid>.+)-(?P<d>\d{4}-\d{2}-\d{2})$",
+    re.IGNORECASE,
+)
+
+
+def _teams_from_tennislike_gamma_slug(slug: str) -> tuple[str, str]:
+    """
+    Gamma public-search a veces devuelve título vacío; el slug trae equipos
+    (p. ej. atp-sinner-jodar-2026-04-29).
+    """
+    m = _TENNISLIKE_GAMMA_SLUG_RE.match(str(slug or "").strip().lower())
+    if not m:
+        return "", ""
+    segs = [p for p in m.group("mid").split("-") if p]
+    if len(segs) < 2:
+        return "", ""
+    if len(segs) == 2:
+        return segs[0].title(), segs[1].title()
+    if len(segs) == 3:
+        return segs[0].title(), f"{segs[1]} {segs[2]}".title()
+    if len(segs) == 4:
+        return f"{segs[0]} {segs[1]}".title(), f"{segs[2]} {segs[3]}".title()
+    mid = len(segs) // 2
+    return " ".join(segs[:mid]).title(), " ".join(segs[mid:]).title()
+
+
 def _yes_token_from_pairs(pairs: list[tuple[str, str]]) -> Optional[str]:
     for lab, tid in pairs:
         if str(lab).strip().lower() == "yes":
@@ -371,13 +407,16 @@ def _yes_token_from_pairs(pairs: list[tuple[str, str]]) -> Optional[str]:
 def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[OpenPolymarketGame]:
     title = str(ev.get("title") or "")
     home_p, away_p = _parse_poly_title_teams(title)
+    slug_e0 = str(ev.get("slug") or "").strip()
+    if not home_p or not away_p:
+        home_p, away_p = _teams_from_tennislike_gamma_slug(slug_e0)
     if not home_p or not away_p:
         return None
     if _latency_sports_skip_doubles() and _gamma_event_doubles_signal(ev):
         return None
     end_dt = _parse_iso_utc(ev.get("endDate"))
     end_s = str(ev.get("endDate") or "").strip() or None
-    slug_e = str(ev.get("slug") or "")[:240]
+    slug_e = slug_e0[:240]
     hl, al = home_p.lower(), away_p.lower()
 
     two_team_m: Optional[dict[str, Any]] = None
@@ -500,7 +539,22 @@ def _event_matches_odds_teams(ev: dict[str, Any], home_odds: str, away_odds: str
     blob = (title + " " + slug).strip()
     if len(blob) < 3:
         return False
-    return odds_team_matches_gamma_blob(home_odds, blob) and odds_team_matches_gamma_blob(away_odds, blob)
+    ok_h = odds_team_matches_gamma_blob(home_odds, blob)
+    ok_a = odds_team_matches_gamma_blob(away_odds, blob)
+    if not (ok_h and ok_a):
+        nh = normalize_team_for_match(home_odds)
+        na = normalize_team_for_match(away_odds)
+        log.debug(
+            "[PS_FILTER] team_match_detail slug=%r blob_tail=%r io_norm_home=%r io_norm_away=%r "
+            "home_hit=%s away_hit=%s",
+            slug,
+            blob[-200:] if len(blob) > 200 else blob,
+            nh,
+            na,
+            ok_h,
+            ok_a,
+        )
+    return ok_h and ok_a
 
 
 def _io_sport_slug_coerce(raw: str) -> str:
@@ -650,11 +704,26 @@ def _pick_open_game_from_public_search_page(
     """Filtra eventos Gamma; prefijo slug IO; fallback título con ambos apellidos; construye OpenPolymarketGame."""
     poly_set = frozenset(poly_slugs_order)
     base: list[dict[str, Any]] = []
+    _ps_filter_logged = 0
+    _ps_filter_cap = 30
     for raw in events_raw:
         ev0 = _merge_root_markets_into_event(raw, root_markets)
-        if not _gamma_event_usable(ev0):
+        sslug = str(ev0.get("slug") or "?")
+        usable = _gamma_event_usable(ev0)
+        teams = _event_matches_odds_teams(ev0, odds_ev.home, odds_ev.away)
+        if _ps_filter_logged < _ps_filter_cap:
+            _ps_filter_logged += 1
+            log.debug(
+                "[PS_FILTER] slug=%s usable=%s teams=%s io_home=%r io_away=%r",
+                sslug,
+                usable,
+                teams,
+                odds_ev.home,
+                odds_ev.away,
+            )
+        if not usable:
             continue
-        if not _event_matches_odds_teams(ev0, odds_ev.home, odds_ev.away):
+        if not teams:
             continue
         tit = str(ev0.get("title") or "")
         if _latency_sports_skip_doubles() and (
@@ -1158,6 +1227,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
         if not ah:
             self._betfair_gamma_search_cache[eid] = (now, None)
             return None
+        # Apellido/token demasiado corto → Gamma puede devolver HTTP 500 (p. ej. q='d'); caché negativa mismo TTL.
+        if len(ah) < 2 or (bool(aa) and len(aa) < 2):
+            self._betfair_gamma_search_cache[eid] = (now, None)
+            return None
 
         limit = int(_HARDCODE_GAMMA_PUBLIC_SEARCH_LIMIT)
         poly_order = list(self.poly_slugs)
@@ -1167,11 +1240,28 @@ class LatencyArbSportsStrategy(ArbStrategy):
             return _pick_open_game_from_public_search_page(evs, mks, odds_ev, ah, aa, poly_order)
 
         game: Optional[OpenPolymarketGame] = None
+        q1_for_miss = ""
+        q2_for_miss = ""
         if aa:
-            q1 = f"{ah} {aa}"
-            game = await one_round(q1)
+            q1_for_miss = f"{ah} {aa}"
+            game = await one_round(q1_for_miss)
+            if game is None:
+                q2_for_miss = ah
+                game = await one_round(q2_for_miss)
+        else:
+            q1_for_miss = ah
+            q2_for_miss = ""
+            game = await one_round(q1_for_miss)
+
         if game is None:
-            game = await one_round(ah)
+            log.info(
+                "[PS_MISS] event_id=%s home=%r away=%r q1=%r q2=%r",
+                eid,
+                odds_ev.home,
+                odds_ev.away,
+                q1_for_miss,
+                q2_for_miss,
+            )
 
         self._betfair_gamma_search_cache[eid] = (time.monotonic(), game)
         return game
@@ -1198,6 +1288,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     }
                 )
                 return
+
+        clear_p = _odds_event_meta_cache_clear_flag_path()
+        if clear_p.is_file():
+            try:
+                self._odds_client._event_meta_cache.clear()
+                log.info("[latency_arb_sports] odds_event_meta_cache en memoria vaciada (admin clear-meta-cache)")
+            finally:
+                try:
+                    clear_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         async with aiohttp.ClientSession(
             headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
