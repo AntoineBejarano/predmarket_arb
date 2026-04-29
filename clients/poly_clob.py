@@ -787,7 +787,7 @@ class PolyCLOBClient:
                     CLOB_WS,
                     ping_interval=20,
                     ping_timeout=20,
-                    extra_headers={"User-Agent": _DEFAULT_HEADERS["User-Agent"]},
+                    additional_headers={"User-Agent": _DEFAULT_HEADERS["User-Agent"]},
                 ) as ws:
                     await ws.send(sub_msg)
                     backoff = 1.0
