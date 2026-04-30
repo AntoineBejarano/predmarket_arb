@@ -25,6 +25,7 @@ import pandas as pd
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -78,6 +79,7 @@ BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
 LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snapshots.csv"
 LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
 LATENCY_SPORTS_SCHEDULE_JSON = DATA_DIR / "logs" / "latency_sports_schedule.json"
+LATENCY_SPORTS_PENDING_JSON = DATA_DIR / "logs" / "latency_arb_sports_pending_matches.json"
 ODDS_EVENT_META_CACHE_JSON = DATA_DIR / "logs" / "odds_event_meta_cache.json"
 # Sentinel: latency_arb_sports vacía `_event_meta_cache` del OddsApiIo al ver este archivo.
 ODDS_EVENT_META_CACHE_CLEAR_FLAG = DATA_DIR / "logs" / ".odds_event_meta_cache_clear_requested"
@@ -513,6 +515,71 @@ async def api_latency_sports_schedule(refresh: bool = Query(False)) -> JSONRespo
         content=payload,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
     )
+
+
+def _read_latency_sports_pending_matches() -> dict[str, Any]:
+    p = LATENCY_SPORTS_PENDING_JSON
+    if not p.is_file():
+        return {"pending": [], "pending_count": 0, "updated_at": None}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {"pending": [], "pending_count": 0, "updated_at": None}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {"pending": [], "pending_count": 0, "updated_at": None}
+
+
+@app.get("/api/arb/latency_sports/pending-matches")
+async def api_latency_sports_pending_matches() -> JSONResponse:
+    """Último snapshot escrito por el motor (sin REST extra). Vacío si el motor no ha corrido."""
+    return JSONResponse(
+        content=_read_latency_sports_pending_matches(),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
+class LatencySportsManualMatchIn(BaseModel):
+    condition_id: str = Field(..., min_length=1)
+    odds_event_id: str = Field(..., min_length=1)
+    swap_sides: bool = False
+    poly_home: str = ""
+    poly_away: str = ""
+
+
+@app.get("/api/arb/latency_sports/manual-matches")
+async def api_latency_sports_manual_matches_list() -> JSONResponse:
+    from arb.latency_sports_manual_match import list_manual_matches_for_api
+
+    return JSONResponse(
+        content={"items": list_manual_matches_for_api()},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
+@app.post("/api/arb/latency_sports/manual-match")
+async def api_latency_sports_manual_match_save(body: LatencySportsManualMatchIn) -> JSONResponse:
+    from arb.latency_sports_manual_match import upsert_manual_match
+
+    try:
+        row = upsert_manual_match(
+            body.condition_id.strip(),
+            body.odds_event_id.strip(),
+            swap_sides=body.swap_sides,
+            poly_home=body.poly_home,
+            poly_away=body.poly_away,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return JSONResponse(content={"ok": True, "item": row})
+
+
+@app.delete("/api/arb/latency_sports/manual-match/{condition_id}")
+async def api_latency_sports_manual_match_delete(condition_id: str) -> JSONResponse:
+    from arb.latency_sports_manual_match import delete_manual_match
+
+    ok = delete_manual_match(condition_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="condition_id not in manual matches")
+    return JSONResponse(content={"ok": True})
 
 
 @app.get("/arb/strategy/{slug}", response_model=None)

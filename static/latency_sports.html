@@ -44,6 +44,49 @@
       <p id="briefing-p2" class="text-sm text-slate-400 leading-relaxed">—</p>
     </section>
 
+    <section id="manual-match-section" class="rounded-xl border border-amber-900/40 bg-slate-800/40 p-4 space-y-4">
+      <div>
+        <h2 class="text-xs font-semibold text-amber-300 uppercase tracking-wide">Matching manual Poly ↔ odds-api</h2>
+        <p class="text-xs text-slate-500 mt-1 leading-relaxed max-w-3xl">
+          Lista <strong class="text-slate-400">pendiente</strong>: mercados Gamma tipo moneyline (sin match automático de nombres en la caché IO del último ciclo del motor).
+          Elige el evento IO de la lista, marca invertir si el local/visitante va cruzado, y pulsa <strong class="text-slate-400">Aprobar</strong>: el motor lo usará en el siguiente ciclo igual que un match automático (misma lógica CLOB / edge / dry o live).
+          Sin candidatos = la caché IO aún no trae filas para ese deporte en ese ciclo.
+        </p>
+        <p id="pending-mm-meta" class="text-[11px] text-slate-600 font-mono mt-1">—</p>
+      </div>
+      <div class="overflow-x-auto rounded-lg border border-slate-700">
+        <table class="w-full text-xs text-left min-w-[960px]">
+          <thead>
+            <tr class="bg-slate-800 text-slate-400 uppercase">
+              <th class="p-2">Polymarket (Gamma)</th>
+              <th class="p-2">Referencia IO (elegir)</th>
+              <th class="p-2 w-28">Invertir</th>
+              <th class="p-2 w-32">Acción</th>
+            </tr>
+          </thead>
+          <tbody id="pending-mm-tbody"></tbody>
+        </table>
+      </div>
+      <div>
+        <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Aprobados (persistente)</h3>
+        <p class="text-[11px] text-slate-600 mt-0.5">JSON en <code class="text-slate-500">DATA_DIR/logs/latency_sports_manual_matches.json</code>. Quitar = borrar enlace.</p>
+        <div class="overflow-x-auto rounded-lg border border-slate-700 mt-2">
+          <table class="w-full text-xs text-left min-w-[720px]">
+            <thead>
+              <tr class="bg-slate-800 text-slate-400 uppercase">
+                <th class="p-2">condition_id</th>
+                <th class="p-2">Poly</th>
+                <th class="p-2">IO event_id</th>
+                <th class="p-2">Swap</th>
+                <th class="p-2 w-24">—</th>
+              </tr>
+            </thead>
+            <tbody id="approved-mm-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <section class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-9 gap-2 md:gap-3">
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase">Estrategia</p>
@@ -416,6 +459,164 @@
         ".";
     }
 
+    var _pendingMmRows = [];
+
+    async function refreshManualMatchPanels() {
+      const tbP = document.getElementById("pending-mm-tbody");
+      const tbA = document.getElementById("approved-mm-tbody");
+      const meta = document.getElementById("pending-mm-meta");
+      if (!tbP || !tbA) return;
+      let pend = { pending: [], pending_count: 0, updated_at: null };
+      let appr = { items: [] };
+      try {
+        const [rp, ra] = await Promise.all([
+          fetch("/api/arb/latency_sports/pending-matches", { cache: "no-store", headers: { Accept: "application/json" } }),
+          fetch("/api/arb/latency_sports/manual-matches", { cache: "no-store", headers: { Accept: "application/json" } }),
+        ]);
+        if (rp.ok) pend = await rp.json();
+        if (ra.ok) appr = await ra.json();
+      } catch (e) {}
+      const rows = Array.isArray(pend.pending) ? pend.pending : [];
+      _pendingMmRows = rows;
+      if (meta) {
+        meta.textContent =
+          "pending_count=" +
+          (pend.pending_count != null ? pend.pending_count : rows.length) +
+          " · updated_at=" +
+          (pend.updated_at || "—");
+      }
+      if (rows.length === 0) {
+        tbP.innerHTML =
+          "<tr><td colspan='4' class='p-4 text-slate-500'>Nada pendiente (o el motor aún no escribió <code class='text-slate-600'>latency_arb_sports_pending_matches.json</code>).</td></tr>";
+      } else {
+        tbP.innerHTML = rows
+          .map(function (row, idx) {
+            const cands = row.io_candidates || [];
+            const opts =
+              "<option value=''>— elegir evento IO —</option>" +
+              cands
+                .map(function (c) {
+                  const lab = esc((c.home || "") + " vs " + (c.away || "") + " · " + (c.bookie || "") + " · id=" + c.event_id);
+                  return "<option value=\"" + esc(c.event_id) + "\">" + lab + "</option>";
+                })
+                .join("");
+            const wait = row.manual_waiting_cache
+              ? "<p class='text-amber-400/90 text-[10px] mt-1'>Aprobado en JSON pero el event_id aún no aparece en la caché de este ciclo.</p>"
+              : "";
+            return (
+              "<tr class='border-t border-slate-700/80'>" +
+              "<td class='p-2 align-top'><div class='font-medium text-slate-200'>" +
+              esc(row.poly_home) +
+              " <span class='text-slate-500'>vs</span> " +
+              esc(row.poly_away) +
+              "</div><div class='text-[10px] text-slate-600 mt-1 font-mono'>" +
+              esc(row.sport_slug) +
+              " · " +
+              esc(row.condition_id || "").slice(0, 18) +
+              "…</div><div class='text-[10px] text-slate-600 mt-0.5'>" +
+              esc(row.slug || "") +
+              "</div>" +
+              wait +
+              "</td>" +
+              "<td class='p-2 align-top'><select id='mm-sel-" +
+              idx +
+              "' class='w-full max-w-md bg-slate-900 border border-slate-600 rounded px-2 py-1 text-[11px]'>" +
+              opts +
+              "</select></td>" +
+              "<td class='p-2 align-top'><label class='flex items-center gap-1 text-slate-400 cursor-pointer'><input type='checkbox' id='mm-swap-" +
+              idx +
+              "' class='rounded border-slate-600 bg-slate-800' /> invertir</label></td>" +
+              "<td class='p-2 align-top'><button type='button' class='text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 text-white' onclick='approveManualMatch(" +
+              idx +
+              ")'>Aprobar</button></td></tr>"
+            );
+          })
+          .join("");
+      }
+      const items = Array.isArray(appr.items) ? appr.items : [];
+      if (items.length === 0) {
+        tbA.innerHTML = "<tr><td colspan='5' class='p-3 text-slate-500'>Sin enlaces manuales guardados.</td></tr>";
+      } else {
+        tbA.innerHTML = items
+          .map(function (it) {
+            const cid = esc(it.condition_id);
+            return (
+              "<tr class='border-t border-slate-700/80'>" +
+              "<td class='p-2 font-mono text-[10px] break-all'>" +
+              cid +
+              "</td>" +
+              "<td class='p-2'>" +
+              esc(it.poly_home) +
+              " vs " +
+              esc(it.poly_away) +
+              "</td>" +
+              "<td class='p-2 font-mono'>" +
+              esc(it.odds_event_id) +
+              "</td>" +
+              "<td class='p-2'>" +
+              (it.swap_sides ? "sí" : "no") +
+              "</td>" +
+              "<td class='p-2'><button type='button' class='text-xs text-red-400 hover:underline' onclick='removeManualMatch(" +
+              JSON.stringify(it.condition_id || "") +
+              ")'>Quitar</button></td></tr>"
+            );
+          })
+          .join("");
+      }
+    }
+
+    async function approveManualMatch(idx) {
+      const row = _pendingMmRows[idx];
+      if (!row || !row.condition_id) return;
+      const sel = document.getElementById("mm-sel-" + idx);
+      const sw = document.getElementById("mm-swap-" + idx);
+      const eid = sel && sel.value ? sel.value.trim() : "";
+      if (!eid) {
+        alert("Elige un evento IO en el desplegable.");
+        return;
+      }
+      const body = {
+        condition_id: row.condition_id,
+        odds_event_id: eid,
+        swap_sides: sw && sw.checked,
+        poly_home: row.poly_home || "",
+        poly_away: row.poly_away || "",
+      };
+      try {
+        const r = await fetch("/api/arb/latency_sports/manual-match", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          alert("Error " + r.status + ": " + t);
+          return;
+        }
+        await refreshManualMatchPanels();
+      } catch (e) {
+        alert(String(e));
+      }
+    }
+
+    async function removeManualMatch(conditionId) {
+      if (!conditionId || !confirm("¿Quitar este enlace manual?")) return;
+      try {
+        const r = await fetch("/api/arb/latency_sports/manual-match/" + encodeURIComponent(conditionId), {
+          method: "DELETE",
+          headers: { Accept: "application/json" },
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          alert("Error " + r.status + ": " + t);
+          return;
+        }
+        await refreshManualMatchPanels();
+      } catch (e) {
+        alert(String(e));
+      }
+    }
+
     async function refreshStatus() {
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
@@ -450,6 +651,7 @@
         (_enabled ? "translate-x-5" : "translate-x-0");
       document.getElementById("toggle-label").textContent = _enabled ? "encendida" : "apagada";
       renderBriefing(s);
+      refreshManualMatchPanels();
     }
 
     async function toggleEnabled() {

@@ -21,6 +21,7 @@ import aiohttp
 from aiohttp import WSMsgType
 
 from arb.base import ArbStrategy
+from arb.latency_sports_manual_match import load_manual_matches
 from clients.odds_api import normalize_team_for_match, odds_team_matches_gamma_blob, teams_match_odds_gamma
 from clients.odds_api_io import (
     ODDS_API_IO_SPORTS_EMBEDDED,
@@ -448,6 +449,74 @@ def _compute_briefing_cycle_counts(
         "briefing_ml_like": int(ml_like),
         "briefing_io_name_match_cache": int(io_name_hit),
     }
+
+
+def _manual_tw_from_odds_event(odds_ev: OddsEvent, swap_sides: bool) -> tuple[str, float, str, float]:
+    """Alineación fija Poly home/away ← IO (swap invierte lados IO respecto a Poly)."""
+    if swap_sides:
+        return (
+            str(odds_ev.away or "").strip(),
+            float(odds_ev.away_odds),
+            str(odds_ev.home or "").strip(),
+            float(odds_ev.home_odds),
+        )
+    return (
+        str(odds_ev.home or "").strip(),
+        float(odds_ev.home_odds),
+        str(odds_ev.away or "").strip(),
+        float(odds_ev.away_odds),
+    )
+
+
+def _build_pending_manual_payload(
+    open_games: list[OpenPolymarketGame],
+    odds_events_by_key: dict[str, list[OddsEvent]],
+    manual_map: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Filas UI: ML-like, no lejano, sin match automático y sin manual resuelto en caché este ciclo."""
+    pending_rows: list[dict[str, Any]] = []
+    for g in open_games:
+        if _is_pre_game_listing_game(g):
+            continue
+        if not _is_ml_like_open_game(g):
+            continue
+        ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
+        if not ok:
+            continue
+        events_list = odds_events_by_key.get(ok) or []
+        if find_event_matching_teams(events_list, g.home, g.away) is not None:
+            continue
+        cid = (g.condition_id or "").strip()
+        if not cid:
+            continue
+        mm = manual_map.get(cid) if manual_map else None
+        eid_manual = str((mm or {}).get("odds_event_id") or "").strip()
+        if eid_manual and any(str(e.event_id) == eid_manual for e in events_list):
+            continue
+        manual_waiting_cache = bool(eid_manual) and not any(str(e.event_id) == eid_manual for e in events_list)
+        candidates = [
+            {
+                "event_id": str(e.event_id),
+                "home": e.home,
+                "away": e.away,
+                "bookie": e.bookie,
+            }
+            for e in events_list[:80]
+        ]
+        pending_rows.append(
+            {
+                "condition_id": cid,
+                "poly_home": g.home,
+                "poly_away": g.away,
+                "sport_slug": g.sport_slug,
+                "odds_key": ok,
+                "slug": (g.slug or "")[:220],
+                "raw_title": (g.raw_title or "")[:400],
+                "io_candidates": candidates,
+                "manual_waiting_cache": manual_waiting_cache,
+            }
+        )
+    return {"pending": pending_rows, "pending_count": len(pending_rows)}
 
 
 @dataclass
@@ -1513,6 +1582,23 @@ class LatencyArbSportsStrategy(ArbStrategy):
         except OSError as e:
             log.debug("[latency_arb_sports] cycle metrics json: %s", e)
 
+    def _write_pending_matches_json(
+        self,
+        open_games: list[OpenPolymarketGame],
+        odds_events_by_key: dict[str, list[OddsEvent]],
+        manual_map: dict[str, dict[str, Any]],
+    ) -> None:
+        try:
+            from lab.paths import data_dir
+
+            path = data_dir() / "logs" / "latency_arb_sports_pending_matches.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            body = _build_pending_manual_payload(open_games, odds_events_by_key, manual_map)
+            body["updated_at"] = datetime.now(timezone.utc).isoformat()
+            path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            log.debug("[latency_arb_sports] pending matches json: %s", e)
+
     def _get_odds_for_sport(self, sport_slug: str) -> list[OddsEvent]:
         poly_key = POLY_SLUG_TO_ODDS_KEY.get(str(sport_slug).strip().lower())
         if not poly_key:
@@ -1997,6 +2083,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 odds_events_by_key[ok] = self._odds_client.get_cached_odds(pk)
             odds_keys_loaded = {k for k, evs in odds_events_by_key.items() if evs}
             briefing_counts = _compute_briefing_cycle_counts(open_games, odds_events_by_key)
+            manual_map = load_manual_matches()
+            self._write_pending_matches_json(open_games, odds_events_by_key, manual_map)
             processed_condition_ids: set[str] = set()
             match_sem = asyncio.Semaphore(int(_HARDCODE_MATCH_PARALLELISM))
             processed_lock = asyncio.Lock()
@@ -2033,6 +2121,18 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         return (0, 0, 0)
                     events_list = odds_events_by_key.get(odds_key) or []
                     odds_ev = find_event_matching_teams(events_list, game.home, game.away)
+                    manual_tw: Optional[tuple[str, float, str, float]] = None
+                    if odds_ev is None and cid_g:
+                        mm = manual_map.get(cid_g)
+                        if isinstance(mm, dict):
+                            eid = str(mm.get("odds_event_id") or "").strip()
+                            swap = bool(mm.get("swap_sides"))
+                            if eid:
+                                for ev in events_list:
+                                    if str(ev.event_id) == eid:
+                                        odds_ev = ev
+                                        manual_tw = _manual_tw_from_odds_event(ev, swap)
+                                        break
                     if odds_ev is None:
                         return (0, 0, 0)
                     async with processed_lock:
@@ -2040,7 +2140,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
                             return (0, 0, 0)
                         if cid_g:
                             processed_condition_ids.add(cid_g)
-                    st = await self._process_matched_poly_odds(sess, clob, game, odds_key, odds_ev)
+                    st = await self._process_matched_poly_odds(
+                        sess, clob, game, odds_key, odds_ev, manual_tw=manual_tw
+                    )
                     return (
                         1,
                         int(st.get("reference_aligned", 0)),
@@ -2218,13 +2320,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
         game: OpenPolymarketGame,
         odds_sport_key: str,
         odds_event: OddsEvent,
+        *,
+        manual_tw: Optional[tuple[str, float, str, float]] = None,
     ) -> dict[str, int]:
         acc: dict[str, int] = {"csv_rows": 0, "reference_aligned": 0}
         if _is_pre_game_listing_game(game):
             return acc
         if _is_reference_lag_over_limit(odds_event) or _is_reference_stale_for_io(odds_event):
             return acc
-        tw = _align_odds_io_to_game(odds_event, game)
+        tw: Optional[tuple[str, float, str, float]] = manual_tw
+        if tw is None:
+            tw = _align_odds_io_to_game(odds_event, game)
         if tw is None:
             return acc
         odds_home, dec_h, odds_away, dec_a = tw
