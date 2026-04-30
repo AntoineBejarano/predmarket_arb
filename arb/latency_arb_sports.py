@@ -12,6 +12,7 @@ import threading
 import time
 import types
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -67,13 +68,6 @@ def _latency_snapshots_csv_path() -> Path:
     from lab.paths import data_dir
 
     return data_dir() / "logs" / "latency_arb_sports_snapshots.csv"
-
-
-def _odds_event_meta_cache_clear_flag_path() -> Path:
-    """Sentinel escrito por POST /api/admin/clear-meta-cache; el motor vacía RAM del cliente IO."""
-    from lab.paths import data_dir
-
-    return data_dir() / "logs" / ".odds_event_meta_cache_clear_requested"
 
 
 def _fmt_opt_float(x: Optional[float], nd: int = 6) -> str:
@@ -179,12 +173,24 @@ _SNAPSHOT_CSV_ENABLED = True
 # Calidad referencia odds-io: descartar emparejamientos demasiado viejos o pre-game listado.
 _HARDCODE_MAX_REFERENCE_LAG_SEC = 30.0
 _HARDCODE_STALE_ODDS_IO_SEC = 120.0
+# Solo SIGNAL si el tick Betfair tiene <=20s: ahí es donde la latencia Betfair→Polymarket
+# todavía vale dinero. 20s-120s permite SKIP:LOW_EDGE para análisis pero no SIGNAL.
+_HARDCODE_TICK_FRESH_FOR_SIGNAL_SEC = 30.0
 _HARDCODE_PRE_GAME_END_MARGIN_SEC = 172800.0
 _HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC = 120.0
 _HARDCODE_MAX_SPREAD = 0.04
 _HARDCODE_MIN_TOP_ASK_NOTIONAL_USDC = 10.0
 _HARDCODE_MIN_ASK_BAND_NOTIONAL_USDC = 25.0
 _HARDCODE_KILL_SWITCH_REF_BACKOFF_SEC = 600.0
+_HARDCODE_REF_UNUSABLE_WARN_CYCLES = 5
+# Tick-driven: cooldown por event_id para no procesar dos ticks consecutivos del mismo partido en <X s.
+_HARDCODE_TICK_DISPATCH_COOLDOWN_SEC = 1.0
+_HARDCODE_TICK_DISPATCH_PARALLELISM = 4
+# REF_DEAD: si llevamos N ciclos sin ticks Betfair (ws_age_last_tick_sec > umbral), escribir SKIP único.
+_HARDCODE_REF_DEAD_NO_TICKS_AGE_SEC = 180.0
+_HARDCODE_REF_DEAD_NO_TICKS_REPEAT_SEC = 300.0
+# Si el WS responde mensajes (heartbeats / no-tick) en este margen, lo consideramos "vivo" aunque no haya ticks.
+_WS_DEAD_LIVE_THRESHOLD_SEC = 60.0
 
 # Gamma /events con ?sport= no filtra de forma fiable; usamos series_id del GET /sports nativo.
 GAMMA_SPORTS_META_TTL_SEC = 3600.0
@@ -949,6 +955,19 @@ def _flatten_ws_odds_best_per_event(client: OddsApiIo) -> list[OddsEvent]:
     return out
 
 
+def _empty_match_counters() -> dict[str, int]:
+    return {
+        "pipeline_entered": 0,
+        "reference_aligned": 0,
+        "csv_rows": 0,
+        "drop_pre_game": 0,
+        "drop_reference_stale": 0,
+        "drop_reference_lag": 0,
+        "drop_alignment_none": 0,
+        "drop_token_map": 0,
+    }
+
+
 def _gamma_slug_prefixes_for_io_sport(io_sport: str) -> tuple[str, ...]:
     sl = _IO_SPORT_ALIASES.get(_io_sport_slug_coerce(io_sport), _io_sport_slug_coerce(io_sport))
     return _IO_SPORT_TO_GAMMA_SLUG_PREFIXES.get(sl, ())
@@ -1255,6 +1274,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "size_usdc",
             "status",
             "latency_ms_ref_to_clob",
+            "latency_ms_tick_to_signal",
             "order_attempted",
             "fill_price",
             "fill_size",
@@ -1272,6 +1292,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "betfair_depth_away",
             "match_score",
             "signal_anchor_ts",
+            "trigger",
         ]
 
     def __init__(self, config: dict[str, Any], dry_run: bool = True) -> None:
@@ -1332,6 +1353,18 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._rest_rr_index = 0
         # condition_id -> (último side YES|NO con SIGNAL, monotonic) para bloquear opuesto en ventana corta.
         self._condition_signal_recent: dict[str, tuple[str, float]] = {}
+        self._ref_unusable_streak = 0
+        # Tick-driven pipeline: queue, dispatcher task y cooldown por event_id.
+        self._betfair_tick_queue: Optional[asyncio.Queue[OddsEvent]] = None
+        self._tick_dispatch_task: Optional[asyncio.Task[None]] = None
+        self._tick_dispatch_last_mono: dict[str, float] = {}
+        self._tick_dispatch_count_total = 0
+        self._tick_dispatch_count_signal = 0
+        self._tick_dispatch_count_low_edge = 0
+        # latencia tick-to-signal: deque rolling de últimas N (ms) para reportar avg.
+        self._tick_to_signal_ms_recent: deque = deque(maxlen=200)
+        # SKIP:REF_DEAD_NO_TICKS: último timestamp escrito (anti-spam).
+        self._ref_dead_last_emit_mono: float = 0.0
 
     def _ensure_csv(self) -> None:
         """Migra cabecera si hay columnas nuevas (base solo fusiona ficticio)."""
@@ -1564,6 +1597,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
         briefing_io_name_match_cache: int = 0,
         ws_odds_bookmaker_slots: int = 0,
         betfair_first_ws_rows: int = 0,
+        ws_rows_usable: int = 0,
+        ws_rows_missing_meta: int = 0,
+        drop_pre_game: int = 0,
+        drop_reference_stale: int = 0,
+        drop_reference_lag: int = 0,
+        drop_alignment_none: int = 0,
+        drop_token_map: int = 0,
+        ref_health_state: str = "REF_OK",
     ) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
@@ -1571,6 +1612,18 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
             path = data_dir() / "logs" / "latency_arb_sports_cycle_metrics.json"
             path.parent.mkdir(parents=True, exist_ok=True)
+            avg_t2s = (
+                round(sum(self._tick_to_signal_ms_recent) / len(self._tick_to_signal_ms_recent), 1)
+                if self._tick_to_signal_ms_recent
+                else None
+            )
+            ws_age_msg = self._odds_client.ws_age_last_msg_sec()
+            ws_age_tick = self._odds_client.ws_age_last_tick_sec()
+            bulk_left = self._odds_client.bulk_backoff_left_sec()
+            meta_left = self._odds_client.meta_backoff_left_sec()
+            quota_used = self._odds_client.rest_quota_used_60min()
+            capture_state = self._odds_client.capture_state()
+            ws_msgs = self._odds_client.ws_msgs_summary()
             payload = {
                 "open_poly_games": int(open_poly_games),
                 # ``reference_matched`` = Poly↔odds alineados con tokens CLOB (no confundir con “intentos de pipeline”).
@@ -1581,10 +1634,33 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "ws_cache_size": int(ws_cache_size),
                 "ws_odds_bookmaker_slots": int(ws_odds_bookmaker_slots),
                 "betfair_first_ws_rows": int(betfair_first_ws_rows),
+                "ws_rows_usable": int(ws_rows_usable),
+                "ws_rows_missing_meta": int(ws_rows_missing_meta),
+                "ws_age_last_msg_sec": (None if ws_age_msg is None else round(float(ws_age_msg), 1)),
+                "ws_age_last_tick_sec": (None if ws_age_tick is None else round(float(ws_age_tick), 1)),
+                "bulk_backoff_left_s": round(float(bulk_left), 1),
+                "meta_backoff_left_s": round(float(meta_left), 1),
+                "rest_quota_used_60min": int(quota_used),
+                "rest_quota_per_hour": 80,
+                "ws_dropped_other_bookie": int(self._odds_client._ws_dropped_other_bookie),
+                "tick_dispatch_total": int(self._tick_dispatch_count_total),
+                "tick_dispatch_signals": int(self._tick_dispatch_count_signal),
+                "tick_dispatch_low_edge": int(self._tick_dispatch_count_low_edge),
+                "avg_latency_tick_to_signal_ms": avg_t2s,
+                "capture_state": str(capture_state),
+                "rest_bootstrapped": bool(self._odds_client.is_bootstrapped()),
+                "ws_msgs_text_total": int(ws_msgs.get("ws_msgs_text_total", 0)),
+                "ws_msgs_by_type": dict(ws_msgs.get("ws_msgs_by_type", {})),
                 "briefing_pre_game_distant": int(briefing_pre_game_distant),
                 "briefing_within_end_window": int(briefing_within_end_window),
                 "briefing_ml_like": int(briefing_ml_like),
                 "briefing_io_name_match_cache": int(briefing_io_name_match_cache),
+                "drop_pre_game": int(drop_pre_game),
+                "drop_reference_stale": int(drop_reference_stale),
+                "drop_reference_lag": int(drop_reference_lag),
+                "drop_alignment_none": int(drop_alignment_none),
+                "drop_token_map": int(drop_token_map),
+                "ref_health_state": str(ref_health_state or "REF_OK"),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1660,9 +1736,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         return cap, cap + pnl_cum
 
     def _reference_feed_degraded(self) -> tuple[bool, float]:
-        """Kill-switch: WS sin datos + REST en backoff prolongado."""
+        """Kill-switch: WS sin datos + REST en backoff prolongado (max global o per-sport)."""
         ws_cache_size = len(self._odds_client._ws_odds_cache)
-        backoff_left_s = float(self._odds_client._rest_backoff_until - time.monotonic())
+        backoff_left_s = float(self._odds_client.bulk_backoff_left_sec())
         degraded = ws_cache_size == 0 and backoff_left_s >= self.ref_backoff_kill_switch_sec
         return degraded, max(0.0, backoff_left_s)
 
@@ -1671,9 +1747,13 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._shutdown.clear()
         self._ws_task = asyncio.create_task(self._ws_runner(), name="latency_arb_sports_ws")
         self._install_io_ws_depth_capture_hook()
+        # Cola de ticks Betfair (tick-driven pipeline). Se inicia con loop activo.
+        self._betfair_tick_queue = asyncio.Queue(maxsize=200)
         if self._odds_client.ws_enabled:
             raw_io_sports = ODDS_API_IO_SPORTS_EMBEDDED
             io_sports = [s.strip() for s in str(raw_io_sports).split(",") if s.strip()]
+            # Registrar callback ANTES de start_ws_stream para no perder los primeros ticks.
+            self._odds_client.set_betfair_tick_callback(self._on_betfair_tick)
             self._odds_client.start_ws_stream(sports=io_sports)
         try:
             async with PolyCLOBClient(
@@ -1681,6 +1761,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 private_key=os.getenv("POLY_PRIVATE_KEY", ""),
                 dry_run=self.dry_run,
             ) as clob:
+                # Dispatcher reactivo: cada tick Betfair busca match Poly y procesa SIGNAL/SKIP.
+                self._tick_dispatch_task = asyncio.create_task(
+                    self._betfair_tick_dispatcher(clob), name="latency_arb_sports_tick_dispatcher"
+                )
                 while True:
                     try:
                         enabled = await state_manager.is_enabled(self.slug)
@@ -1739,7 +1823,15 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     await asyncio.sleep(interval)
         finally:
             self._shutdown.set()
+            self._odds_client.set_betfair_tick_callback(None)
             await self._odds_client.stop_ws_stream()
+            if self._tick_dispatch_task:
+                self._tick_dispatch_task.cancel()
+                try:
+                    await self._tick_dispatch_task
+                except asyncio.CancelledError:
+                    pass
+                self._tick_dispatch_task = None
             if self._ws_task:
                 self._ws_task.cancel()
                 try:
@@ -1747,6 +1839,93 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 except asyncio.CancelledError:
                     pass
                 self._ws_task = None
+
+    async def _on_betfair_tick(self, ev: OddsEvent) -> None:
+        """
+        Callback invocado por OddsApiIo cuando llega un tick Betfair válido (con metadata mínima).
+        Enqueue con cooldown por event_id; el dispatcher procesa fuera del WS receive loop.
+        """
+        if self._betfair_tick_queue is None:
+            return
+        eid = (ev.event_id or "").strip()
+        if not eid:
+            return
+        if (ev.bookie or "").strip().casefold() != "betfair exchange":
+            return
+        if not (ev.home or "").strip() or not (ev.away or "").strip() or not (ev.sport or "").strip():
+            return
+        now_mono = time.monotonic()
+        last = self._tick_dispatch_last_mono.get(eid, 0.0)
+        if (now_mono - last) < float(_HARDCODE_TICK_DISPATCH_COOLDOWN_SEC):
+            return
+        self._tick_dispatch_last_mono[eid] = now_mono
+        try:
+            self._betfair_tick_queue.put_nowait(ev)
+        except asyncio.QueueFull:
+            log.debug("[latency_arb_sports] tick queue full; drop event_id=%s", eid)
+
+    async def _betfair_tick_dispatcher(self, clob: PolyCLOBClient) -> None:
+        """Consume cola de ticks Betfair y dispara BF-first match en paralelo (sem)."""
+        sem = asyncio.Semaphore(int(_HARDCODE_TICK_DISPATCH_PARALLELISM))
+        in_flight: set[asyncio.Task[None]] = set()
+        async with aiohttp.ClientSession(
+            headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
+        ) as sess:
+            while not self._shutdown.is_set():
+                if self._betfair_tick_queue is None:
+                    await asyncio.sleep(0.5)
+                    continue
+                try:
+                    ev = await asyncio.wait_for(self._betfair_tick_queue.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    in_flight = {t for t in in_flight if not t.done()}
+                    continue
+                tick_received_mono = time.monotonic()
+                t = asyncio.create_task(
+                    self._dispatch_tick_one(sem, sess, clob, ev, tick_received_mono),
+                    name=f"bf_tick_{ev.event_id}",
+                )
+                in_flight.add(t)
+                in_flight = {x for x in in_flight if not x.done()}
+
+    async def _dispatch_tick_one(
+        self,
+        sem: asyncio.Semaphore,
+        sess: aiohttp.ClientSession,
+        clob: PolyCLOBClient,
+        ev: OddsEvent,
+        tick_received_mono: float,
+    ) -> None:
+        try:
+            async with sem:
+                # Si la estrategia está deshabilitada, descartar.
+                try:
+                    enabled = await self._state_manager.is_enabled(self.slug) if self._state_manager else True
+                except Exception:
+                    enabled = True
+                if not enabled:
+                    return
+                self._tick_dispatch_count_total += 1
+                game = await self._resolve_open_game_betfair_public_search(sess, ev)
+                if game is None:
+                    return
+                cid = (game.condition_id or "").strip()
+                if not cid:
+                    return
+                odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug)
+                if odds_key is None:
+                    return
+                st = await self._process_matched_poly_odds(
+                    sess, clob, game, odds_key, ev, tick_received_mono=tick_received_mono, trigger="tick"
+                )
+                if int(st.get("emitted_signal", 0)):
+                    self._tick_dispatch_count_signal += 1
+                if int(st.get("emitted_low_edge", 0)):
+                    self._tick_dispatch_count_low_edge += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("[latency_arb_sports] dispatch_tick_one event_id=%s err=%s", ev.event_id, e)
 
     async def _ws_runner(self) -> None:
         while not self._shutdown.is_set():
@@ -2031,18 +2210,6 @@ class LatencyArbSportsStrategy(ArbStrategy):
             )
             return
 
-        clear_p = _odds_event_meta_cache_clear_flag_path()
-        if clear_p.is_file():
-            try:
-                self._odds_client._event_meta_cache.clear()
-                self._odds_client._event_meta_negative.clear()
-                log.info("[latency_arb_sports] odds_event_meta_cache en memoria vaciada (admin clear-meta-cache)")
-            finally:
-                try:
-                    clear_p.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
         async with aiohttp.ClientSession(
             headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
         ) as sess:
@@ -2065,9 +2232,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
             odds_events_by_key: dict[str, list[OddsEvent]] = {}
             keys_order: list[str] = []
-            pipeline_entered = 0
-            reference_aligned = 0
-            csv_rows = 0
+            cycle_counters = _empty_match_counters()
             for g in open_games:
                 ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
                 if ok and ok not in keys_order:
@@ -2111,6 +2276,58 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 pk = _client_poly_key_for_odds_io(ok, g.sport_slug)
                 odds_events_by_key[ok] = self._odds_client.get_cached_odds(pk)
             odds_keys_loaded = {k for k, evs in odds_events_by_key.items() if evs}
+            ws_health = self._odds_client.ws_health_counts()
+            if len(self._odds_client._ws_odds_cache) > 0 and len(odds_keys_loaded) == 0:
+                self._ref_unusable_streak += 1
+            else:
+                self._ref_unusable_streak = 0
+            ref_health_state = "REF_OK"
+            ws_age_tick = self._odds_client.ws_age_last_tick_sec()
+            ws_age_msg = self._odds_client.ws_age_last_msg_sec()
+            if ws_age_tick is not None and ws_age_tick > float(_HARDCODE_REF_DEAD_NO_TICKS_AGE_SEC):
+                # WS vivo (msg recientes) o muerto: en cualquier caso, sin ticks Betfair = sin oportunidad.
+                ref_health_state = (
+                    "REF_DEAD_NO_TICKS_WS_LIVE"
+                    if (ws_age_msg is not None and ws_age_msg <= float(_WS_DEAD_LIVE_THRESHOLD_SEC))
+                    else "REF_DEAD_NO_TICKS_WS_DEAD"
+                )
+                # Una sola fila CSV cada N segundos para no spamear.
+                now_mono = time.monotonic()
+                if (now_mono - self._ref_dead_last_emit_mono) >= float(_HARDCODE_REF_DEAD_NO_TICKS_REPEAT_SEC):
+                    self._ref_dead_last_emit_mono = now_mono
+                    await self.log_signal_async(
+                        {
+                            "action": "SKIP:REF_DEAD_NO_TICKS",
+                            "reason": (
+                                f"ws_age_last_tick_sec={ws_age_tick:.0f}>th={_HARDCODE_REF_DEAD_NO_TICKS_AGE_SEC:.0f}"
+                                f"_ws_age_last_msg_sec="
+                                f"{(ws_age_msg if ws_age_msg is not None else -1):.0f}"
+                                f"_state={ref_health_state}"
+                            ),
+                            "game_slug": "",
+                            "league": "",
+                            "home_team": "",
+                            "away_team": "",
+                            "side": "",
+                            "token_id": "",
+                            "price_poly": "",
+                            "prob_pinnacle": "",
+                            "edge": "",
+                            "size_usdc": "0",
+                            "status": "SKIP",
+                            "trigger": "poll",
+                        }
+                    )
+            elif self._ref_unusable_streak >= int(_HARDCODE_REF_UNUSABLE_WARN_CYCLES):
+                ref_health_state = "REF_UNUSABLE_WS_META_MISSING"
+                if self._ref_unusable_streak == int(_HARDCODE_REF_UNUSABLE_WARN_CYCLES):
+                    log.warning(
+                        "[latency_arb_sports] %s: ws_event_ids=%s odds_io_keys=%s ws_rows_missing_meta=%s",
+                        ref_health_state,
+                        len(self._odds_client._ws_odds_cache),
+                        len(odds_keys_loaded),
+                        ws_health.get("ws_rows_missing_meta", 0),
+                    )
             briefing_counts = _compute_briefing_cycle_counts(open_games, odds_events_by_key)
             manual_map = load_manual_matches()
             self._write_pending_matches_json(open_games, odds_events_by_key, manual_map)
@@ -2118,36 +2335,42 @@ class LatencyArbSportsStrategy(ArbStrategy):
             match_sem = asyncio.Semaphore(int(_HARDCODE_MATCH_PARALLELISM))
             processed_lock = asyncio.Lock()
 
-            async def _process_bf_row(odds_ev: OddsEvent) -> tuple[int, int, int]:
-                """(pipeline_entered, reference_aligned, csv_rows) por partido."""
+            def _acc_cycle(src: dict[str, int]) -> None:
+                for k in cycle_counters:
+                    cycle_counters[k] += int(src.get(k, 0))
+
+            async def _process_bf_row(odds_ev: OddsEvent) -> dict[str, int]:
+                """Contadores por partido (BF-first)."""
                 async with match_sem:
                     game_bf = await self._resolve_open_game_betfair_public_search(sess, odds_ev)
                     if game_bf is None:
-                        return (0, 0, 0)
+                        return _empty_match_counters()
                     cid_bf = (game_bf.condition_id or "").strip()
                     odds_key_bf = POLY_SLUG_TO_ODDS_KEY.get(game_bf.sport_slug)
                     if odds_key_bf is None:
-                        return (0, 0, 0)
+                        return _empty_match_counters()
                     async with processed_lock:
                         if not cid_bf or cid_bf in processed_condition_ids:
-                            return (0, 0, 0)
+                            return _empty_match_counters()
                         processed_condition_ids.add(cid_bf)
                     st_bf = await self._process_matched_poly_odds(sess, clob, game_bf, odds_key_bf, odds_ev)
-                    return (
-                        1,
-                        int(st_bf.get("reference_aligned", 0)),
-                        int(st_bf.get("csv_rows", 0)),
-                    )
+                    out = _empty_match_counters()
+                    out["pipeline_entered"] = 1
+                    for k in out:
+                        if k == "pipeline_entered":
+                            continue
+                        out[k] = int(st_bf.get(k, 0))
+                    return out
 
-            async def _process_og_row(game: OpenPolymarketGame) -> tuple[int, int, int]:
+            async def _process_og_row(game: OpenPolymarketGame) -> dict[str, int]:
                 async with match_sem:
                     cid_g = (game.condition_id or "").strip()
                     async with processed_lock:
                         if cid_g and cid_g in processed_condition_ids:
-                            return (0, 0, 0)
+                            return _empty_match_counters()
                     odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug)
                     if odds_key is None:
-                        return (0, 0, 0)
+                        return _empty_match_counters()
                     events_list = odds_events_by_key.get(odds_key) or []
                     odds_ev = find_event_matching_teams(events_list, game.home, game.away)
                     manual_tw: Optional[tuple[str, float, str, float]] = None
@@ -2163,20 +2386,22 @@ class LatencyArbSportsStrategy(ArbStrategy):
                                         manual_tw = _manual_tw_from_odds_event(ev, swap)
                                         break
                     if odds_ev is None:
-                        return (0, 0, 0)
+                        return _empty_match_counters()
                     async with processed_lock:
                         if cid_g and cid_g in processed_condition_ids:
-                            return (0, 0, 0)
+                            return _empty_match_counters()
                         if cid_g:
                             processed_condition_ids.add(cid_g)
                     st = await self._process_matched_poly_odds(
                         sess, clob, game, odds_key, odds_ev, manual_tw=manual_tw
                     )
-                    return (
-                        1,
-                        int(st.get("reference_aligned", 0)),
-                        int(st.get("csv_rows", 0)),
-                    )
+                    out = _empty_match_counters()
+                    out["pipeline_entered"] = 1
+                    for k in out:
+                        if k == "pipeline_entered":
+                            continue
+                        out[k] = int(st.get(k, 0))
+                    return out
 
             bf_events_list: list[OddsEvent] = []
             if self._odds_client.ws_enabled:
@@ -2190,10 +2415,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         if isinstance(r, Exception):
                             log.warning("[latency_arb_sports] betfair-first row error: %s", r)
                             continue
-                        ent_i, ali_i, csv_i = r
-                        pipeline_entered += ent_i
-                        reference_aligned += ali_i
-                        csv_rows += csv_i
+                        _acc_cycle(r)
 
             if open_games:
                 og_results = await asyncio.gather(
@@ -2204,10 +2426,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     if isinstance(r, Exception):
                         log.warning("[latency_arb_sports] open_games row error: %s", r)
                         continue
-                    ent_i, ali_i, csv_i = r
-                    pipeline_entered += ent_i
-                    reference_aligned += ali_i
-                    csv_rows += csv_i
+                    _acc_cycle(r)
 
             if (
                 not self._ref_debug_done
@@ -2235,38 +2454,65 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "[latency_arb_sports] cycle #%s regions=%s min_edge_exec=%.4f max_stake=%.2f "
                 "open_poly_games=%s odds_io_keys=%s pipeline_entered=%s reference_aligned=%s csv_rows=%s "
                 "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_event_ids=%s ws_bk_slots=%s "
+                "ws_rows_usable=%s ws_rows_missing_meta=%s "
+                "ws_age_msg=%s ws_age_tick=%s bulk_backoff=%.0fs meta_backoff=%.0fs rest_quota_used_60min=%s "
+                "tick_dispatch=%s/%s_signal "
                 "bf_first_ws_rows=%s (pipeline cuenta BF+OG antes de stale/CLOB; ver reference_aligned) "
-                "public_search_http=%s public_search_cache_hits=%s",
+                "drop_pre_game=%s drop_stale=%s drop_lag=%s drop_align=%s drop_token=%s "
+                "ref_health=%s public_search_http=%s public_search_cache_hits=%s",
                 seq,
                 self.regions,
                 self.min_edge_exec,
                 self.max_stake,
                 len(open_games),
                 len(odds_keys_loaded),
-                pipeline_entered,
-                reference_aligned,
-                csv_rows,
+                cycle_counters["pipeline_entered"],
+                cycle_counters["reference_aligned"],
+                cycle_counters["csv_rows"],
                 self._discovery_fetch_ttl_sec(),
                 self._is_in_active_window(open_games),
                 self.dry_run,
                 len(self._odds_client._ws_odds_cache),
                 ws_slots,
+                ws_health.get("ws_rows_usable", 0),
+                ws_health.get("ws_rows_missing_meta", 0),
+                _fmt_opt_float(self._odds_client.ws_age_last_msg_sec(), nd=1),
+                _fmt_opt_float(self._odds_client.ws_age_last_tick_sec(), nd=1),
+                self._odds_client.bulk_backoff_left_sec(),
+                self._odds_client.meta_backoff_left_sec(),
+                self._odds_client.rest_quota_used_60min(),
+                self._tick_dispatch_count_total,
+                self._tick_dispatch_count_signal,
                 len(bf_events_list),
+                cycle_counters["drop_pre_game"],
+                cycle_counters["drop_reference_stale"],
+                cycle_counters["drop_reference_lag"],
+                cycle_counters["drop_alignment_none"],
+                cycle_counters["drop_token_map"],
+                ref_health_state,
                 self._cycle_public_search_http,
                 self._cycle_public_search_cache_hits,
             )
             self._write_cycle_metrics_json(
                 len(open_games),
-                reference_aligned,
-                csv_rows,
+                cycle_counters["reference_aligned"],
+                cycle_counters["csv_rows"],
                 len(self._odds_client._ws_odds_cache),
-                pipeline_entered,
+                cycle_counters["pipeline_entered"],
                 briefing_pre_game_distant=briefing_counts["briefing_pre_game_distant"],
                 briefing_within_end_window=briefing_counts["briefing_within_end_window"],
                 briefing_ml_like=briefing_counts["briefing_ml_like"],
                 briefing_io_name_match_cache=briefing_counts["briefing_io_name_match_cache"],
                 ws_odds_bookmaker_slots=ws_slots,
                 betfair_first_ws_rows=len(bf_events_list),
+                ws_rows_usable=ws_health.get("ws_rows_usable", 0),
+                ws_rows_missing_meta=ws_health.get("ws_rows_missing_meta", 0),
+                drop_pre_game=cycle_counters["drop_pre_game"],
+                drop_reference_stale=cycle_counters["drop_reference_stale"],
+                drop_reference_lag=cycle_counters["drop_reference_lag"],
+                drop_alignment_none=cycle_counters["drop_alignment_none"],
+                drop_token_map=cycle_counters["drop_token_map"],
+                ref_health_state=ref_health_state,
             )
             await self._drain_poly_followups(clob)
 
@@ -2283,10 +2529,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
         edge_exec: Optional[float] = None,
         spread: Optional[float] = None,
         latency_ms_ref_to_clob: Optional[float] = None,
+        latency_ms_tick_to_signal: Optional[float] = None,
         order_attempted: bool = False,
         fill_price: Optional[float] = None,
         fill_size: Optional[float] = None,
         fee_est: Optional[float] = None,
+        trigger: str = "poll",
     ) -> dict[str, str]:
         clob_t = await self._clob_trace_for_token(clob, token_id, float(mid))
         dh, da = self._betfair_depth_for_event(odds_event)
@@ -2297,6 +2545,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "edge_exec": _fmt_opt_float(edge_exec),
             "spread": _fmt_opt_float(spread),
             "latency_ms_ref_to_clob": _fmt_opt_float(latency_ms_ref_to_clob, nd=1),
+            "latency_ms_tick_to_signal": _fmt_opt_float(latency_ms_tick_to_signal, nd=1),
             "order_attempted": "true" if order_attempted else "false",
             "fill_price": _fmt_opt_float(fill_price),
             "fill_size": _fmt_opt_float(fill_size, nd=4),
@@ -2310,6 +2559,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "betfair_depth_away": da,
             "match_score": match_score_s,
             "signal_anchor_ts": anchor_iso,
+            "trigger": str(trigger or "poll"),
         }
 
     def _followup_snap(
@@ -2358,16 +2608,103 @@ class LatencyArbSportsStrategy(ArbStrategy):
         odds_event: OddsEvent,
         *,
         manual_tw: Optional[tuple[str, float, str, float]] = None,
+        tick_received_mono: Optional[float] = None,
+        trigger: str = "poll",
     ) -> dict[str, int]:
-        acc: dict[str, int] = {"csv_rows": 0, "reference_aligned": 0}
+        acc: dict[str, int] = _empty_match_counters()
+        acc["emitted_signal"] = 0
+        acc["emitted_low_edge"] = 0
+
+        def _ms_tick_to_now() -> Optional[float]:
+            if tick_received_mono is None:
+                return None
+            return max(0.0, (time.monotonic() - float(tick_received_mono)) * 1000.0)
+
+        ref_age_s_early = _odds_io_updated_age_sec(odds_event)
+
+        async def _emit_drop_skip_row_if_tick(reason_action: str, reason_text: str) -> None:
+            """En camino tick-driven, emite una fila CSV con motivo concreto del descarte temprano."""
+            if trigger != "tick":
+                return
+            try:
+                _mset_e, mscr_e = self._ws_snapshot_match_fields(game)
+                row = {
+                    "action": reason_action,
+                    "reason": reason_text,
+                    "signal_id": str(uuid.uuid4()),
+                    "game_slug": game.slug or game.condition_id[:16],
+                    "league": game.sport_slug,
+                    "home_team": (odds_event.home or game.home or "").strip(),
+                    "away_team": (odds_event.away or game.away or "").strip(),
+                    "side": "",
+                    "token_id": "",
+                    "price_poly": "",
+                    "prob_pinnacle": "",
+                    "edge_mid": "",
+                    "edge_exec": "",
+                    "edge": "",
+                    "spread": "",
+                    "size_usdc": "0",
+                    "status": "SKIP",
+                    "latency_ms_ref_to_clob": _fmt_opt_float(
+                        ref_age_s_early * 1000.0 if ref_age_s_early is not None else None, nd=1
+                    ),
+                    "latency_ms_tick_to_signal": _fmt_opt_float(_ms_tick_to_now(), nd=1),
+                    "order_attempted": "false",
+                    "fill_price": "",
+                    "fill_size": "",
+                    "fee_est": "",
+                    "odds_io_updated_at": str(odds_event.updated_at or ""),
+                    "clob_best_bid": "",
+                    "clob_best_bid_size": "",
+                    "clob_best_ask": "",
+                    "clob_best_ask_size": "",
+                    "clob_liquidity_at_price": "",
+                    "poly_price_30s": "",
+                    "poly_price_60s": "",
+                    "poly_price_120s": "",
+                    "betfair_depth_home": "",
+                    "betfair_depth_away": "",
+                    "match_score": mscr_e,
+                    "signal_anchor_ts": datetime.now(timezone.utc).isoformat(),
+                    "trigger": "tick",
+                }
+                await self.log_signal_async(row)
+                acc["csv_rows"] += 1
+            except Exception as e:
+                log.debug("[latency_arb_sports] _emit_drop_skip_row_if_tick err: %s", e)
+
         if _is_pre_game_listing_game(game):
+            acc["drop_pre_game"] = 1
+            await _emit_drop_skip_row_if_tick("SKIP:PRE_GAME_DISTANT", "endDate>48h_pre_game_listing")
             return acc
-        if _is_reference_lag_over_limit(odds_event) or _is_reference_stale_for_io(odds_event):
+        if _is_reference_stale_for_io(odds_event):
+            acc["drop_reference_stale"] = 1
+            await _emit_drop_skip_row_if_tick(
+                "SKIP:STALE",
+                f"odds_io_age_s={ref_age_s_early:.1f}>stale={_HARDCODE_STALE_ODDS_IO_SEC:.0f}"
+                if ref_age_s_early is not None
+                else "odds_io_age_unknown",
+            )
+            return acc
+        if _is_reference_lag_over_limit(odds_event):
+            acc["drop_reference_lag"] = 1
+            await _emit_drop_skip_row_if_tick(
+                "SKIP:LAG",
+                f"odds_io_age_s={ref_age_s_early:.1f}>max_lag={_HARDCODE_MAX_REFERENCE_LAG_SEC:.0f}"
+                if ref_age_s_early is not None
+                else "odds_io_age_unknown",
+            )
             return acc
         tw: Optional[tuple[str, float, str, float]] = manual_tw
         if tw is None:
             tw = _align_odds_io_to_game(odds_event, game)
         if tw is None:
+            acc["drop_alignment_none"] = 1
+            await _emit_drop_skip_row_if_tick(
+                "SKIP:ALIGN_NONE",
+                f"poly_home={game.home!r}_poly_away={game.away!r}_io_home={odds_event.home!r}_io_away={odds_event.away!r}",
+            )
             return acc
         odds_home, dec_h, odds_away, dec_a = tw
         ddraw = odds_event.draw_odds if odds_event.draw_odds and odds_event.draw_odds > 0 else None
@@ -2375,8 +2712,18 @@ class LatencyArbSportsStrategy(ArbStrategy):
         g = _open_game_to_gamma_row(game, odds_sport_key)
         tok_h, tok_a = _map_outcomes_to_tokens(g, odds_home, odds_away)
         if not tok_h or not tok_a:
+            acc["drop_token_map"] = 1
+            await _emit_drop_skip_row_if_tick(
+                "SKIP:TOKEN_MAP",
+                f"could_not_map_io_home={odds_home!r}_io_away={odds_away!r}_to_outcome_tokens",
+            )
             return acc
         acc["reference_aligned"] = 1
+        # Sólo permitimos SIGNAL si la cuota Betfair llegó hace <=TICK_FRESH_FOR_SIGNAL_SEC.
+        # 20-120s: SKIP:LOW_EDGE permitido (instructivo) pero nunca SIGNAL.
+        tick_fresh_for_signal = (
+            ref_age_s_early is not None and ref_age_s_early <= float(_HARDCODE_TICK_FRESH_FOR_SIGNAL_SEC)
+        )
         _mset_snap, mscr_live = self._ws_snapshot_match_fields(game)
 
         async def _resolve_mid(tid: str) -> Optional[float]:
@@ -2432,6 +2779,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
         ref_age_s = _odds_io_updated_age_sec(odds_event)
         latency_ms_ref_to_clob = ref_age_s * 1000.0 if ref_age_s is not None else None
+        latency_ms_tick_to_signal = _ms_tick_to_now()
         legs: list[dict[str, Any]] = []
         for side_label, token_id, p_fair in (("YES", tok_h, p_h_fair), ("NO", tok_a, p_a_fair)):
             mid_i: Optional[float] = mid_h_val if token_id == tok_h else mid_a_val
@@ -2494,6 +2842,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 edge_mid=None,
                 spread=None,
                 latency_ms_ref_to_clob=latency_ms_ref_to_clob,
+                latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                trigger=trigger,
             )
             await self.log_signal_async(
                 {
@@ -2577,6 +2927,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     edge_exec=edge_exec,
                     spread=spread,
                     latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
                 )
                 await self.log_signal_async(
                     {
@@ -2635,6 +2987,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     edge_mid=edge_mid,
                     spread=spread,
                     latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
                 )
                 await self.log_signal_async(
                     {
@@ -2691,6 +3045,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     edge_exec=edge_exec,
                     spread=spread,
                     latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
                 )
                 await self.log_signal_async(
                     {
@@ -2750,6 +3106,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     edge_exec=edge_exec,
                     spread=spread,
                     latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
                 )
                 await self.log_signal_async(
                     {
@@ -2809,6 +3167,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     edge_exec=edge_exec,
                     spread=spread,
                     latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
                 )
                 await self.log_signal_async(
                     {
@@ -2846,6 +3206,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     edge_exec=edge_exec,
                     spread=spread,
                     latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
                 )
                 await self.log_signal_async(
                     {
@@ -2886,6 +3248,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     edge_exec=edge_exec,
                     spread=spread,
                     latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
                 )
                 await self.log_signal_async(
                     {
@@ -2939,6 +3303,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                             edge_exec=edge_exec,
                             spread=spread,
                             latency_ms_ref_to_clob=latency_ms_ref,
+                            latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                            trigger=trigger,
                         )
                         await self.log_signal_async(
                             {
@@ -2986,6 +3352,52 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     )
                     continue
 
+            # Gate de tick-fresh: aunque haya edge, no emitimos SIGNAL si la cuota Betfair ya está vieja
+            # (>TICK_FRESH_FOR_SIGNAL_SEC). Para entonces Polymarket suele haber convergido y el edge no es real.
+            if not tick_fresh_for_signal:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
+                )
+                age_s_for_log = float(ref_age_s) if ref_age_s is not None else -1.0
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:STALE_FOR_SIGNAL",
+                        "reason": (
+                            f"edge_exec={edge_exec:.4f}>=min_edge_exec={self.min_edge_exec:.4f}"
+                            f"_but_tick_age_s={age_s_for_log:.1f}>tick_fresh={_HARDCODE_TICK_FRESH_FOR_SIGNAL_SEC:.0f}"
+                        ),
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": f"{edge_exec:.6f}",
+                        "edge": f"{edge_exec:.6f}",
+                        "spread": _fmt_opt_float(spread),
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex,
+                    }
+                )
+                acc["csv_rows"] += 1
+                acc["emitted_low_edge"] += 1
+                continue
+
             buy_side = "BUY"
             size = float(self.max_stake)
             status = "SIGNAL"
@@ -3028,6 +3440,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 edge_exec=edge_exec,
                 spread=spread,
                 latency_ms_ref_to_clob=latency_ms_ref,
+                latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                trigger=trigger,
                 order_attempted=order_attempted,
                 fill_price=fill_price,
                 fill_size=fill_size,
@@ -3086,4 +3500,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         if v[1] >= cutoff
                     }
             acc["csv_rows"] += 1
+            acc["emitted_signal"] += 1
+            if latency_ms_tick_to_signal is not None:
+                self._tick_to_signal_ms_recent.append(float(latency_ms_tick_to_signal))
+            log.info(
+                "[latency_arb_sports] SIGNAL_EMITTED game='%s vs %s' side=%s edge_exec=%.4f edge_mid=%.4f "
+                "ref_age_s=%s latency_ms_tick_to_signal=%s trigger=%s",
+                game.home,
+                game.away,
+                side_label,
+                float(edge_exec),
+                float(edge_mid),
+                _fmt_opt_float(ref_age_s, nd=2),
+                _fmt_opt_float(latency_ms_tick_to_signal, nd=1),
+                trigger,
+            )
         return acc

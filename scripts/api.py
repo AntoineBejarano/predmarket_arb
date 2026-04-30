@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
@@ -80,9 +81,6 @@ LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snaps
 LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
 LATENCY_SPORTS_SCHEDULE_JSON = DATA_DIR / "logs" / "latency_sports_schedule.json"
 LATENCY_SPORTS_PENDING_JSON = DATA_DIR / "logs" / "latency_arb_sports_pending_matches.json"
-ODDS_EVENT_META_CACHE_JSON = DATA_DIR / "logs" / "odds_event_meta_cache.json"
-# Sentinel: latency_arb_sports vacía `_event_meta_cache` del OddsApiIo al ver este archivo.
-ODDS_EVENT_META_CACHE_CLEAR_FLAG = DATA_DIR / "logs" / ".odds_event_meta_cache_clear_requested"
 
 
 def _read_latency_sports_cycle_metrics() -> dict[str, Any]:
@@ -537,6 +535,126 @@ async def api_latency_sports_pending_matches() -> JSONResponse:
     )
 
 
+@app.get("/api/arb/latency_sports/edge-history")
+async def api_latency_sports_edge_history(hours: int = Query(24, ge=1, le=168)) -> JSONResponse:
+    """
+    Resumen de últimas N horas leyendo ``latency_arb_sports.csv``:
+    señales emitidas vs descartes (LOW_EDGE / STALE / etc.) + buckets por hora UTC para gráficas.
+    Pensado para el panel "Edges detectados" del dashboard latency_arb_sports.
+    """
+    csv_path = ARB_CSV_PATHS.get("latency_arb_sports")
+    if csv_path is None or not csv_path.is_file():
+        return JSONResponse(content={
+            "available": False,
+            "hours": int(hours),
+            "signals": 0,
+            "skip_low_edge": 0,
+            "skip_stale_for_signal": 0,
+            "skip_ref_dead": 0,
+            "skip_total": 0,
+            "errors": 0,
+            "best_edge": None,
+            "avg_edge_signal": None,
+            "avg_latency_tick_to_signal_ms": None,
+            "buckets": [],
+            "recent_signals": [],
+        })
+    rows = _read_arb_csv_tail(csv_path, n=15000)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=int(hours))
+    bucket_counts: dict[str, dict[str, int]] = {}
+    sig_count = skip_low = skip_stale = skip_ref_dead = err_count = skip_total = 0
+    edges_signal: list[float] = []
+    lat_tick: list[float] = []
+    best_edge: Optional[float] = None
+    recent_signals: list[dict[str, Any]] = []
+    for r in rows:
+        ts_raw = str(r.get("ts") or "").strip()
+        if not ts_raw:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        action = str(r.get("action") or "").strip().upper()
+        bk_key = ts.strftime("%Y-%m-%dT%H:00:00Z")
+        bk = bucket_counts.setdefault(bk_key, {"signal": 0, "skip_low_edge": 0, "skip_other": 0, "error": 0})
+        if action == "SIGNAL":
+            sig_count += 1
+            bk["signal"] += 1
+            try:
+                e = float(r.get("edge") or r.get("edge_exec") or 0.0)
+                edges_signal.append(e)
+                if best_edge is None or e > best_edge:
+                    best_edge = e
+            except (TypeError, ValueError):
+                pass
+            try:
+                lat = float(r.get("latency_ms_tick_to_signal") or 0.0)
+                if lat > 0:
+                    lat_tick.append(lat)
+            except (TypeError, ValueError):
+                pass
+            if len(recent_signals) < 25:
+                recent_signals.append(
+                    {
+                        "ts": ts_raw,
+                        "side": r.get("side"),
+                        "home_team": r.get("home_team"),
+                        "away_team": r.get("away_team"),
+                        "league": r.get("league"),
+                        "edge": r.get("edge"),
+                        "edge_exec": r.get("edge_exec"),
+                        "edge_mid": r.get("edge_mid"),
+                        "price_poly": r.get("price_poly"),
+                        "prob_pinnacle": r.get("prob_pinnacle"),
+                        "latency_ms_tick_to_signal": r.get("latency_ms_tick_to_signal"),
+                        "trigger": r.get("trigger"),
+                    }
+                )
+        elif action == "SKIP:LOW_EDGE":
+            skip_low += 1
+            skip_total += 1
+            bk["skip_low_edge"] += 1
+        elif action == "SKIP:STALE_FOR_SIGNAL":
+            skip_stale += 1
+            skip_total += 1
+            bk["skip_other"] += 1
+        elif action == "SKIP:REF_DEAD_NO_TICKS":
+            skip_ref_dead += 1
+            skip_total += 1
+            bk["skip_other"] += 1
+        elif action.startswith("SKIP"):
+            skip_total += 1
+            bk["skip_other"] += 1
+        elif action.startswith("ERROR"):
+            err_count += 1
+            bk["error"] += 1
+    buckets_sorted = [
+        {"hour_utc": k, **bucket_counts[k]} for k in sorted(bucket_counts.keys())
+    ]
+    avg_edge = round(sum(edges_signal) / len(edges_signal), 6) if edges_signal else None
+    avg_lat = round(sum(lat_tick) / len(lat_tick), 1) if lat_tick else None
+    return JSONResponse(content={
+        "available": True,
+        "hours": int(hours),
+        "signals": sig_count,
+        "skip_low_edge": skip_low,
+        "skip_stale_for_signal": skip_stale,
+        "skip_ref_dead": skip_ref_dead,
+        "skip_total": skip_total,
+        "errors": err_count,
+        "best_edge": best_edge,
+        "avg_edge_signal": avg_edge,
+        "avg_latency_tick_to_signal_ms": avg_lat,
+        "buckets": buckets_sorted,
+        "recent_signals": recent_signals,
+    })
+
+
 class LatencySportsManualMatchIn(BaseModel):
     condition_id: str = Field(..., min_length=1)
     odds_event_id: str = Field(..., min_length=1)
@@ -951,7 +1069,6 @@ def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
             LATENCY_SPORTS_SCHEDULE_JSON,
             LATENCY_SPORTS_PENDING_JSON,
             DATA_DIR / "logs" / "latency_sports_manual_matches.json",
-            ODDS_EVENT_META_CACHE_JSON,
         ]
     )
     if include_validator:
@@ -1000,11 +1117,34 @@ async def arb_status() -> JSONResponse:
                 row["ws_cache_size"] = m.get("ws_cache_size")
                 row["ws_odds_bookmaker_slots"] = m.get("ws_odds_bookmaker_slots")
                 row["betfair_first_ws_rows"] = m.get("betfair_first_ws_rows")
+                row["ws_rows_usable"] = m.get("ws_rows_usable")
+                row["ws_rows_missing_meta"] = m.get("ws_rows_missing_meta")
+                row["ws_age_last_msg_sec"] = m.get("ws_age_last_msg_sec")
+                row["ws_age_last_tick_sec"] = m.get("ws_age_last_tick_sec")
+                row["bulk_backoff_left_s"] = m.get("bulk_backoff_left_s")
+                row["meta_backoff_left_s"] = m.get("meta_backoff_left_s")
+                row["rest_quota_used_60min"] = m.get("rest_quota_used_60min")
+                row["rest_quota_per_hour"] = m.get("rest_quota_per_hour")
+                row["ws_dropped_other_bookie"] = m.get("ws_dropped_other_bookie")
+                row["tick_dispatch_total"] = m.get("tick_dispatch_total")
+                row["tick_dispatch_signals"] = m.get("tick_dispatch_signals")
+                row["tick_dispatch_low_edge"] = m.get("tick_dispatch_low_edge")
+                row["avg_latency_tick_to_signal_ms"] = m.get("avg_latency_tick_to_signal_ms")
+                row["capture_state"] = m.get("capture_state")
+                row["rest_bootstrapped"] = m.get("rest_bootstrapped")
+                row["ws_msgs_text_total"] = m.get("ws_msgs_text_total")
+                row["ws_msgs_by_type"] = m.get("ws_msgs_by_type")
                 row["cycle_metrics_updated_at"] = m.get("updated_at")
                 row["briefing_pre_game_distant"] = m.get("briefing_pre_game_distant")
                 row["briefing_within_end_window"] = m.get("briefing_within_end_window")
                 row["briefing_ml_like"] = m.get("briefing_ml_like")
                 row["briefing_io_name_match_cache"] = m.get("briefing_io_name_match_cache")
+                row["drop_pre_game"] = m.get("drop_pre_game")
+                row["drop_reference_stale"] = m.get("drop_reference_stale")
+                row["drop_reference_lag"] = m.get("drop_reference_lag")
+                row["drop_alignment_none"] = m.get("drop_alignment_none")
+                row["drop_token_map"] = m.get("drop_token_map")
+                row["ref_health_state"] = m.get("ref_health_state")
         strategies.append(row)
     running = False
     with _arb_lock:
@@ -1023,39 +1163,6 @@ async def arb_status() -> JSONResponse:
         content=payload,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
     )
-
-
-@app.post("/api/admin/clear-meta-cache")
-async def admin_clear_meta_cache() -> dict[str, Any]:
-    """Borra caché meta odds-api.io en disco y señala al motor para vaciar RAM (sin restart)."""
-    path = ODDS_EVENT_META_CACHE_JSON
-    try:
-        (DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        log.warning("clear-meta-cache: no se pudo asegurar DATA_DIR/logs: %s", e)
-        return JSONResponse(
-            {"cleared": False, "path": str(path), "error": f"mkdir logs: {e}"},
-            status_code=500,
-        )
-    if path.is_file():
-        try:
-            path.unlink()
-        except OSError as e:
-            log.warning("clear-meta-cache: unlink %s: %s", path, e)
-            return JSONResponse(
-                {"cleared": False, "path": str(path), "error": str(e)},
-                status_code=500,
-            )
-    try:
-        ODDS_EVENT_META_CACHE_CLEAR_FLAG.write_text("", encoding="utf-8")
-    except OSError as e:
-        log.warning("clear-meta-cache: sentinel %s: %s", ODDS_EVENT_META_CACHE_CLEAR_FLAG, e)
-        return JSONResponse(
-            {"cleared": False, "path": str(path), "error": f"sentinel: {e}"},
-            status_code=500,
-        )
-    log.info("POST /api/admin/clear-meta-cache path=%s", path)
-    return {"cleared": True, "path": str(path)}
 
 
 @app.post("/api/arb/start")

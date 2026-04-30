@@ -38,6 +38,67 @@
       </div>
     </header>
 
+    <section id="capture-state-section" class="rounded-xl border border-indigo-900/50 bg-slate-800/50 p-4 space-y-3">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-xs font-semibold text-indigo-300 uppercase tracking-wide">Estado de captura Betfair</h2>
+        <span id="capture-bootstrap" class="text-[10px] px-2 py-0.5 rounded-full bg-slate-700 text-slate-400" title="REST bootstrap preload (1 sport con eventos próximos al iniciar)">bootstrap?</span>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 text-xs">
+        <span id="capture-state-pill" class="text-sm font-semibold px-3 py-1 rounded-full bg-slate-700 text-slate-300">—</span>
+        <span class="text-slate-400">WS msg: <span id="capture-age-msg" class="text-slate-200 font-mono">—</span></span>
+        <span class="text-slate-400">WS tick: <span id="capture-age-tick" class="text-slate-200 font-mono">—</span></span>
+        <span class="text-slate-400">REST bulk backoff: <span id="capture-bulk" class="text-slate-200 font-mono">—</span></span>
+        <span class="text-slate-400">REST quota 60min: <span id="capture-quota" class="text-slate-200 font-mono">—</span></span>
+        <span class="text-slate-400">Tick dispatch: <span id="capture-dispatch" class="text-slate-200 font-mono">—</span></span>
+      </div>
+      <div class="text-[11px] text-slate-500 font-mono break-all">
+        <span class="text-slate-400">WS msgs:</span>
+        <span id="capture-ws-msgs" class="text-slate-300">—</span>
+      </div>
+      <p class="text-[11px] text-slate-500 italic leading-snug max-w-3xl">
+        Si Betfair se queda quieto (WS_LIVE_NO_TICKS / WS_DEAD), no emitimos SIGNAL — significa que no hay oportunidades,
+        no que el bot esté roto. SIGNAL solo se permite con cuota Betfair &le;20s; entre 20-120s sale como
+        SKIP:LOW_EDGE / SKIP:STALE_FOR_SIGNAL.
+      </p>
+    </section>
+
+    <section id="edges-section" class="rounded-xl border border-emerald-900/40 bg-slate-800/40 p-4 space-y-3">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-xs font-semibold text-emerald-300 uppercase tracking-wide">Edges detectados últimas <span id="edges-hours-label">24</span>h</h2>
+        <div class="flex items-center gap-1 text-[11px]">
+          <button type="button" data-edges-hours="6" class="edges-hours-btn px-2 py-0.5 rounded border border-slate-700 text-slate-400 hover:bg-slate-800">6h</button>
+          <button type="button" data-edges-hours="24" class="edges-hours-btn px-2 py-0.5 rounded border border-emerald-700 text-emerald-300 bg-emerald-900/20">24h</button>
+          <button type="button" data-edges-hours="72" class="edges-hours-btn px-2 py-0.5 rounded border border-slate-700 text-slate-400 hover:bg-slate-800">72h</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
+        <div><span class="text-slate-500 block">SIGNAL</span><span id="edges-signals" class="text-emerald-300 font-mono text-base">—</span></div>
+        <div><span class="text-slate-500 block">SKIP:LOW_EDGE</span><span id="edges-low" class="text-amber-300 font-mono text-base">—</span></div>
+        <div><span class="text-slate-500 block">SKIP:STALE_FOR_SIGNAL</span><span id="edges-stale" class="text-orange-300 font-mono text-base">—</span></div>
+        <div><span class="text-slate-500 block">Mejor edge</span><span id="edges-best" class="text-slate-200 font-mono text-base">—</span></div>
+        <div><span class="text-slate-500 block">avg latency tick→signal</span><span id="edges-lat" class="text-slate-200 font-mono text-base">—</span></div>
+      </div>
+      <div class="overflow-x-auto rounded border border-slate-700/50">
+        <table class="w-full text-[11px] font-mono text-left min-w-[680px]">
+          <thead class="bg-slate-800 text-slate-500 uppercase text-[10px]">
+            <tr>
+              <th class="p-1.5">ts</th>
+              <th class="p-1.5">match</th>
+              <th class="p-1.5">side</th>
+              <th class="p-1.5">edge</th>
+              <th class="p-1.5">price_poly</th>
+              <th class="p-1.5">prob_pin</th>
+              <th class="p-1.5">t→s ms</th>
+              <th class="p-1.5">trigger</th>
+            </tr>
+          </thead>
+          <tbody id="edges-tbody">
+            <tr><td colspan="8" class="p-2 text-slate-600 text-center">Sin SIGNAL en la ventana seleccionada.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="briefing-section" class="rounded-xl border border-indigo-900/50 bg-slate-800/50 p-4 space-y-2">
       <h2 class="text-xs font-semibold text-indigo-300 uppercase tracking-wide">Briefing del último ciclo</h2>
       <p id="briefing-p1" class="text-sm text-slate-300 leading-relaxed">—</p>
@@ -432,6 +493,14 @@
       const pipe = numMetric(s.pipeline_entered_last_cycle);
       const ref = numMetric(s.reference_aligned_last_cycle);
       const csv = numMetric(s.csv_rows_last_cycle);
+      const wsUse = numMetric(s.ws_rows_usable);
+      const wsMiss = numMetric(s.ws_rows_missing_meta);
+      const dPre = numMetric(s.drop_pre_game);
+      const dStale = numMetric(s.drop_reference_stale);
+      const dLag = numMetric(s.drop_reference_lag);
+      const dAlign = numMetric(s.drop_alignment_none);
+      const dTok = numMetric(s.drop_token_map);
+      const refHealth = String(s.ref_health_state || "REF_OK");
       if (n == null && bFar == null) {
         el1.textContent =
           "Sin métricas del último ciclo. Arranca el motor Arb con esta estrategia habilitada para generar latency_arb_sports_cycle_metrics.json.";
@@ -450,6 +519,14 @@
         " parecen moneyline (no props Over/Under). " +
         (bIo != null ? bIo : "—") +
         " con par por nombres en la caché odds-api del ciclo (solo lectura; no implica REST nuevo).";
+      const tickTotal = numMetric(s.tick_dispatch_total);
+      const tickSig = numMetric(s.tick_dispatch_signals);
+      const tickLow = numMetric(s.tick_dispatch_low_edge);
+      const avgT2S = numMetric(s.avg_latency_tick_to_signal_ms);
+      const wsAgeMsg = numMetric(s.ws_age_last_msg_sec);
+      const wsAgeTick = numMetric(s.ws_age_last_tick_sec);
+      const bulkBack = numMetric(s.bulk_backoff_left_s);
+      const restQuota = numMetric(s.rest_quota_used_60min);
       el2.textContent =
         "Último ciclo hacia CLOB: pipeline_entered = " +
         (pipe != null ? pipe : "—") +
@@ -457,6 +534,38 @@
         (ref != null ? ref : "—") +
         " (tokens YES/NO alineados y listos para mids), filas CSV = " +
         (csv != null ? csv : "—") +
+        ". WS usable/incompletas(home-away) = " +
+        (wsUse != null ? wsUse : "—") +
+        "/" +
+        (wsMiss != null ? wsMiss : "—") +
+        ". Drops: pre_game=" +
+        (dPre != null ? dPre : "—") +
+        ", stale=" +
+        (dStale != null ? dStale : "—") +
+        ", lag=" +
+        (dLag != null ? dLag : "—") +
+        ", align_none=" +
+        (dAlign != null ? dAlign : "—") +
+        ", token_map=" +
+        (dTok != null ? dTok : "—") +
+        ". Tick-driven: dispatch=" +
+        (tickTotal != null ? tickTotal : "—") +
+        " · signals=" +
+        (tickSig != null ? tickSig : "—") +
+        " · low_edge=" +
+        (tickLow != null ? tickLow : "—") +
+        " · avg_t2s_ms=" +
+        (avgT2S != null ? avgT2S.toFixed(0) : "—") +
+        ". WS age: msg=" +
+        (wsAgeMsg != null ? wsAgeMsg.toFixed(0) + "s" : "—") +
+        " · tick=" +
+        (wsAgeTick != null ? wsAgeTick.toFixed(0) + "s" : "—") +
+        ". REST: bulk_backoff=" +
+        (bulkBack != null ? bulkBack.toFixed(0) + "s" : "—") +
+        " · quota_60min=" +
+        (restQuota != null ? restQuota : "—") +
+        "/80. estado_ref=" +
+        refHealth +
         ".";
     }
 
@@ -639,11 +748,26 @@
       document.getElementById("k-ws-cache").textContent = s.ws_cache_size != null ? String(s.ws_cache_size) : "—";
       const wss = s.ws_odds_bookmaker_slots;
       const bff = s.betfair_first_ws_rows;
+      const wsu = s.ws_rows_usable;
+      const wsm = s.ws_rows_missing_meta;
+      const wsAgeMsg2 = s.ws_age_last_msg_sec;
+      const wsAgeTick2 = s.ws_age_last_tick_sec;
       const elWs = document.getElementById("k-ws-slots");
       if (elWs) {
         elWs.textContent =
-          wss != null || bff != null
-            ? "slots=" + (wss != null ? wss : "—") + " · bf_ws_rows=" + (bff != null ? bff : "—")
+          wss != null || bff != null || wsu != null || wsm != null || wsAgeMsg2 != null
+            ? "slots=" +
+              (wss != null ? wss : "—") +
+              " · bf_ws_rows=" +
+              (bff != null ? bff : "—") +
+              " · usable=" +
+              (wsu != null ? wsu : "—") +
+              " · incompletas(home-away)=" +
+              (wsm != null ? wsm : "—") +
+              " · age_msg=" +
+              (wsAgeMsg2 != null ? Number(wsAgeMsg2).toFixed(0) + "s" : "—") +
+              " · age_tick=" +
+              (wsAgeTick2 != null ? Number(wsAgeTick2).toFixed(0) + "s" : "—")
             : "—";
       }
       document.getElementById("k-ref-matched").textContent = s.reference_matched != null ? String(s.reference_matched) : "—";
@@ -661,7 +785,142 @@
         (_enabled ? "translate-x-5" : "translate-x-0");
       document.getElementById("toggle-label").textContent = _enabled ? "encendida" : "apagada";
       renderBriefing(s);
+      renderCaptureState(s);
       refreshManualMatchPanels();
+    }
+
+    let _edgesHours = 24;
+
+    function renderCaptureState(s) {
+      const captureState = s && s.capture_state ? String(s.capture_state) : null;
+      const pill = document.getElementById("capture-state-pill");
+      if (pill) {
+        const map = {
+          WS_LIVE_OK: ["WS_LIVE_OK", "bg-emerald-700/40 text-emerald-200"],
+          WS_LIVE_NO_TICKS: ["WS_LIVE_NO_TICKS", "bg-amber-700/40 text-amber-200"],
+          WS_RECONNECTING: ["WS_RECONNECTING", "bg-sky-700/40 text-sky-200"],
+          REST_BACKOFF_ACTIVE: ["REST_BACKOFF_ACTIVE", "bg-orange-700/40 text-orange-200"],
+          WS_DEAD: ["WS_DEAD", "bg-red-700/40 text-red-200"],
+        };
+        const k = captureState && map[captureState] ? captureState : null;
+        const [text, cls] = map[k] || ["—", "bg-slate-700 text-slate-300"];
+        pill.textContent = text;
+        pill.className = "text-sm font-semibold px-3 py-1 rounded-full " + cls;
+      }
+      const setText = (id, txt) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = txt;
+      };
+      const fmtS = (v) => (v == null ? "—" : Number(v).toFixed(0) + "s");
+      setText("capture-age-msg", fmtS(s.ws_age_last_msg_sec));
+      setText("capture-age-tick", fmtS(s.ws_age_last_tick_sec));
+      setText(
+        "capture-bulk",
+        s.bulk_backoff_left_s == null ? "—" : Number(s.bulk_backoff_left_s).toFixed(0) + "s"
+      );
+      setText(
+        "capture-quota",
+        s.rest_quota_used_60min == null
+          ? "—"
+          : (s.rest_quota_used_60min + "/" + (s.rest_quota_per_hour != null ? s.rest_quota_per_hour : 80))
+      );
+      const total = s.tick_dispatch_total != null ? s.tick_dispatch_total : "—";
+      const sig = s.tick_dispatch_signals != null ? s.tick_dispatch_signals : "—";
+      const low = s.tick_dispatch_low_edge != null ? s.tick_dispatch_low_edge : "—";
+      setText("capture-dispatch", total + " (sig=" + sig + ", low=" + low + ")");
+      const wsTot = s.ws_msgs_text_total != null ? s.ws_msgs_text_total : "—";
+      const byType = s.ws_msgs_by_type && typeof s.ws_msgs_by_type === "object" ? s.ws_msgs_by_type : {};
+      const typeStr = Object.keys(byType).length
+        ? Object.keys(byType)
+            .sort()
+            .map((k) => k + "=" + byType[k])
+            .join(" · ")
+        : "—";
+      setText("capture-ws-msgs", "total=" + wsTot + " · " + typeStr);
+      const boot = document.getElementById("capture-bootstrap");
+      if (boot) {
+        if (s.rest_bootstrapped === true) {
+          boot.textContent = "bootstrap OK";
+          boot.className = "text-[10px] px-2 py-0.5 rounded-full bg-emerald-900/40 text-emerald-200";
+        } else if (s.rest_bootstrapped === false) {
+          boot.textContent = "bootstrap pendiente";
+          boot.className = "text-[10px] px-2 py-0.5 rounded-full bg-slate-700 text-slate-400";
+        } else {
+          boot.textContent = "bootstrap?";
+          boot.className = "text-[10px] px-2 py-0.5 rounded-full bg-slate-700 text-slate-400";
+        }
+      }
+    }
+
+    async function refreshEdges() {
+      try {
+        const resp = await fetch("/api/arb/latency_sports/edge-history?hours=" + _edgesHours, {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (!resp.ok) return;
+        const d = await resp.json();
+        document.getElementById("edges-hours-label").textContent = String(_edgesHours);
+        document.getElementById("edges-signals").textContent = d.signals != null ? d.signals : "—";
+        document.getElementById("edges-low").textContent = d.skip_low_edge != null ? d.skip_low_edge : "—";
+        document.getElementById("edges-stale").textContent = d.skip_stale_for_signal != null ? d.skip_stale_for_signal : "—";
+        document.getElementById("edges-best").textContent =
+          d.best_edge != null ? Number(d.best_edge).toFixed(4) : "—";
+        document.getElementById("edges-lat").textContent =
+          d.avg_latency_tick_to_signal_ms != null ? Number(d.avg_latency_tick_to_signal_ms).toFixed(0) + " ms" : "—";
+        const tbody = document.getElementById("edges-tbody");
+        if (!tbody) return;
+        const rows = Array.isArray(d.recent_signals) ? d.recent_signals : [];
+        if (rows.length === 0) {
+          tbody.innerHTML =
+            '<tr><td colspan="8" class="p-2 text-slate-600 text-center">Sin SIGNAL en la ventana seleccionada.</td></tr>';
+          return;
+        }
+        const esc = (v) => String(v == null ? "" : v).replace(/[&<>]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+        tbody.innerHTML = rows
+          .slice()
+          .reverse()
+          .map((r) => {
+            const ts = r.ts ? r.ts.replace("T", " ").slice(0, 19) : "—";
+            const match = esc(r.home_team || "?") + " vs " + esc(r.away_team || "?");
+            const edgeNum = r.edge != null ? Number(r.edge) : NaN;
+            const edge = !Number.isNaN(edgeNum) ? edgeNum.toFixed(4) : "—";
+            const pp = r.price_poly != null && r.price_poly !== "" ? Number(r.price_poly).toFixed(4) : "—";
+            const pn = r.prob_pinnacle != null && r.prob_pinnacle !== "" ? Number(r.prob_pinnacle).toFixed(4) : "—";
+            const lat = r.latency_ms_tick_to_signal != null && r.latency_ms_tick_to_signal !== ""
+              ? Number(r.latency_ms_tick_to_signal).toFixed(0)
+              : "—";
+            return (
+              "<tr class='border-t border-slate-800/60'>" +
+              "<td class='p-1.5 text-slate-500'>" + esc(ts) + "</td>" +
+              "<td class='p-1.5 text-slate-200'>" + match + "</td>" +
+              "<td class='p-1.5 text-slate-300'>" + esc(r.side || "") + "</td>" +
+              "<td class='p-1.5 text-emerald-300'>" + edge + "</td>" +
+              "<td class='p-1.5'>" + pp + "</td>" +
+              "<td class='p-1.5'>" + pn + "</td>" +
+              "<td class='p-1.5'>" + lat + "</td>" +
+              "<td class='p-1.5 text-slate-400'>" + esc(r.trigger || "") + "</td>" +
+              "</tr>"
+            );
+          })
+          .join("");
+      } catch (e) {}
+    }
+
+    function bindEdgesHoursButtons() {
+      const btns = document.querySelectorAll(".edges-hours-btn");
+      btns.forEach((b) => {
+        b.addEventListener("click", () => {
+          const h = parseInt(b.getAttribute("data-edges-hours") || "24", 10);
+          if (!Number.isFinite(h)) return;
+          _edgesHours = h;
+          btns.forEach((x) => {
+            x.className = "edges-hours-btn px-2 py-0.5 rounded border border-slate-700 text-slate-400 hover:bg-slate-800";
+          });
+          b.className = "edges-hours-btn px-2 py-0.5 rounded border border-emerald-700 text-emerald-300 bg-emerald-900/20";
+          refreshEdges();
+        });
+      });
     }
 
     async function toggleEnabled() {
@@ -1065,10 +1324,13 @@
     loadSchedule(false);
     loadLog();
     startLive();
+    bindEdgesHoursButtons();
+    refreshEdges();
     setInterval(() => {
       refreshStatus();
       loadSchedule(false);
       loadLog();
+      refreshEdges();
     }, 12000);
   </script>
 </body>

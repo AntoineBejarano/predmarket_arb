@@ -10,12 +10,12 @@ import time
 from collections import deque
 from datetime import datetime
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
 
 import aiohttp
 from aiohttp import WSMsgType
+from typing import Awaitable, Callable
 
 from clients.odds_api import implied_prob as _implied_prob
 from clients.odds_api import levenshtein
@@ -24,12 +24,15 @@ from clients.odds_api import remove_vig as _remove_vig_probs
 
 log = logging.getLogger("odds_api_io")
 
+# Tipo de callback de tick Betfair: motor latency_arb_sports lo conecta para reaccionar al instante.
+BetfairTickCallback = Callable[["OddsEvent"], Awaitable[None]]
+
 # Valores embebidos (p. ej. Railway sin env). `os.getenv("ODDS_API_IO_*")` sigue pudiendo sobreescribir en local.
 ODDS_API_IO_KEY_EMBEDDED = "647c2e8972c62f827b54f98b759982ea2b6d891be25b49c2a746a6f1ed4dd360"
 ODDS_API_IO_WS_EMBEDDED = True
-ODDS_API_IO_CACHE_TTL_EMBEDDED = 300
-# Alineado con el tier típico de la clave (máx. 2 bookies: Betfair + Polymarket). Sharp Exchange → 403 en /odds/multi.
-ODDS_API_IO_BOOKMAKERS_EMBEDDED = "Betfair Exchange,Polymarket"
+ODDS_API_IO_CACHE_TTL_EMBEDDED = 900
+# Default hardcodeado para reducir ruido WS sin metadata durante validación: solo Betfair.
+ODDS_API_IO_BOOKMAKERS_EMBEDDED = "Betfair Exchange"
 ODDS_API_IO_MARKETS_EMBEDDED = "ML"
 # Deportes WS: slugs oficiales GET https://api.odds-api.io/v3/sports (p. ej. basketball, football).
 ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis,basketball,football"
@@ -102,54 +105,21 @@ ODDS_KEY_TO_IO_SPORT = {
 _WS_BACKOFF_SEC = (2, 4, 8, 16, 30)
 # Tope de eventos por deporte en REST (evita decenas de GET /odds/multi por ciclo en tenis/fútbol).
 _ODDS_IO_REST_MAX_EVENT_IDS = 100
-# Máx. GET /events/{id} por ventana de 60s (meta WS) para no quemar cupo.
-_ODDS_IO_META_FETCH_PER_60S = 12
-_EVENT_META_NEGATIVE_TTL_404_SEC = 600.0
-_EVENT_META_NEGATIVE_TTL_429_SEC = 300.0
-_META_DISK_DEBOUNCE_SEC = 30.0
-
-
-def _event_meta_disk_path() -> Path:
-    """Caché en disco bajo ``<repo>/data/logs`` (misma convención que arb/validador)."""
-    from lab.paths import data_dir
-
-    return data_dir() / "logs" / "odds_event_meta_cache.json"
-
-
-def _load_event_meta_disk_cache(into: dict[str, dict[str, str]]) -> None:
-    path = _event_meta_disk_path()
-    if not path.is_file():
-        return
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError) as e:
-        log.warning("[odds_api_io] event meta disk cache read %s: %s", path, e)
-        return
-    if not isinstance(raw, dict):
-        return
-    n = 0
-    for k, v in raw.items():
-        eid = str(k).strip()
-        if not eid or not isinstance(v, dict):
-            continue
-        into[eid] = {
-            "home": str(v.get("home") or "").strip(),
-            "away": str(v.get("away") or "").strip(),
-            "sport": str(v.get("sport") or "").strip().lower(),
-        }
-        n += 1
-    if n:
-        log.info("[odds_api_io] event meta disk cache cargada: n=%s path=%s", n, path)
-
-
-def _save_event_meta_disk_cache(cache: dict[str, dict[str, str]]) -> None:
-    path = _event_meta_disk_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {str(k): dict(v) for k, v in cache.items()}
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except OSError as e:
-        log.warning("[odds_api_io] event meta disk cache write %s: %s", path, e)
+# Per-sport bulk backoff: 300s default; AUTH errors cubren todos los deportes 1h.
+_REST_BULK_BACKOFF_SEC = 300.0
+_REST_BULK_BACKOFF_MAX_SEC = 1800.0
+_REST_AUTH_BACKOFF_SEC = 3600.0
+# Token bucket REST global: máximo 80 reqs/h (margen sobre 100/h del plan gratis).
+_REST_QUOTA_PER_HOUR = 80
+_REST_QUOTA_WINDOW_SEC = 3600.0
+# Watchdog WS: si tras welcome no llega ningún mensaje durante > _WS_IDLE_RESET_SEC, forzar reconexión.
+_WS_IDLE_RESET_SEC = 90.0
+# Cadencia del watchdog (poll interno).
+_WS_WATCHDOG_POLL_SEC = 30.0
+# Mínimo entre intentos bulk REST por sport: evita martillear /events cada poll cycle (5s).
+_REST_PER_SPORT_MIN_INTERVAL_SEC = 30.0
+# Si /events sport=X devuelve lista vacía, no insistir durante esta ventana.
+_REST_EMPTY_SPORT_BACKOFF_SEC = 600.0
 
 
 @dataclass
@@ -197,10 +167,6 @@ def _coerce_io_sport_slug(sport_val: Any) -> str:
     if isinstance(sport_val, dict):
         return str(sport_val.get("slug") or sport_val.get("sport_slug") or "").strip().lower()
     return str(sport_val).strip().lower()
-
-
-def _event_meta_has_io_sport(meta: dict[str, str]) -> bool:
-    return bool((meta.get("sport") or "").strip())
 
 
 def _levenshtein_similarity_ratio(a: str, b: str) -> float:
@@ -352,25 +318,49 @@ class OddsApiIo:
         _raw_ws = os.getenv("ODDS_API_IO_WS")
         self.ws_enabled = ODDS_API_IO_WS_EMBEDDED if _raw_ws is None else _raw_ws.strip().lower() == "true"
         self.cache_ttl = int(os.getenv("ODDS_API_IO_CACHE_TTL") or ODDS_API_IO_CACHE_TTL_EMBEDDED)
-        raw_bk = os.getenv("ODDS_API_IO_BOOKMAKERS") or ODDS_API_IO_BOOKMAKERS_EMBEDDED
-        self.bookmakers_csv = ",".join(b.strip() for b in raw_bk.split(",") if b.strip())
+        # Hardcode estricto por decisión operativa: no leer ODDS_API_IO_BOOKMAKERS del entorno.
+        self.bookmakers_csv = ",".join(
+            b.strip() for b in ODDS_API_IO_BOOKMAKERS_EMBEDDED.split(",") if b.strip()
+        )
         self._wanted_bookmaker_names = frozenset(b.strip() for b in self.bookmakers_csv.split(",") if b.strip())
         self.markets_ws = (os.getenv("ODDS_API_IO_MARKETS") or ODDS_API_IO_MARKETS_EMBEDDED).strip() or "ML"
         self._lock = asyncio.Lock()
         self._ws_odds_cache: dict[str, dict[str, OddsEvent]] = {}
         self._rest_cache: dict[str, tuple[float, list[OddsEvent]]] = {}
-        self._event_meta_cache: dict[str, dict[str, str]] = {}
-        _load_event_meta_disk_cache(self._event_meta_cache)
-        self._event_meta_inflight: set[str] = set()
         self._ws_runner_task: Optional[asyncio.Task[None]] = None
+        self._ws_watchdog_task: Optional[asyncio.Task[None]] = None
         self._ws_cancel = asyncio.Event()
+        # Una conexión activa por sport suscrito.
+        self._ws_current_by_sport: dict[str, aiohttp.ClientWebSocketResponse] = {}
+        self._ws_tasks_by_sport: dict[str, asyncio.Task[None]] = {}
         self._raw_logged = False
-        # Tras 403/429 REST no reintentar en bucle (mata el gather del arb_engine).
-        self._rest_backoff_until: float = 0.0
-        # event_id -> no reintentar GET /events/{id} hasta este monotonic (404/429/transitorio).
-        self._event_meta_negative: dict[str, float] = {}
-        self._meta_fetch_times: deque[float] = deque(maxlen=128)
-        self._meta_disk_lt_handle: Optional[asyncio.TimerHandle] = None
+        # Backoff bulk REST: /events + /odds/multi (per-sport para que un 429 en tenis no apague basket)
+        self._rest_bulk_backoff_until_per_sport: dict[str, float] = {}
+        # Backoff global (auth 401/403): cubre TODOS los deportes hasta vencer.
+        self._rest_bulk_backoff_global_until: float = 0.0
+        # Token bucket REST global: timestamps monotonic de cada request HTTP REST.
+        self._rest_quota_ts: deque[float] = deque(maxlen=_REST_QUOTA_PER_HOUR * 4)
+        # Salud WS: edad del último mensaje (cualquier tipo) y del último tick válido (created/updated parseado).
+        self._ws_last_msg_mono: float = 0.0
+        self._ws_last_tick_mono: float = 0.0
+        # Filas WS descartadas por bookie != Betfair (debería ser 0 con bookmakers hardcodeado).
+        self._ws_dropped_other_bookie: int = 0
+        # Contadores WS para diagnóstico: total de mensajes TEXT y desglose por tipo declarado.
+        self._ws_msgs_text_total: int = 0
+        self._ws_msgs_by_type: dict[str, int] = {}
+        # Callback de tick Betfair (motor latency_arb_sports). Se invoca desde _apply_ws_created_updated.
+        self._betfair_tick_callback: Optional[BetfairTickCallback] = None
+        # Bootstrap REST: marca True tras preload OK del primer sport con eventos próximos.
+        self._bootstrapped: bool = False
+        self._bootstrap_task: Optional[asyncio.Task[None]] = None
+        # Gating per-sport: monotonic del último intento bulk REST (eventos / odds-multi).
+        self._rest_last_attempt_per_sport: dict[str, float] = {}
+        # Sports que devolvieron lista vacía: marcados aquí para no insistir en /odds/multi sin meta-cache.
+        self._rest_empty_sport_until: dict[str, float] = {}
+
+    def set_betfair_tick_callback(self, cb: Optional[BetfairTickCallback]) -> None:
+        """latency_arb_sports lo conecta para reaccionar al instante a cada tick Betfair válido."""
+        self._betfair_tick_callback = cb
 
     def start_ws_stream(self, sports: list[str]) -> None:
         if not self.ws_enabled:
@@ -381,18 +371,213 @@ class OddsApiIo:
         clean = [s.strip() for s in sports if s.strip()]
         if not clean:
             clean = [s.strip() for s in ODDS_API_IO_SPORTS_EMBEDDED.split(",") if s.strip()]
+        clean = list(dict.fromkeys(clean))
         self._ws_runner_task = asyncio.create_task(self._ws_runner_loop(clean), name="odds_api_io_ws")
+        if self._ws_watchdog_task is None or self._ws_watchdog_task.done():
+            self._ws_watchdog_task = asyncio.create_task(self._ws_watchdog_loop(), name="odds_api_io_ws_watchdog")
+        # Preload bootstrap: primer sport con eventos próximos para poblar cache REST.
+        if (self._bootstrap_task is None or self._bootstrap_task.done()) and not self._bootstrapped:
+            self._bootstrap_task = asyncio.create_task(
+                self._bootstrap_preload(clean), name="odds_api_io_bootstrap_preload"
+            )
+
+    def is_bootstrapped(self) -> bool:
+        return self._bootstrapped
+
+    async def _bootstrap_preload(self, sports: list[str]) -> None:
+        """
+        Gasta 1 request bulk en el sport con más eventos próximos (tennis primero) para
+        poblar cache REST de respaldo antes del primer ciclo de matching.
+        """
+        try:
+            await asyncio.sleep(0.5)
+            if self._bootstrapped:
+                return
+            preferred = ["tennis", "table-tennis", "basketball", "football"]
+            ordered = [s for s in preferred if s in sports] + [s for s in sports if s not in preferred]
+            timeout = aiohttp.ClientTimeout(total=45)
+            async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS, timeout=timeout) as sess:
+                for io_sport in ordered:
+                    if self._ws_cancel.is_set():
+                        return
+                    if self._bulk_backoff_blocked(io_sport):
+                        continue
+                    if not self._rest_quota_can_consume():
+                        log.info(
+                            "[odds_api_io] BOOTSTRAP: token bucket %s/%s lleno, salto sport=%s.",
+                            len(self._rest_quota_ts),
+                            _REST_QUOTA_PER_HOUR,
+                            io_sport,
+                        )
+                        return
+                    try:
+                        events_rows = await self._rest_fetch_sport(sess, io_sport)
+                    except OddsApiIoRestQuotaError as e:
+                        log.warning(
+                            "[odds_api_io] BOOTSTRAP sport=%s 429 / cuota: per-sport backoff %.0fs. %s",
+                            io_sport,
+                            _REST_BULK_BACKOFF_SEC,
+                            e,
+                        )
+                        self._set_bulk_backoff_for_sport(io_sport, _REST_BULK_BACKOFF_SEC)
+                        continue
+                    except Exception as e:
+                        log.warning("[odds_api_io] BOOTSTRAP sport=%s error: %s", io_sport, e)
+                        continue
+                    if events_rows:
+                        async with self._lock:
+                            self._rest_cache[io_sport] = (time.monotonic(), list(events_rows))
+                        self._bootstrapped = True
+                        log.info(
+                            "[odds_api_io] BOOTSTRAP OK sport=%s events=%s bootstrapped=True",
+                            io_sport,
+                            len(events_rows),
+                        )
+                        return
+            log.info("[odds_api_io] BOOTSTRAP: ningún sport devolvió eventos; reintentos vía refresh_rest_cache.")
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.warning("[odds_api_io] BOOTSTRAP error inesperado: %s", e)
 
     async def stop_ws_stream(self) -> None:
-        if not self._ws_runner_task:
-            return
         self._ws_cancel.set()
-        self._ws_runner_task.cancel()
-        try:
-            await self._ws_runner_task
-        except asyncio.CancelledError:
-            pass
+        for t in (self._ws_runner_task, self._ws_watchdog_task, self._bootstrap_task, *self._ws_tasks_by_sport.values()):
+            if t is None:
+                continue
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         self._ws_runner_task = None
+        self._ws_watchdog_task = None
+        self._bootstrap_task = None
+        self._ws_tasks_by_sport = {}
+
+    def ws_age_last_msg_sec(self) -> Optional[float]:
+        """Edad (s) del último mensaje WS recibido (tipo cualquiera). None si aún no hay conexión."""
+        if self._ws_last_msg_mono == 0.0:
+            return None
+        return max(0.0, time.monotonic() - self._ws_last_msg_mono)
+
+    def ws_age_last_tick_sec(self) -> Optional[float]:
+        """Edad (s) del último tick Betfair válido parseado (created/updated con cuotas)."""
+        if self._ws_last_tick_mono == 0.0:
+            return None
+        return max(0.0, time.monotonic() - self._ws_last_tick_mono)
+
+    def bulk_backoff_left_sec(self, io_sport: Optional[str] = None) -> float:
+        """Tiempo restante (s) del backoff bulk REST: max(global_auth, per_sport)."""
+        now = time.monotonic()
+        glob = max(0.0, float(self._rest_bulk_backoff_global_until - now))
+        if io_sport is None:
+            mx_sport = 0.0
+            for v in self._rest_bulk_backoff_until_per_sport.values():
+                left = float(v) - now
+                if left > mx_sport:
+                    mx_sport = left
+            return max(glob, max(0.0, mx_sport))
+        sport_until = float(self._rest_bulk_backoff_until_per_sport.get(io_sport, 0.0))
+        return max(glob, max(0.0, sport_until - now))
+
+    def meta_backoff_left_sec(self) -> float:
+        return 0.0
+
+    def capture_state(self) -> str:
+        """
+        Estado canónico del feed Betfair (plan §2/§6):
+          - WS_LIVE_OK: WS conectado, último msg <60s y al menos 1 tick válido <180s.
+          - WS_LIVE_NO_TICKS: WS recibe heartbeats / mensajes pero sin ticks válidos en >180s.
+          - WS_RECONNECTING: tarea WS viva pero sin conexión activa (entre intentos de _ws_runner_loop).
+          - WS_DEAD: tarea WS terminada o sin mensajes en >90s y watchdog aún no recicló.
+          - REST_BACKOFF_ACTIVE: WS sin datos y bulk_backoff (auth global o todos sports) > 60s.
+        """
+        ws_task_alive = self._ws_runner_task is not None and not self._ws_runner_task.done()
+        ws_current_alive = len(self._ws_current_by_sport) > 0
+        age_msg = self.ws_age_last_msg_sec()
+        age_tick = self.ws_age_last_tick_sec()
+        bulk_left = self.bulk_backoff_left_sec()
+        if not ws_task_alive:
+            if bulk_left >= 60.0:
+                return "REST_BACKOFF_ACTIVE"
+            return "WS_DEAD"
+        if not ws_current_alive:
+            return "WS_RECONNECTING"
+        if age_msg is None:
+            return "WS_RECONNECTING"
+        if age_msg > _WS_IDLE_RESET_SEC:
+            return "WS_DEAD"
+        if age_tick is None or age_tick > 180.0:
+            return "WS_LIVE_NO_TICKS"
+        return "WS_LIVE_OK"
+
+    def rest_quota_used_60min(self) -> int:
+        """Reqs REST emitidos en la última hora (token bucket)."""
+        self._rest_quota_pop_old()
+        return len(self._rest_quota_ts)
+
+    def ws_msgs_summary(self) -> dict[str, Any]:
+        """Diagnóstico WS: total de mensajes TEXT recibidos y desglose por tipo."""
+        return {
+            "ws_msgs_text_total": int(self._ws_msgs_text_total),
+            "ws_msgs_by_type": dict(self._ws_msgs_by_type),
+        }
+
+    def _rest_quota_pop_old(self) -> None:
+        now = time.monotonic()
+        while self._rest_quota_ts and now - self._rest_quota_ts[0] > _REST_QUOTA_WINDOW_SEC:
+            self._rest_quota_ts.popleft()
+
+    def _rest_quota_can_consume(self) -> bool:
+        self._rest_quota_pop_old()
+        return len(self._rest_quota_ts) < _REST_QUOTA_PER_HOUR
+
+    def _rest_quota_consume(self) -> None:
+        self._rest_quota_ts.append(time.monotonic())
+
+    def _bulk_backoff_blocked(self, io_sport: str) -> bool:
+        return self.bulk_backoff_left_sec(io_sport) > 0.0
+
+    def _set_bulk_backoff_for_sport(self, io_sport: str, base_sec: float = _REST_BULK_BACKOFF_SEC) -> None:
+        """Backoff per-sport con tope; escala si ya estaba en backoff."""
+        now = time.monotonic()
+        prev_left = max(0.0, float(self._rest_bulk_backoff_until_per_sport.get(io_sport, 0.0)) - now)
+        next_dur = min(_REST_BULK_BACKOFF_MAX_SEC, max(base_sec, prev_left * 2.0))
+        self._rest_bulk_backoff_until_per_sport[io_sport] = now + float(next_dur)
+
+    def _set_bulk_backoff_global_auth(self, sec: float = _REST_AUTH_BACKOFF_SEC) -> None:
+        self._rest_bulk_backoff_global_until = max(self._rest_bulk_backoff_global_until, time.monotonic() + float(sec))
+
+    async def _ws_watchdog_loop(self) -> None:
+        """Cierra la WS activa si lleva > _WS_IDLE_RESET_SEC sin mensajes (la reabrirá _ws_runner_loop)."""
+        try:
+            while not self._ws_cancel.is_set():
+                try:
+                    await asyncio.wait_for(self._ws_cancel.wait(), timeout=_WS_WATCHDOG_POLL_SEC)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                sockets = list(self._ws_current_by_sport.items())
+                if not sockets:
+                    continue
+                age_msg = self.ws_age_last_msg_sec()
+                if age_msg is None:
+                    continue
+                if age_msg > _WS_IDLE_RESET_SEC:
+                    log.warning(
+                        "[odds_api_io] WS_WATCHDOG idle %.0fs > %ss, cerrando %s WS para forzar reconexión.",
+                        age_msg,
+                        int(_WS_IDLE_RESET_SEC),
+                        len(sockets),
+                    )
+                    for sport_slug, ws in sockets:
+                        try:
+                            await ws.close()
+                        except Exception as e:
+                            log.debug("[odds_api_io] WS_WATCHDOG close sport=%s: %s", sport_slug, e)
+        except asyncio.CancelledError:
+            return
 
     def get_cached_odds(self, sport: str) -> list[OddsEvent]:
         """Solo lectura de caché; en REST la caché se rellena vía refresh_rest_cache."""
@@ -417,6 +602,25 @@ class OddsApiIo:
         """True si hay al menos un tick WS en caché para el slug IO (p. ej. tennis)."""
         return len(self._flatten_ws_cache_io_sport(str(io_sport or "").strip().lower())) > 0
 
+    def ws_health_counts(self) -> dict[str, int]:
+        """Diagnóstico WS: filas utilizables vs filas incompletas (home/away)."""
+        total = 0
+        usable = 0
+        missing_meta = 0
+        for by_bk in self._ws_odds_cache.values():
+            for ev in by_bk.values():
+                total += 1
+                has_meta = bool((ev.home or "").strip() and (ev.away or "").strip())
+                if has_meta:
+                    usable += 1
+                else:
+                    missing_meta += 1
+        return {
+            "ws_rows_total": int(total),
+            "ws_rows_usable": int(usable),
+            "ws_rows_missing_meta": int(missing_meta),
+        }
+
     def _flatten_ws_cache_io_sport(self, sport_slug: str) -> list[OddsEvent]:
         sl = sport_slug.strip().casefold()
         acc: list[OddsEvent] = []
@@ -435,64 +639,58 @@ class OddsApiIo:
                 return i
         return len(order)
 
-    async def _persist_event_meta_disk(self) -> None:
-        async with self._lock:
-            snap = {str(k): dict(v) for k, v in self._event_meta_cache.items()}
-        await asyncio.to_thread(_save_event_meta_disk_cache, snap)
-
-    def _schedule_debounced_meta_disk(self) -> None:
-        """Una escritura a disco ~30s tras el último cambio de meta (no cada GET)."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        h = self._meta_disk_lt_handle
-        if h is not None and not h.cancelled():
-            h.cancel()
-
-        async def _flush() -> None:
-            try:
-                await self._persist_event_meta_disk()
-            except OSError as e:
-                log.warning("[odds_api_io] debounced meta disk persist: %s", e)
-
-        def _fire() -> None:
-            self._meta_disk_lt_handle = None
-            loop.create_task(_flush())
-
-        self._meta_disk_lt_handle = loop.call_later(_META_DISK_DEBOUNCE_SEC, _fire)
-
-    def _meta_rate_limit_pop_old(self) -> None:
-        now = time.monotonic()
-        while self._meta_fetch_times and now - self._meta_fetch_times[0] > 60.0:
-            self._meta_fetch_times.popleft()
-
-    def _meta_rate_limit_allows(self) -> bool:
-        self._meta_rate_limit_pop_old()
-        return len(self._meta_fetch_times) < _ODDS_IO_META_FETCH_PER_60S
-
     async def refresh_rest_cache(self, session: aiohttp.ClientSession, poly_sport: str) -> None:
         io_sport = poly_odds_key_to_io_sport(poly_sport)
         if not io_sport:
             return
+        if self._bulk_backoff_blocked(io_sport):
+            return
         now = time.monotonic()
-        if now < self._rest_backoff_until:
+        # Gating per-sport: aunque el TTL de cache haya vencido, no martillear /events cada 5s.
+        last_attempt = float(self._rest_last_attempt_per_sport.get(io_sport, 0.0))
+        if last_attempt > 0 and (now - last_attempt) < _REST_PER_SPORT_MIN_INTERVAL_SEC:
+            return
+        # Sport marcado como "vacío" recientemente: no insistir hasta que venza la ventana.
+        empty_until = float(self._rest_empty_sport_until.get(io_sport, 0.0))
+        if empty_until > now:
+            return
+        if not self._rest_quota_can_consume():
+            log.debug(
+                "[odds_api_io] REST quota %s/%s en última hora; salto refresh sport=%s.",
+                len(self._rest_quota_ts),
+                _REST_QUOTA_PER_HOUR,
+                io_sport,
+            )
             return
         async with self._lock:
             row = self._rest_cache.get(io_sport)
             if row and now - row[0] < self.cache_ttl:
                 return
+        self._rest_last_attempt_per_sport[io_sport] = now
         try:
             events_rows = await self._rest_fetch_sport(session, io_sport)
         except OddsApiIoRestQuotaError as e:
             log.warning(
-                "[odds_api_io] REST en pausa ~1h (cuota o límite de bookmakers); el motor sigue con WS. %s",
+                "[odds_api_io] REST sport=%s en pausa (cuota/límite); per-sport backoff %.0fs. %s",
+                io_sport,
+                _REST_BULK_BACKOFF_SEC,
                 e,
             )
-            self._rest_backoff_until = time.monotonic() + 3600.0
+            self._set_bulk_backoff_for_sport(io_sport, _REST_BULK_BACKOFF_SEC)
             return
         except Exception as e:
             log.warning("[odds_api_io] REST fetch sport=%s: %s", io_sport, e)
+            return
+        if not events_rows:
+            # Sport sin eventos próximos en odds-api.io: no llamar a /odds/multi y posponer reintentos.
+            self._rest_empty_sport_until[io_sport] = now + _REST_EMPTY_SPORT_BACKOFF_SEC
+            log.debug(
+                "[odds_api_io] REST sport=%s sin eventos; backoff %.0fs antes de reintentar /events.",
+                io_sport,
+                _REST_EMPTY_SPORT_BACKOFF_SEC,
+            )
+            async with self._lock:
+                self._rest_cache[io_sport] = (time.monotonic(), [])
             return
         async with self._lock:
             self._rest_cache[io_sport] = (time.monotonic(), events_rows)
@@ -500,11 +698,14 @@ class OddsApiIo:
     async def _rest_fetch_sport(self, session: aiohttp.ClientSession, io_sport: str) -> list[OddsEvent]:
         params = {"apiKey": self.api_key, "sport": io_sport}
         url = f"{BASE_REST}/events"
+        self._rest_quota_consume()
         async with session.get(
             url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
+                if resp.status in (401, 403):
+                    self._set_bulk_backoff_global_auth(_REST_AUTH_BACKOFF_SEC)
                 _raise_if_rest_quota_error(resp.status, text, f"GET /events sport={io_sport}")
                 log.warning("[odds_api_io] GET /events sport=%s HTTP %s: %s", io_sport, resp.status, text[:300])
                 return []
@@ -523,6 +724,12 @@ class OddsApiIo:
             return []
         out: list[OddsEvent] = []
         for i in range(0, len(ids), 10):
+            if not self._rest_quota_can_consume():
+                log.info(
+                    "[odds_api_io] REST quota agotada en chunks /odds/multi sport=%s; cortamos batch.",
+                    io_sport,
+                )
+                break
             chunk = ids[i : i + 10]
             multi = await self._rest_odds_multi(session, chunk, io_sport)
             out.extend(multi)
@@ -537,11 +744,14 @@ class OddsApiIo:
             "bookmakers": self.bookmakers_csv,
         }
         url = f"{BASE_REST}/odds/multi"
+        self._rest_quota_consume()
         async with session.get(
             url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=45)
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
+                if resp.status in (401, 403):
+                    self._set_bulk_backoff_global_auth(_REST_AUTH_BACKOFF_SEC)
                 _raise_if_rest_quota_error(resp.status, text, "GET /odds/multi")
                 log.warning("[odds_api_io] GET /odds/multi HTTP %s: %s", resp.status, text[:300])
                 return []
@@ -558,119 +768,31 @@ class OddsApiIo:
                 rows.extend(_oddsevents_from_odds_payload(item, sport_slug, self._wanted_bookmaker_names))
         return rows
 
-    async def _fetch_event_meta(self, session: aiohttp.ClientSession, event_id: str) -> dict[str, str]:
-        out: dict[str, str] = {}
-        if not event_id:
-            return out
-        try:
-            now_mono = time.monotonic()
-            if now_mono < self._rest_backoff_until:
-                return out
-            neg_until = self._event_meta_negative.get(event_id)
-            if neg_until is not None and now_mono < neg_until:
-                return out
-            async with self._lock:
-                cached = self._event_meta_cache.get(event_id)
-            if cached is not None and _event_meta_has_io_sport(cached):
-                return dict(cached)
-            if not self._meta_rate_limit_allows():
-                log.debug("[odds_api_io] event meta rate-limit skip id=%s", event_id)
-                return out
-            self._meta_fetch_times.append(time.monotonic())
-            url = f"{BASE_REST}/events/{event_id}"
-            params = {"apiKey": self.api_key}
-            try:
-                async with session.get(
-                    url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    text = await resp.text()
-                    if resp.status != 200:
-                        if resp.status == 404:
-                            log.debug("[odds_api_io] GET /events/%s HTTP 404", event_id)
-                            self._event_meta_negative[event_id] = (
-                                time.monotonic() + _EVENT_META_NEGATIVE_TTL_404_SEC
-                            )
-                            return out
-                        if resp.status in (401, 403, 429):
-                            log.warning(
-                                "[odds_api_io] GET /events/%s HTTP %s — backoff REST compartido, WS sigue.",
-                                event_id,
-                                resp.status,
-                            )
-                            self._rest_backoff_until = time.monotonic() + 3600.0
-                            self._event_meta_negative[event_id] = (
-                                time.monotonic() + _EVENT_META_NEGATIVE_TTL_429_SEC
-                            )
-                            return out
-                        log.debug("[odds_api_io] GET /events/%s HTTP %s", event_id, resp.status)
-                        self._event_meta_negative[event_id] = time.monotonic() + 120.0
-                        return out
-                    raw = json.loads(text)
-            except OddsApiIoRestQuotaError as e:
-                log.warning("[odds_api_io] event meta quota id=%s: %s", event_id, e)
-                self._rest_backoff_until = time.monotonic() + 3600.0
-                self._event_meta_negative[event_id] = time.monotonic() + _EVENT_META_NEGATIVE_TTL_429_SEC
-                return out
-            if not isinstance(raw, dict):
-                return out
-            home_raw = str(raw.get("home") or raw.get("home_team") or "").strip()
-            away_raw = str(raw.get("away") or raw.get("away_team") or "").strip()
-            home = normalize_name_order(home_raw) if home_raw else ""
-            away = normalize_name_order(away_raw) if away_raw else ""
-            sp = raw.get("sport")
-            if isinstance(sp, dict):
-                sport_slug = str(sp.get("slug", "") or "").strip().lower()
-            else:
-                sport_slug = str(sp or raw.get("sport_slug") or "").strip().lower()
-            out = {"home": home, "away": away, "sport": sport_slug}
-            async with self._lock:
-                self._event_meta_cache[event_id] = out
-                self._event_meta_negative.pop(event_id, None)
-                # WS a veces manda "updated" sin sport/home/away; el filtro por io_sport
-                # descartaba esos OddsEvent hasta el siguiente tick. Rellenar caché en vivo.
-                by_bk = self._ws_odds_cache.get(event_id)
-                if by_bk:
-                    for ev in by_bk.values():
-                        if not (ev.sport or "").strip() and sport_slug:
-                            ev.sport = sport_slug
-                        if not (ev.home or "").strip() and home:
-                            ev.home = home
-                        if not (ev.away or "").strip() and away:
-                            ev.away = away
-            self._schedule_debounced_meta_disk()
-            return dict(out)
-        except OddsApiIoRestQuotaError as e:
-            log.warning("[odds_api_io] event meta outer quota id=%s: %s", event_id, e)
-            self._rest_backoff_until = time.monotonic() + 3600.0
-            self._event_meta_negative[event_id] = time.monotonic() + _EVENT_META_NEGATIVE_TTL_429_SEC
-            return out
-        except Exception as e:
-            log.warning("[odds_api_io] event meta id=%s: %s", event_id, e)
-            self._event_meta_negative[event_id] = time.monotonic() + 90.0
-            return out
-        finally:
-            async with self._lock:
-                self._event_meta_inflight.discard(event_id)
-
     async def _ws_runner_loop(self, sports: list[str]) -> None:
+        # Un loop independiente por sport para que cada mensaje quede etiquetado por canal.
+        self._ws_tasks_by_sport = {
+            sport_slug: asyncio.create_task(
+                self._ws_sport_loop(sport_slug),
+                name=f"odds_api_io_ws_{sport_slug}",
+            )
+            for sport_slug in sports
+        }
+        try:
+            await self._ws_cancel.wait()
+        finally:
+            for t in self._ws_tasks_by_sport.values():
+                t.cancel()
+            await asyncio.gather(*self._ws_tasks_by_sport.values(), return_exceptions=True)
+            self._ws_tasks_by_sport = {}
+
+    async def _ws_sport_loop(self, bound_sport: str) -> None:
         attempt = 0
         backoff_i = 0
-        sport_param = ",".join(sports)
         while not self._ws_cancel.is_set():
             try:
-                await self._ws_once(sport_param)
+                await self._ws_once(bound_sport)
             except asyncio.CancelledError:
                 raise
-            except OddsApiIoRestQuotaError as e:
-                log.warning(
-                    "[odds_api_io] WS ciclo: cuota/auth REST (%s); reintento tras pausa sin tumbar el proceso.",
-                    e,
-                )
-                try:
-                    await asyncio.wait_for(self._ws_cancel.wait(), timeout=120.0)
-                except asyncio.TimeoutError:
-                    pass
-                continue
             except Exception as e:
                 attempt += 1
                 delay = _WS_BACKOFF_SEC[min(backoff_i, len(_WS_BACKOFF_SEC) - 1)]
@@ -678,7 +800,13 @@ class OddsApiIo:
                     delay = 30
                 else:
                     backoff_i += 1
-                log.warning("[odds_api_io] WS_RECONNECT attempt=%s delay=%ss err=%s", attempt, delay, e)
+                log.warning(
+                    "[odds_api_io] WS_RECONNECT sport=%s attempt=%s delay=%ss err=%s",
+                    bound_sport,
+                    attempt,
+                    delay,
+                    e,
+                )
                 try:
                     await asyncio.wait_for(self._ws_cancel.wait(), timeout=delay)
                 except asyncio.TimeoutError:
@@ -690,77 +818,84 @@ class OddsApiIo:
                 break
             await asyncio.sleep(2.0)
 
-    async def _ws_once(self, sport_param: str) -> None:
+    async def _ws_once(self, bound_sport: str) -> None:
         q = {
             "apiKey": self.api_key,
             "markets": self.markets_ws,
-            "sport": sport_param,
+            "sport": bound_sport,
             "status": "live",
         }
         bm_ws = _ws_bookmakers_query_value(self.bookmakers_csv)
         url = f"{WS_BASE}?{urlencode(q)}&bookmakers={quote(bm_ws, safe=',+')}"
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=None)
         async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS, timeout=timeout) as session:
-            log.info("[odds_api_io] WS connecting sport=%s", sport_param)
+            log.info("[odds_api_io] WS connecting sport=%s", bound_sport)
             async with session.ws_connect(url, heartbeat=30.0) as ws:
-                ws_first_msg_types: set[str] = set()
-                welcome_ok = False
-                while not self._ws_cancel.is_set():
-                    msg = await ws.receive()
-                    if msg.type == WSMsgType.CLOSE or msg.type == WSMsgType.CLOSED:
-                        break
-                    if msg.type == WSMsgType.ERROR:
-                        exc = ws.exception()
-                        if exc:
-                            raise exc
-                        break
-                    if msg.type != WSMsgType.TEXT:
-                        continue
-                    try:
-                        data = json.loads(msg.data)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(data, dict):
-                        continue
-                    typ = str(data.get("type") or "").lower()
-                    if typ and typ not in ws_first_msg_types:
-                        ws_first_msg_types.add(typ)
-                        log.info(
-                            "[odds_api_io] WS_FIRST_MSG type=%s bookie=%s event_id=%s home=%s away=%s",
-                            typ,
-                            str(data.get("bookie") or "").strip(),
-                            str(data.get("id") or "").strip(),
-                            str(data.get("home") or "").strip(),
-                            str(data.get("away") or "").strip(),
-                        )
-                    if typ == "welcome":
-                        welcome_ok = True
-                        bks = data.get("bookmakers") or []
-                        bk_list = list(bks) if isinstance(bks, list) else []
-                        log.info("[odds_api_io] WS_CONNECTED bookmakers=%s", bk_list)
-                        continue
-                    if not welcome_ok:
-                        continue
-                    if typ in ("created", "updated") and not self._raw_logged:
-                        self._raw_logged = True
-                        log.info("[odds_api_io] RAW_MSG %s", json.dumps(data)[:500])
-                    if typ in ("created", "updated"):
-                        eid_w = str(data.get("id") or "").strip()
-                        if eid_w:
-                            start_meta = False
-                            async with self._lock:
-                                prev = self._event_meta_cache.get(eid_w)
-                                need_meta = prev is None or not _event_meta_has_io_sport(prev)
-                                if need_meta and eid_w not in self._event_meta_inflight:
-                                    self._event_meta_inflight.add(eid_w)
-                                    start_meta = True
-                            if start_meta:
-                                await self._fetch_event_meta(session, eid_w)
-                        await self._apply_ws_created_updated(session, data, sport_param, typ)
-                    elif typ == "deleted":
-                        await self._apply_ws_deleted(data)
-                    elif typ == "no_markets":
-                        log.debug("[odds_api_io] no_markets id=%s", data.get("id"))
+                self._ws_current_by_sport[bound_sport] = ws
+                # En cuanto se conecta, marcar last_msg para que el watchdog no dispare durante el handshake.
+                self._ws_last_msg_mono = time.monotonic()
+                try:
+                    ws_first_msg_types: set[str] = set()
+                    welcome_ok = False
+                    while not self._ws_cancel.is_set():
+                        msg = await ws.receive()
+                        # Cualquier mensaje del WS (incluso heartbeats / no-text) cuenta como "vivo".
+                        self._ws_last_msg_mono = time.monotonic()
+                        if msg.type == WSMsgType.CLOSE or msg.type == WSMsgType.CLOSED:
+                            break
+                        if msg.type == WSMsgType.ERROR:
+                            exc = ws.exception()
+                            if exc:
+                                raise exc
+                            break
+                        if msg.type != WSMsgType.TEXT:
+                            continue
+                        # Cuenta de mensajes TEXT (incluso si luego no se parsea bien o no es dict).
+                        self._ws_msgs_text_total += 1
+                        try:
+                            data = json.loads(msg.data)
+                        except json.JSONDecodeError:
+                            self._ws_msgs_by_type["__json_error__"] = (
+                                self._ws_msgs_by_type.get("__json_error__", 0) + 1
+                            )
+                            continue
+                        if not isinstance(data, dict):
+                            self._ws_msgs_by_type["__non_dict__"] = (
+                                self._ws_msgs_by_type.get("__non_dict__", 0) + 1
+                            )
+                            continue
+                        typ = str(data.get("type") or "").lower()
+                        type_key = typ or "__no_type__"
+                        self._ws_msgs_by_type[type_key] = self._ws_msgs_by_type.get(type_key, 0) + 1
+                        if typ and typ not in ws_first_msg_types:
+                            ws_first_msg_types.add(typ)
+                            log.info(
+                                "[odds_api_io] WS_FIRST_MSG type=%s bookie=%s event_id=%s home=%s away=%s",
+                                typ,
+                                str(data.get("bookie") or "").strip(),
+                                str(data.get("id") or "").strip(),
+                                str(data.get("home") or "").strip(),
+                                str(data.get("away") or "").strip(),
+                            )
+                        if typ == "welcome":
+                            welcome_ok = True
+                            bks = data.get("bookmakers") or []
+                            bk_list = list(bks) if isinstance(bks, list) else []
+                            log.info("[odds_api_io] WS_CONNECTED bookmakers=%s", bk_list)
+                            continue
+                        if not welcome_ok:
+                            continue
+                        if typ in ("created", "updated") and not self._raw_logged:
+                            self._raw_logged = True
+                            log.info("[odds_api_io] RAW_MSG %s", json.dumps(data)[:500])
+                        if typ in ("created", "updated"):
+                            await self._apply_ws_created_updated(data, bound_sport, typ)
+                        elif typ == "deleted":
+                            await self._apply_ws_deleted(data)
+                        elif typ == "no_markets":
+                            log.debug("[odds_api_io] no_markets id=%s", data.get("id"))
+                finally:
+                    self._ws_current_by_sport.pop(bound_sport, None)
 
     async def _apply_ws_deleted(self, data: dict[str, Any]) -> None:
         eid = str(data.get("id") or "")
@@ -776,28 +911,47 @@ class OddsApiIo:
             else:
                 self._ws_odds_cache.pop(eid, None)
 
-    async def _apply_ws_created_updated(
-        self, session: aiohttp.ClientSession, data: dict[str, Any], sport_param: str, message_type: str
-    ) -> None:
+    async def _apply_ws_created_updated(self, data: dict[str, Any], bound_sport: str, message_type: str) -> None:
         eid = str(data.get("id") or "")
         bookie = str(data.get("bookie") or "").strip()
         if not eid or not bookie:
             return
         if self._wanted_bookmaker_names and not _bookie_matches_wanted(bookie, self._wanted_bookmaker_names):
+            self._ws_dropped_other_bookie += 1
+            log.debug(
+                "[odds_api_io] WS_DROP_OTHER_BOOKIE event_id=%s bookie=%s wanted=%s",
+                eid,
+                bookie,
+                sorted(self._wanted_bookmaker_names),
+            )
             return
         home = str(data.get("home") or "").strip()
         away = str(data.get("away") or "").strip()
-        sport_guess = _coerce_io_sport_slug(data.get("sport"))
-        meta: dict[str, str] = {}
+        sport_guess = str(bound_sport or "").strip().lower()
+        incoming_sport = _coerce_io_sport_slug(data.get("sport"))
+        if incoming_sport and incoming_sport != sport_guess:
+            log.debug(
+                "[odds_api_io] WS_SPORT_MISMATCH event_id=%s payload=%s bound=%s",
+                eid,
+                incoming_sport,
+                sport_guess,
+            )
         async with self._lock:
-            if eid in self._event_meta_cache:
-                meta = dict(self._event_meta_cache[eid])
-        if not home:
-            home = str(meta.get("home") or "").strip()
-        if not away:
-            away = str(meta.get("away") or "").strip()
-        if not sport_guess:
-            sport_guess = str(meta.get("sport") or "").strip().lower()
+            prev = self._ws_odds_cache.get(eid, {}).get(bookie)
+        if prev is not None:
+            if not home:
+                home = str(prev.home or "").strip()
+            if not away:
+                away = str(prev.away or "").strip()
+        if not home or not away:
+            log.debug(
+                "[odds_api_io] WS_INCOMPLETE event_id=%s bookie=%s home=%r away=%r sport=%r",
+                eid,
+                bookie,
+                home,
+                away,
+                sport_guess,
+            )
         row, upd_at = _ml_first_row(data.get("markets"))
         if row is None:
             return
@@ -830,3 +984,11 @@ class OddsApiIo:
         )
         async with self._lock:
             self._ws_odds_cache.setdefault(eid, {})[bookie] = ev
+        # Marca tick válido y dispara callback (motor latency_arb_sports reacciona al instante).
+        self._ws_last_tick_mono = time.monotonic()
+        cb = self._betfair_tick_callback
+        if cb is not None and home and away and sport_guess:
+            try:
+                await cb(ev)
+            except Exception as e:
+                log.warning("[odds_api_io] tick callback err event_id=%s: %s", eid, e)

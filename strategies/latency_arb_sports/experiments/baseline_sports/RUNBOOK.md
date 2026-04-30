@@ -4,6 +4,23 @@
 
 Paper / laboratorio: comparar probabilidad fair Pinnacle (The Odds API) con mid CLOB Polymarket en mercados deportivos Gamma, con matching explícito y TTL de descubrimiento anti-ban.
 
+## Decisión operativa: Betfair-only (invariante)
+
+Esta estrategia consume **un solo bookmaker** vía `odds-api.io`: **`Betfair Exchange`** (sharp). Está hardcodeado en
+`clients/odds_api_io.py` (`ODDS_API_IO_BOOKMAKERS_EMBEDDED`) y **no se sobreescribe por env** (`ODDS_API_IO_BOOKMAKERS`
+ya no se lee). El precio de Polymarket NUNCA viene de odds-api.io: viene del CLOB nativo (`clients/poly_clob.py`).
+
+Pipeline reactivo: cada **tick Betfair WS** dispara `match Polymarket via Gamma → mid CLOB → SIGNAL/SKIP` antes de
+que Polymarket converja. La SIGNAL solo se permite con `_odds_io_updated_age_sec <= 20s` (ahí es donde la latencia
+Betfair→Polymarket todavía vale dinero).
+
+Counters de salud expuestos en `latency_arb_sports_cycle_metrics.json`:
+- `ws_age_last_msg_sec`, `ws_age_last_tick_sec`: edad del WS Betfair.
+- `bulk_backoff_left_s`, `meta_backoff_left_s`, `rest_quota_used_60min`: salud REST.
+- `tick_dispatch_total/signals/low_edge`, `avg_latency_tick_to_signal_ms`: tick-driven dispatcher.
+- `ws_dropped_other_bookie`: bookies != Betfair filtrados (debería quedar en 0).
+- `ref_health_state`: `REF_OK`, `REF_DEAD_NO_TICKS_WS_LIVE`, `REF_DEAD_NO_TICKS_WS_DEAD`, `REF_UNUSABLE_WS_META_MISSING`.
+
 ## Variables de entorno
 
 - **`ENABLE_EXPERIMENTAL`**: por defecto en `arb_engine.py` es **activo** (`true`) para no depender de variables en Railway. Solo si defines `ENABLE_EXPERIMENTAL=false` el motor queda en 3 estrategias base y **no** cargará `latency_arb_sports` aunque el toggle en la UI esté ON.
