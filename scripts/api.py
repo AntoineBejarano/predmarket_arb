@@ -930,6 +930,10 @@ async def arb_status() -> JSONResponse:
                 row["csv_rows_last_cycle"] = m.get("csv_rows_last_cycle")
                 row["ws_cache_size"] = m.get("ws_cache_size")
                 row["cycle_metrics_updated_at"] = m.get("updated_at")
+                row["briefing_pre_game_distant"] = m.get("briefing_pre_game_distant")
+                row["briefing_within_end_window"] = m.get("briefing_within_end_window")
+                row["briefing_ml_like"] = m.get("briefing_ml_like")
+                row["briefing_io_name_match_cache"] = m.get("briefing_io_name_match_cache")
         strategies.append(row)
     running = False
     with _arb_lock:

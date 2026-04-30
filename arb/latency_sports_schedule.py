@@ -17,7 +17,12 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
-from arb.latency_arb_sports import LatencyArbSportsStrategy, OpenPolymarketGame, _HARDCODE_POLY_SLUGS
+from arb.latency_arb_sports import (
+    LatencyArbSportsStrategy,
+    OpenPolymarketGame,
+    _HARDCODE_POLY_SLUGS,
+    _is_ml_like_open_game,
+)
 
 log = logging.getLogger("latency_sports_schedule")
 _TZ_ES = ZoneInfo("Europe/Madrid")
@@ -77,6 +82,8 @@ def pick_gamma_upcoming(
         if dt < (now - grace):
             continue
         if dt > now + timedelta(days=14):
+            continue
+        if not _is_ml_like_open_game(g):
             continue
         rows.append((dt, g))
     rows.sort(key=lambda x: x[0])

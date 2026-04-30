@@ -38,6 +38,12 @@
       </div>
     </header>
 
+    <section id="briefing-section" class="rounded-xl border border-indigo-900/50 bg-slate-800/50 p-4 space-y-2">
+      <h2 class="text-xs font-semibold text-indigo-300 uppercase tracking-wide">Briefing del último ciclo</h2>
+      <p id="briefing-p1" class="text-sm text-slate-300 leading-relaxed">—</p>
+      <p id="briefing-p2" class="text-sm text-slate-400 leading-relaxed">—</p>
+    </section>
+
     <section class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-9 gap-2 md:gap-3">
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase">Estrategia</p>
@@ -65,7 +71,7 @@
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase leading-tight">Partidos monitorizados</p>
         <p id="k-open-poly" class="font-mono text-base md:text-lg text-cyan-300/90 mt-1">—</p>
-        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">open_poly_games</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">descubrimiento Gamma (bruto)</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase leading-tight">WS cache size</p>
@@ -364,6 +370,52 @@
               .join("");
     }
 
+    function numMetric(v) {
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function renderBriefing(s) {
+      const el1 = document.getElementById("briefing-p1");
+      const el2 = document.getElementById("briefing-p2");
+      if (!el1 || !el2) return;
+      const n = numMetric(s.open_poly_games);
+      const bFar = numMetric(s.briefing_pre_game_distant);
+      const bWin = numMetric(s.briefing_within_end_window);
+      const bMl = numMetric(s.briefing_ml_like);
+      const bIo = numMetric(s.briefing_io_name_match_cache);
+      const pipe = numMetric(s.pipeline_entered_last_cycle);
+      const ref = numMetric(s.reference_aligned_last_cycle);
+      const csv = numMetric(s.csv_rows_last_cycle);
+      if (n == null && bFar == null) {
+        el1.textContent =
+          "Sin métricas del último ciclo. Arranca el motor Arb con esta estrategia habilitada para generar latency_arb_sports_cycle_metrics.json.";
+        el2.textContent = "";
+        return;
+      }
+      el1.textContent =
+        "Gamma (bruto): " +
+        (n != null ? n : "—") +
+        " mercados listados. " +
+        (bFar != null ? bFar : "—") +
+        " excluidos como prematch lejano (endDate >48h). " +
+        (bWin != null ? bWin : "—") +
+        " pasan ese filtro. De ellos, " +
+        (bMl != null ? bMl : "—") +
+        " parecen moneyline (no props Over/Under). " +
+        (bIo != null ? bIo : "—") +
+        " con par por nombres en la caché odds-api del ciclo (solo lectura; no implica REST nuevo).";
+      el2.textContent =
+        "Último ciclo hacia CLOB: pipeline_entered = " +
+        (pipe != null ? pipe : "—") +
+        ", reference_aligned = " +
+        (ref != null ? ref : "—") +
+        ", filas CSV = " +
+        (csv != null ? csv : "—") +
+        ".";
+    }
+
     async function refreshStatus() {
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
@@ -397,6 +449,7 @@
         "pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow transition-transform " +
         (_enabled ? "translate-x-5" : "translate-x-0");
       document.getElementById("toggle-label").textContent = _enabled ? "encendida" : "apagada";
+      renderBriefing(s);
     }
 
     async function toggleEnabled() {

@@ -158,7 +158,8 @@ _SIGNAL_COOLDOWN_SEC = 30.0
 
 # Parámetros fijos de la estrategia (no se leen LATENCY_SPORTS_* ni ODDS_API_IO_SPORTS del entorno).
 # Rutas de datos: ``lab.paths.data_dir()`` (fijo ``<repo>/data``). Siguen por env: POLY_* (CLOB), claves Odds API en clients/odds_api_io.
-_HARDCODE_POLY_SLUGS = "atp,wta,wttmen"
+# Slugs ``sport`` nativos Gamma GET https://gamma-api.polymarket.com/sports (nba, epl, ucl, …).
+_HARDCODE_POLY_SLUGS = "atp,wta,wttmen,nba,epl,ucl"
 _HARDCODE_MIN_EDGE = 0.005
 _HARDCODE_MIN_EDGE_EXEC = 0.005
 _HARDCODE_MAX_STAKE_USDC = 10.0
@@ -191,13 +192,57 @@ POLY_SLUG_TO_ODDS_KEY: dict[str, str] = {
     "wta": "tennis",
     "atp": "tennis",
     "wttmen": "table-tennis",
+    "nba": "basketball",
+    "epl": "football",
+    "ucl": "football",
 }
 
 # odds-api.io slug deporte (OddsEvent.sport) → prefijos esperados en slug Gamma (public-search mezcla deportes).
 _IO_SPORT_TO_GAMMA_SLUG_PREFIXES: dict[str, tuple[str, ...]] = {
     "tennis": ("atp-", "wta-", "wtt-"),
-    "football": ("epl-", "mls-", "ucl-", "uel-", "soccer-", "premier-"),
-    "soccer": ("epl-", "mls-", "ucl-", "uel-", "soccer-", "premier-"),
+    "football": (
+        "epl-",
+        "mls-",
+        "ucl-",
+        "uel-",
+        "soccer-",
+        "premier-",
+        "lal-",
+        "bun-",
+        "fl1-",
+        "sea-",
+        "ere-",
+        "tur-",
+        "mex-",
+        "lib-",
+        "sud-",
+        "con-",
+        "cof-",
+        "afc-",
+        "ofc-",
+        "fif-",
+        "arg-",
+        "itc-",
+        "lcs-",
+        "uef-",
+        "caf-",
+        "rus-",
+        "efa-",
+        "efl-",
+        "acn-",
+    ),
+    "soccer": (
+        "epl-",
+        "mls-",
+        "ucl-",
+        "uel-",
+        "soccer-",
+        "premier-",
+        "lal-",
+        "bun-",
+        "fl1-",
+        "sea-",
+    ),
     "basketball": ("nba-",),
     "american-football": ("nfl-",),
     "ice-hockey": ("nhl-",),
@@ -226,11 +271,13 @@ _ODDS_KEY_TO_IO_SPORT: dict[str, str] = {
 _ODDS_IO_CLIENT_POLY_KEY: dict[str, str] = {
     "tennis": "tennis_wta",
     "table-tennis": "tabletennis_wtt",
+    "basketball": "basketball_nba",
+    "football": "soccer_epl",
 }
 
 
 def _client_poly_key_for_odds_io(odds_key: str, poly_sport_slug: str = "") -> str:
-    """Clave Odds API IO / caché: tennis en Poly va por slug Gamma (atp vs wta)."""
+    """Clave Odds API IO / caché: tennis por slug Gamma (atp vs wta); fútbol ucl/uel vs resto."""
     k = odds_key.strip()
     slug = str(poly_sport_slug).strip().lower()
     if k == "tennis":
@@ -240,6 +287,15 @@ def _client_poly_key_for_odds_io(odds_key: str, poly_sport_slug: str = "") -> st
             return "tennis_wta"
     if k == "table-tennis" and slug == "wttmen":
         return "tabletennis_wtt"
+    if k == "football":
+        if slug == "ucl":
+            return "soccer_uefa_champs_league"
+        if slug == "uel":
+            return "soccer_uefa_europa_league"
+        return "soccer_epl"
+    if k == "basketball":
+        # odds-api.io deporte ``basketball``; clave interna NBA (misma caché REST/WS).
+        return "basketball_nba"
     return _ODDS_IO_CLIENT_POLY_KEY.get(k, k)
 
 
@@ -340,6 +396,58 @@ def _is_pre_game_listing_game(game: OpenPolymarketGame) -> bool:
     if game.end_date is not None and (game.end_date - now).total_seconds() > float(_HARDCODE_PRE_GAME_END_MARGIN_SEC):
         return True
     return False
+
+
+def _is_ml_like_open_game(game: OpenPolymarketGame) -> bool:
+    """Excluye props típicos Over/Under (no moneyline jugador vs jugador). Solo heurística Gamma."""
+    h = (game.home or "").strip().lower()
+    a = (game.away or "").strip().lower()
+    if not h or not a:
+        return False
+    if h in ("over", "under") and a in ("over", "under"):
+        return False
+    oh, oa = "over" in h, "over" in a
+    uh, ua = "under" in h, "under" in a
+    if (oh and ua) or (uh and oa):
+        return False
+    for lab in (h, a):
+        if "over 2.5" in lab or "under 2.5" in lab or "over 1.5" in lab or "under 1.5" in lab:
+            return False
+        if lab.startswith("over ") or lab.startswith("under "):
+            return False
+    return True
+
+
+def _compute_briefing_cycle_counts(
+    open_games: list[OpenPolymarketGame],
+    odds_events_by_key: dict[str, list[OddsEvent]],
+) -> dict[str, int]:
+    """
+    Contadores solo lectura para UI: Gamma + match de nombres contra caché IO ya cargada en el ciclo.
+    No dispara REST adicional.
+    """
+    pre_distant = sum(1 for g in open_games if _is_pre_game_listing_game(g))
+    within = max(0, len(open_games) - pre_distant)
+    ml_like = 0
+    io_name_hit = 0
+    for g in open_games:
+        if _is_pre_game_listing_game(g):
+            continue
+        if not _is_ml_like_open_game(g):
+            continue
+        ml_like += 1
+        odds_key = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
+        if not odds_key:
+            continue
+        evs = odds_events_by_key.get(odds_key) or []
+        if find_event_matching_teams(evs, g.home, g.away) is not None:
+            io_name_hit += 1
+    return {
+        "briefing_pre_game_distant": int(pre_distant),
+        "briefing_within_end_window": int(within),
+        "briefing_ml_like": int(ml_like),
+        "briefing_io_name_match_cache": int(io_name_hit),
+    }
 
 
 @dataclass
@@ -850,6 +958,7 @@ def _infer_poly_slug_from_gamma_slug(gamma_slug: str, poly_slugs_enabled: set[st
         ("epl-", "epl"),
         ("ucl-", "ucl"),
         ("uel-", "uel"),
+        ("lal-", "epl"),
         ("mls-", "epl"),
     ]
     for pref, poly in ordered:
@@ -1374,6 +1483,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
         csv_rows_last_cycle: int,
         ws_cache_size: int,
         pipeline_entered: int,
+        *,
+        briefing_pre_game_distant: int = 0,
+        briefing_within_end_window: int = 0,
+        briefing_ml_like: int = 0,
+        briefing_io_name_match_cache: int = 0,
     ) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
@@ -1389,6 +1503,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "pipeline_entered_last_cycle": int(pipeline_entered),
                 "csv_rows_last_cycle": int(csv_rows_last_cycle),
                 "ws_cache_size": int(ws_cache_size),
+                "briefing_pre_game_distant": int(briefing_pre_game_distant),
+                "briefing_within_end_window": int(briefing_within_end_window),
+                "briefing_ml_like": int(briefing_ml_like),
+                "briefing_io_name_match_cache": int(briefing_io_name_match_cache),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1878,6 +1996,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 pk = _client_poly_key_for_odds_io(ok, g.sport_slug)
                 odds_events_by_key[ok] = self._odds_client.get_cached_odds(pk)
             odds_keys_loaded = {k for k, evs in odds_events_by_key.items() if evs}
+            briefing_counts = _compute_briefing_cycle_counts(open_games, odds_events_by_key)
             processed_condition_ids: set[str] = set()
             match_sem = asyncio.Semaphore(int(_HARDCODE_MATCH_PARALLELISM))
             processed_lock = asyncio.Lock()
@@ -2006,6 +2125,10 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 csv_rows,
                 len(self._odds_client._ws_odds_cache),
                 pipeline_entered,
+                briefing_pre_game_distant=briefing_counts["briefing_pre_game_distant"],
+                briefing_within_end_window=briefing_counts["briefing_within_end_window"],
+                briefing_ml_like=briefing_counts["briefing_ml_like"],
+                briefing_io_name_match_cache=briefing_counts["briefing_io_name_match_cache"],
             )
             await self._drain_poly_followups(clob)
 

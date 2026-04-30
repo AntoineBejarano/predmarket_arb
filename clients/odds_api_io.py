@@ -31,7 +31,8 @@ ODDS_API_IO_CACHE_TTL_EMBEDDED = 300
 # Alineado con el tier típico de la clave (máx. 2 bookies: Betfair + Polymarket). Sharp Exchange → 403 en /odds/multi.
 ODDS_API_IO_BOOKMAKERS_EMBEDDED = "Betfair Exchange,Polymarket"
 ODDS_API_IO_MARKETS_EMBEDDED = "ML"
-ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis"
+# Deportes WS: slugs oficiales GET https://api.odds-api.io/v3/sports (p. ej. basketball, football).
+ODDS_API_IO_SPORTS_EMBEDDED = "tennis,table-tennis,basketball,football"
 
 BASE_REST = "https://api.odds-api.io/v3"
 WS_BASE = "wss://api.odds-api.io/v3/ws"
