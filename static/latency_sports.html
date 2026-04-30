@@ -119,7 +119,8 @@
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase leading-tight">WS cache size</p>
         <p id="k-ws-cache" class="font-mono text-base md:text-lg text-cyan-300/90 mt-1">—</p>
-        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">odds-api.io</p>
+        <p id="k-ws-slots" class="text-[10px] text-slate-600 mt-0.5 leading-tight font-mono">—</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">event_ids IO · slots libro WS</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase leading-tight">Alineados Poly↔odds</p>
@@ -129,7 +130,7 @@
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase leading-tight">Pipeline (últ. ciclo)</p>
         <p id="k-pipeline" class="font-mono text-base md:text-lg text-slate-200 mt-1">—</p>
-        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">entradas a evaluar CLOB</p>
+        <p class="text-[10px] text-slate-600 mt-0.5 leading-tight">BF+OG resuelven Poly↔IO; puede &gt;0 aunque referencia=0 (stale/lag antes del CLOB)</p>
       </div>
       <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 md:p-4">
         <p class="text-xs text-slate-500 uppercase leading-tight">Filas CSV (últ. ciclo)</p>
@@ -144,8 +145,8 @@
           <h2 class="text-sm font-medium text-slate-200">Próximos eventos (Gamma / Polymarket)</h2>
           <p class="text-xs text-slate-500 mt-0.5">
             Hora estimada en <span class="text-slate-400">Europe/Madrid</span> desde metadata Gamma (sin llamadas a
-            odds-api.io). Solo filas con <code class="text-slate-600">kickoff_utc</code> inferido; partidos con kickoff hace
-            &gt;45 min no se listan.
+            odds-api.io).             Solo filas con <code class="text-slate-600">kickoff_utc</code> inferido; partidos con kickoff hace
+            &gt;45 min no se listan. “Hace N min” = ya empezó hace N minutos (no es cuenta atrás hacia el inicio).
           </p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
@@ -160,7 +161,7 @@
             <tr class="bg-slate-800 text-slate-400 uppercase">
               <th class="p-2">Inicio (España)</th>
               <th class="p-2">UTC</th>
-              <th class="p-2">Respecto al inicio</th>
+              <th class="p-2" title="Negativo = kickoff ya pasó (partido en curso si el kickoff es correcto). Se listan hasta ~45 min tras el inicio.">Respecto al inicio</th>
               <th class="p-2">Estado</th>
               <th class="p-2">Liga</th>
               <th class="p-2">Partido</th>
@@ -452,9 +453,9 @@
       el2.textContent =
         "Último ciclo hacia CLOB: pipeline_entered = " +
         (pipe != null ? pipe : "—") +
-        ", reference_aligned = " +
+        " (intentos BF-first + Poly-first con evento IO; no implica que la cuota pasara fresh/stale), reference_aligned = " +
         (ref != null ? ref : "—") +
-        ", filas CSV = " +
+        " (tokens YES/NO alineados y listos para mids), filas CSV = " +
         (csv != null ? csv : "—") +
         ".";
     }
@@ -636,6 +637,15 @@
       document.getElementById("k-trades").textContent = s.fict_trades != null ? "Ops: " + s.fict_trades : "—";
       document.getElementById("k-open-poly").textContent = s.open_poly_games != null ? String(s.open_poly_games) : "—";
       document.getElementById("k-ws-cache").textContent = s.ws_cache_size != null ? String(s.ws_cache_size) : "—";
+      const wss = s.ws_odds_bookmaker_slots;
+      const bff = s.betfair_first_ws_rows;
+      const elWs = document.getElementById("k-ws-slots");
+      if (elWs) {
+        elWs.textContent =
+          wss != null || bff != null
+            ? "slots=" + (wss != null ? wss : "—") + " · bf_ws_rows=" + (bff != null ? bff : "—")
+            : "—";
+      }
       document.getElementById("k-ref-matched").textContent = s.reference_matched != null ? String(s.reference_matched) : "—";
       document.getElementById("k-pipeline").textContent =
         s.pipeline_entered_last_cycle != null ? String(s.pipeline_entered_last_cycle) : "—";

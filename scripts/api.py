@@ -949,6 +949,8 @@ def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
             LATENCY_ARB_SPORTS_SNAPSHOTS_CSV,
             LATENCY_SPORTS_CYCLE_METRICS_JSON,
             LATENCY_SPORTS_SCHEDULE_JSON,
+            LATENCY_SPORTS_PENDING_JSON,
+            DATA_DIR / "logs" / "latency_sports_manual_matches.json",
             ODDS_EVENT_META_CACHE_JSON,
         ]
     )
@@ -996,6 +998,8 @@ async def arb_status() -> JSONResponse:
                 row["pipeline_entered_last_cycle"] = m.get("pipeline_entered_last_cycle")
                 row["csv_rows_last_cycle"] = m.get("csv_rows_last_cycle")
                 row["ws_cache_size"] = m.get("ws_cache_size")
+                row["ws_odds_bookmaker_slots"] = m.get("ws_odds_bookmaker_slots")
+                row["betfair_first_ws_rows"] = m.get("betfair_first_ws_rows")
                 row["cycle_metrics_updated_at"] = m.get("updated_at")
                 row["briefing_pre_game_distant"] = m.get("briefing_pre_game_distant")
                 row["briefing_within_end_window"] = m.get("briefing_within_end_window")

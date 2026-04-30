@@ -932,6 +932,11 @@ def _io_surname_token(name_normalized: str) -> str:
     return parts[-1]
 
 
+def _ws_cache_bookmaker_slots(client: OddsApiIo) -> int:
+    """Filas OddsEvent en caché WS (un evento puede tener varias casas)."""
+    return sum(len(by_bk) for by_bk in client._ws_odds_cache.values())
+
+
 def _flatten_ws_odds_best_per_event(client: OddsApiIo) -> list[OddsEvent]:
     """Un OddsEvent por event_id IO (mejor bookie según prioridad del cliente)."""
     out: list[OddsEvent] = []
@@ -1557,6 +1562,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
         briefing_within_end_window: int = 0,
         briefing_ml_like: int = 0,
         briefing_io_name_match_cache: int = 0,
+        ws_odds_bookmaker_slots: int = 0,
+        betfair_first_ws_rows: int = 0,
     ) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
@@ -1572,6 +1579,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "pipeline_entered_last_cycle": int(pipeline_entered),
                 "csv_rows_last_cycle": int(csv_rows_last_cycle),
                 "ws_cache_size": int(ws_cache_size),
+                "ws_odds_bookmaker_slots": int(ws_odds_bookmaker_slots),
+                "betfair_first_ws_rows": int(betfair_first_ws_rows),
                 "briefing_pre_game_distant": int(briefing_pre_game_distant),
                 "briefing_within_end_window": int(briefing_within_end_window),
                 "briefing_ml_like": int(briefing_ml_like),
@@ -2075,6 +2084,26 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 )
                 if not ws_nonempty:
                     await self._odds_client.refresh_rest_cache(sess, poly_k)
+            # Sin ticks WS para un deporte, get_cached_odds queda vacío salvo REST: el round-robin solo
+            # rellenaba una clave por ciclo → NBA/EPL podían quedar sin candidatos IO. Forzar REST por
+            # cada poly_key distinto con caché vacía y sin WS para ese io_sport.
+            distinct_pk: set[str] = set()
+            for g2 in open_games:
+                ok2 = POLY_SLUG_TO_ODDS_KEY.get(g2.sport_slug)
+                if not ok2:
+                    continue
+                distinct_pk.add(_client_poly_key_for_odds_io(ok2, g2.sport_slug))
+            for pk2 in sorted(distinct_pk):
+                io_pk = poly_odds_key_to_io_sport(pk2)
+                ws_live_pk = bool(
+                    io_pk
+                    and self._odds_client.ws_enabled
+                    and self._odds_client.has_ws_odds_for_io_sport(io_pk)
+                )
+                if ws_live_pk:
+                    continue
+                if not self._odds_client.get_cached_odds(pk2):
+                    await self._odds_client.refresh_rest_cache(sess, pk2)
             for g in open_games:
                 ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
                 if not ok:
@@ -2149,11 +2178,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         int(st.get("csv_rows", 0)),
                     )
 
+            bf_events_list: list[OddsEvent] = []
             if self._odds_client.ws_enabled:
-                bf_events = list(_flatten_ws_odds_best_per_event(self._odds_client))
-                if bf_events:
+                bf_events_list = list(_flatten_ws_odds_best_per_event(self._odds_client))
+                if bf_events_list:
                     bf_results = await asyncio.gather(
-                        *(_process_bf_row(ev) for ev in bf_events),
+                        *(_process_bf_row(ev) for ev in bf_events_list),
                         return_exceptions=True,
                     )
                     for r in bf_results:
@@ -2200,10 +2230,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     )
                 self._ref_debug_done = True
 
+            ws_slots = _ws_cache_bookmaker_slots(self._odds_client)
             log.info(
                 "[latency_arb_sports] cycle #%s regions=%s min_edge_exec=%.4f max_stake=%.2f "
                 "open_poly_games=%s odds_io_keys=%s pipeline_entered=%s reference_aligned=%s csv_rows=%s "
-                "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_cache_size=%s "
+                "discovery_ttl_eff=%.0fs active_window=%s dry_run=%s ws_event_ids=%s ws_bk_slots=%s "
+                "bf_first_ws_rows=%s (pipeline cuenta BF+OG antes de stale/CLOB; ver reference_aligned) "
                 "public_search_http=%s public_search_cache_hits=%s",
                 seq,
                 self.regions,
@@ -2218,6 +2250,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self._is_in_active_window(open_games),
                 self.dry_run,
                 len(self._odds_client._ws_odds_cache),
+                ws_slots,
+                len(bf_events_list),
                 self._cycle_public_search_http,
                 self._cycle_public_search_cache_hits,
             )
@@ -2231,6 +2265,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 briefing_within_end_window=briefing_counts["briefing_within_end_window"],
                 briefing_ml_like=briefing_counts["briefing_ml_like"],
                 briefing_io_name_match_cache=briefing_counts["briefing_io_name_match_cache"],
+                ws_odds_bookmaker_slots=ws_slots,
+                betfair_first_ws_rows=len(bf_events_list),
             )
             await self._drain_poly_followups(clob)
 
