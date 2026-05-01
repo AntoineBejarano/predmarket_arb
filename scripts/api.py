@@ -521,16 +521,71 @@ def _read_latency_sports_pending_matches() -> dict[str, Any]:
         return {"pending": [], "pending_count": 0, "updated_at": None}
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-        return raw if isinstance(raw, dict) else {"pending": [], "pending_count": 0, "updated_at": None}
     except (OSError, json.JSONDecodeError, TypeError):
         return {"pending": [], "pending_count": 0, "updated_at": None}
+    if not isinstance(raw, dict):
+        return {"pending": [], "pending_count": 0, "updated_at": None}
+    from arb.latency_sports_ai_rejects import load_ai_rejected_condition_ids
+
+    rejected = load_ai_rejected_condition_ids()
+    pending_list = raw.get("pending")
+    if not isinstance(pending_list, list) or not rejected:
+        return raw
+    filtered: list[Any] = []
+    hidden = 0
+    for row in pending_list:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("condition_id") or "").strip()
+        if cid and cid in rejected:
+            hidden += 1
+            continue
+        filtered.append(row)
+    out = dict(raw)
+    out["pending"] = filtered
+    out["pending_count"] = len(filtered)
+    if hidden:
+        out["ai_rejected_hidden_in_ui"] = int(hidden)
+    else:
+        out.pop("ai_rejected_hidden_in_ui", None)
+    return out
 
 
 @app.get("/api/arb/latency_sports/pending-matches")
 async def api_latency_sports_pending_matches() -> JSONResponse:
-    """Último snapshot escrito por el motor (sin REST extra). Vacío si el motor no ha corrido."""
+    """Snapshot del motor; oculta en cliente los ``condition_id`` en ``latency_sports_ai_rejected.json`` (IA descarte)."""
     return JSONResponse(
         content=_read_latency_sports_pending_matches(),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
+@app.post("/api/arb/latency_sports/ai-match-run")
+async def api_latency_sports_ai_match_run() -> JSONResponse:
+    """
+    OpenRouter (modelo hardcodeado en código): lee pending matches y escribe
+    ``latency_sports_manual_matches.json`` (upsert si match; borra entrada si reject / sin fila IA / id inválido).
+    """
+    from arb.latency_sports_ai_openrouter import run_openrouter_on_pending
+
+    log.info("POST /api/arb/latency_sports/ai-match-run (OpenRouter matching)")
+    try:
+        out = await run_openrouter_on_pending()
+    except RuntimeError as e:
+        log.warning("ai-match-run RuntimeError: %s", e)
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except Exception as e:
+        log.exception("ai-match-run error")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    log.info(
+        "ai-match-run OK skipped=%s tasks=%s matched=%s deleted_existing=%s",
+        out.get("skipped"),
+        out.get("tasks_count"),
+        out.get("matched"),
+        out.get("deleted_existing"),
+    )
+    return JSONResponse(
+        content=out,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
     )
 
@@ -688,6 +743,17 @@ async def api_latency_sports_manual_match_save(body: LatencySportsManualMatchIn)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return JSONResponse(content={"ok": True, "item": row})
+
+
+@app.delete("/api/arb/latency_sports/ai-reject/{condition_id}")
+async def api_latency_sports_ai_reject_delete(condition_id: str) -> JSONResponse:
+    """Quita un condition_id de la lista IA-descartada para que vuelva a aparecer como pendiente si aplica."""
+    from arb.latency_sports_ai_rejects import clear_ai_reject
+
+    ok = clear_ai_reject(condition_id.strip())
+    if not ok:
+        raise HTTPException(status_code=404, detail="condition_id not in ai rejects")
+    return JSONResponse(content={"ok": True})
 
 
 @app.delete("/api/arb/latency_sports/manual-match/{condition_id}")
@@ -1134,6 +1200,8 @@ async def arb_status() -> JSONResponse:
                 row["rest_bootstrapped"] = m.get("rest_bootstrapped")
                 row["ws_msgs_text_total"] = m.get("ws_msgs_text_total")
                 row["ws_msgs_by_type"] = m.get("ws_msgs_by_type")
+                row["rest_limit_notice"] = m.get("rest_limit_notice")
+                row["rest_limit_reset_left_s"] = m.get("rest_limit_reset_left_s")
                 row["cycle_metrics_updated_at"] = m.get("updated_at")
                 row["briefing_pre_game_distant"] = m.get("briefing_pre_game_distant")
                 row["briefing_within_end_window"] = m.get("briefing_within_end_window")

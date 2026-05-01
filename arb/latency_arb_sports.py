@@ -191,6 +191,8 @@ _HARDCODE_REF_DEAD_NO_TICKS_AGE_SEC = 180.0
 _HARDCODE_REF_DEAD_NO_TICKS_REPEAT_SEC = 300.0
 # Si el WS responde mensajes (heartbeats / no-tick) en este margen, lo consideramos "vivo" aunque no haya ticks.
 _WS_DEAD_LIVE_THRESHOLD_SEC = 60.0
+# Filtro temporal previo al name-match para evitar comparar candidatos de días muy distintos.
+_HARDCODE_ALIGNMENT_TIME_WINDOW_SEC = 36.0 * 3600.0
 
 # Gamma /events con ?sport= no filtra de forma fiable; usamos series_id del GET /sports nativo.
 GAMMA_SPORTS_META_TTL_SEC = 3600.0
@@ -480,6 +482,9 @@ def _build_pending_manual_payload(
     manual_map: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Filas UI: ML-like, no lejano, sin match automático y sin manual resuelto en caché este ciclo."""
+    from arb.latency_sports_ai_rejects import load_ai_rejected_condition_ids
+
+    ai_rejected = load_ai_rejected_condition_ids()
     pending_rows: list[dict[str, Any]] = []
     for g in open_games:
         if _is_pre_game_listing_game(g):
@@ -494,6 +499,8 @@ def _build_pending_manual_payload(
             continue
         cid = (g.condition_id or "").strip()
         if not cid:
+            continue
+        if cid in ai_rejected:
             continue
         mm = manual_map.get(cid) if manual_map else None
         eid_manual = str((mm or {}).get("odds_event_id") or "").strip()
@@ -1191,6 +1198,67 @@ def _align_odds_io_to_game(ev: OddsEvent, game: OpenPolymarketGame) -> Optional[
     return None
 
 
+def _odds_event_kickoff_utc(ev: OddsEvent) -> Optional[datetime]:
+    raw = str(getattr(ev, "event_date_s", "") or "").strip()
+    return _parse_iso_utc(raw)
+
+
+def _filter_odds_candidates_by_time(
+    game: OpenPolymarketGame, events: list[OddsEvent]
+) -> list[OddsEvent]:
+    k0 = game.kickoff_utc
+    if k0 is None:
+        return list(events)
+    out: list[OddsEvent] = []
+    max_dt = float(_HARDCODE_ALIGNMENT_TIME_WINDOW_SEC)
+    for ev in events:
+        k1 = _odds_event_kickoff_utc(ev)
+        if k1 is None:
+            out.append(ev)
+            continue
+        if abs((k1 - k0).total_seconds()) <= max_dt:
+            out.append(ev)
+    return out
+
+
+def _count_name_aligned_candidates(events: list[OddsEvent], poly_home: str, poly_away: str) -> int:
+    ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
+    if not ph or not pa:
+        return 0
+    n = 0
+    for ev in events:
+        if (
+            teams_match_odds_gamma(ph, ev.home)
+            and teams_match_odds_gamma(pa, ev.away)
+        ) or (
+            teams_match_odds_gamma(ph, ev.away)
+            and teams_match_odds_gamma(pa, ev.home)
+        ):
+            n += 1
+    return n
+
+
+def _best_match_summary(events: list[OddsEvent], poly_home: str, poly_away: str) -> tuple[float, str]:
+    ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
+    if not ph or not pa or not events:
+        return 0.0, "no_candidates"
+    best_score = 0.0
+    best_reason = "no_name_match"
+    for ev in events:
+        direct_home = teams_match_odds_gamma(ph, ev.home)
+        direct_away = teams_match_odds_gamma(pa, ev.away)
+        swap_home = teams_match_odds_gamma(ph, ev.away)
+        swap_away = teams_match_odds_gamma(pa, ev.home)
+        if direct_home and direct_away:
+            return 1.0, "name_exact_direct"
+        if swap_home and swap_away:
+            return 1.0, "name_exact_swapped"
+        if direct_home or direct_away or swap_home or swap_away:
+            best_score = max(best_score, 0.5)
+            best_reason = "name_partial"
+    return best_score, best_reason
+
+
 def _map_outcomes_to_tokens(
     g: GammaSportMarket,
     odds_home: str,
@@ -1399,9 +1467,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
 
         async def wrapped(
             self_c: OddsApiIo,
-            session: aiohttp.ClientSession,
             data: dict[str, Any],
-            sport_param: str,
+            bound_sport: str,
             message_type: str,
         ) -> None:
             if isinstance(data, dict):
@@ -1410,7 +1477,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 if eid and bk:
                     dh, da = _depth_pair_from_ws_payload(data)
                     self._io_betfair_depth_last[(eid, bk.casefold())] = (dh, da)
-            return await orig(session, data, sport_param, message_type)
+            return await orig(data, bound_sport, message_type)
 
         c._apply_ws_created_updated = types.MethodType(wrapped, c)
 
@@ -1599,12 +1666,24 @@ class LatencyArbSportsStrategy(ArbStrategy):
         betfair_first_ws_rows: int = 0,
         ws_rows_usable: int = 0,
         ws_rows_missing_meta: int = 0,
+        ws_rows_completed_from_rest: int = 0,
+        meta_cache_hits: int = 0,
         drop_pre_game: int = 0,
         drop_reference_stale: int = 0,
         drop_reference_lag: int = 0,
         drop_alignment_none: int = 0,
         drop_token_map: int = 0,
         ref_health_state: str = "REF_OK",
+        odds_events_total: int = 0,
+        odds_events_by_sport: Optional[dict[str, int]] = None,
+        poly_games_by_sport: Optional[dict[str, int]] = None,
+        candidates_checked_by_sport: Optional[dict[str, int]] = None,
+        candidates_after_time_filter: Optional[dict[str, int]] = None,
+        candidates_after_name_filter: Optional[dict[str, int]] = None,
+        best_match_score: float = 0.0,
+        best_match_reason: str = "",
+        rest_limit_notice: str = "",
+        rest_limit_reset_left_s: float = 0.0,
     ) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
@@ -1636,6 +1715,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "betfair_first_ws_rows": int(betfair_first_ws_rows),
                 "ws_rows_usable": int(ws_rows_usable),
                 "ws_rows_missing_meta": int(ws_rows_missing_meta),
+                "ws_rows_completed_from_rest": int(ws_rows_completed_from_rest),
+                "meta_cache_hits": int(meta_cache_hits),
                 "ws_age_last_msg_sec": (None if ws_age_msg is None else round(float(ws_age_msg), 1)),
                 "ws_age_last_tick_sec": (None if ws_age_tick is None else round(float(ws_age_tick), 1)),
                 "bulk_backoff_left_s": round(float(bulk_left), 1),
@@ -1661,6 +1742,16 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "drop_alignment_none": int(drop_alignment_none),
                 "drop_token_map": int(drop_token_map),
                 "ref_health_state": str(ref_health_state or "REF_OK"),
+                "odds_events_total": int(odds_events_total),
+                "odds_events_by_sport": dict(odds_events_by_sport or {}),
+                "poly_games_by_sport": dict(poly_games_by_sport or {}),
+                "candidates_checked_by_sport": dict(candidates_checked_by_sport or {}),
+                "candidates_after_time_filter": dict(candidates_after_time_filter or {}),
+                "candidates_after_name_filter": dict(candidates_after_name_filter or {}),
+                "best_match_score": round(float(best_match_score), 3),
+                "best_match_reason": str(best_match_reason or ""),
+                "rest_limit_notice": str(rest_limit_notice or ""),
+                "rest_limit_reset_left_s": round(float(rest_limit_reset_left_s or 0.0), 1),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -2148,6 +2239,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 q1_for_miss,
                 q2_for_miss,
             )
+        # Evita "entradas al pipeline" con partidos todavía lejanos (pre-game listing).
+        if game is not None and _is_pre_game_listing_game(game):
+            game = None
 
         self._betfair_gamma_search_cache[eid] = (time.monotonic(), game)
         return game
@@ -2233,6 +2327,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
             odds_events_by_key: dict[str, list[OddsEvent]] = {}
             keys_order: list[str] = []
             cycle_counters = _empty_match_counters()
+            poly_games_by_sport: dict[str, int] = {}
+            for g in open_games:
+                ps = str(g.sport_slug or "").strip().lower()
+                if not ps:
+                    continue
+                poly_games_by_sport[ps] = int(poly_games_by_sport.get(ps, 0)) + 1
             for g in open_games:
                 ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
                 if ok and ok not in keys_order:
@@ -2247,7 +2347,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 ws_nonempty = bool(
                     io_s and self._odds_client.ws_enabled and self._odds_client.has_ws_odds_for_io_sport(io_s)
                 )
-                if not ws_nonempty:
+                ws_incomplete = bool(io_s and self._odds_client.has_ws_incomplete_for_io_sport(io_s))
+                if (not ws_nonempty) or ws_incomplete:
                     await self._odds_client.refresh_rest_cache(sess, poly_k)
             # Sin ticks WS para un deporte, get_cached_odds queda vacío salvo REST: el round-robin solo
             # rellenaba una clave por ciclo → NBA/EPL podían quedar sin candidatos IO. Forzar REST por
@@ -2265,7 +2366,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     and self._odds_client.ws_enabled
                     and self._odds_client.has_ws_odds_for_io_sport(io_pk)
                 )
-                if ws_live_pk:
+                ws_incomplete_pk = bool(io_pk and self._odds_client.has_ws_incomplete_for_io_sport(io_pk))
+                if ws_live_pk and not ws_incomplete_pk:
                     continue
                 if not self._odds_client.get_cached_odds(pk2):
                     await self._odds_client.refresh_rest_cache(sess, pk2)
@@ -2276,7 +2378,15 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 pk = _client_poly_key_for_odds_io(ok, g.sport_slug)
                 odds_events_by_key[ok] = self._odds_client.get_cached_odds(pk)
             odds_keys_loaded = {k for k, evs in odds_events_by_key.items() if evs}
+            odds_events_by_sport = {k: len(v) for k, v in odds_events_by_key.items() if v}
+            odds_events_total = int(sum(odds_events_by_sport.values()))
+            candidates_checked_by_sport: dict[str, int] = {}
+            candidates_after_time_filter_by_sport: dict[str, int] = {}
+            candidates_after_name_filter_by_sport: dict[str, int] = {}
+            best_match_score = 0.0
+            best_match_reason = "no_candidates"
             ws_health = self._odds_client.ws_health_counts()
+            rest_limit = self._odds_client.rest_limit_status()
             if len(self._odds_client._ws_odds_cache) > 0 and len(odds_keys_loaded) == 0:
                 self._ref_unusable_streak += 1
             else:
@@ -2334,6 +2444,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             processed_condition_ids: set[str] = set()
             match_sem = asyncio.Semaphore(int(_HARDCODE_MATCH_PARALLELISM))
             processed_lock = asyncio.Lock()
+            diag_lock = asyncio.Lock()
 
             def _acc_cycle(src: dict[str, int]) -> None:
                 for k in cycle_counters:
@@ -2355,7 +2466,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         processed_condition_ids.add(cid_bf)
                     st_bf = await self._process_matched_poly_odds(sess, clob, game_bf, odds_key_bf, odds_ev)
                     out = _empty_match_counters()
-                    out["pipeline_entered"] = 1
+                    out["pipeline_entered"] = 0 if int(st_bf.get("drop_pre_game", 0)) > 0 else 1
                     for k in out:
                         if k == "pipeline_entered":
                             continue
@@ -2363,6 +2474,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     return out
 
             async def _process_og_row(game: OpenPolymarketGame) -> dict[str, int]:
+                nonlocal best_match_score, best_match_reason
                 async with match_sem:
                     cid_g = (game.condition_id or "").strip()
                     async with processed_lock:
@@ -2372,7 +2484,26 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     if odds_key is None:
                         return _empty_match_counters()
                     events_list = odds_events_by_key.get(odds_key) or []
-                    odds_ev = find_event_matching_teams(events_list, game.home, game.away)
+                    events_time_filtered = _filter_odds_candidates_by_time(game, events_list)
+                    name_candidates = _count_name_aligned_candidates(events_time_filtered, game.home, game.away)
+                    b_score, b_reason = _best_match_summary(events_time_filtered, game.home, game.away)
+                    async with diag_lock:
+                        sport_diag = str(game.sport_slug or "").strip().lower() or "unknown"
+                        candidates_checked_by_sport[sport_diag] = (
+                            int(candidates_checked_by_sport.get(sport_diag, 0)) + int(len(events_list))
+                        )
+                        candidates_after_time_filter_by_sport[sport_diag] = (
+                            int(candidates_after_time_filter_by_sport.get(sport_diag, 0))
+                            + int(len(events_time_filtered))
+                        )
+                        candidates_after_name_filter_by_sport[sport_diag] = (
+                            int(candidates_after_name_filter_by_sport.get(sport_diag, 0)) + int(name_candidates)
+                        )
+                        if b_score >= best_match_score:
+                            best_match_score = float(b_score)
+                            best_match_reason = str(b_reason)
+                    pool_for_match = events_time_filtered if events_time_filtered else events_list
+                    odds_ev = find_event_matching_teams(pool_for_match, game.home, game.away)
                     manual_tw: Optional[tuple[str, float, str, float]] = None
                     if odds_ev is None and cid_g:
                         mm = manual_map.get(cid_g)
@@ -2380,7 +2511,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                             eid = str(mm.get("odds_event_id") or "").strip()
                             swap = bool(mm.get("swap_sides"))
                             if eid:
-                                for ev in events_list:
+                                for ev in pool_for_match:
                                     if str(ev.event_id) == eid:
                                         odds_ev = ev
                                         manual_tw = _manual_tw_from_odds_event(ev, swap)
@@ -2396,7 +2527,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         sess, clob, game, odds_key, odds_ev, manual_tw=manual_tw
                     )
                     out = _empty_match_counters()
-                    out["pipeline_entered"] = 1
+                    out["pipeline_entered"] = 0 if int(st.get("drop_pre_game", 0)) > 0 else 1
                     for k in out:
                         if k == "pipeline_entered":
                             continue
@@ -2439,12 +2570,16 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     odds_events = self._odds_client.get_cached_odds(
                         _client_poly_key_for_odds_io(odds_key, game.sport_slug)
                     )
-                    preview = [f"{ev.home} vs {ev.away}" for ev in odds_events[:3]]
+                    odds_time = _filter_odds_candidates_by_time(game, odds_events)
+                    preview = [f"{ev.home} vs {ev.away}" for ev in odds_time[:3]]
                     log.info(
-                        "[REF_DEBUG] game='%s vs %s' sport=%s odds_io_events=%s",
+                        "[REF_DEBUG] game='%s vs %s' sport=%s candidates_raw=%s candidates_time=%s candidates_name=%s odds_io_events=%s",
                         game.home,
                         game.away,
                         game.sport_slug,
+                        len(odds_events),
+                        len(odds_time),
+                        _count_name_aligned_candidates(odds_time, game.home, game.away),
                         preview,
                     )
                 self._ref_debug_done = True
@@ -2493,6 +2628,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 self._cycle_public_search_http,
                 self._cycle_public_search_cache_hits,
             )
+            log.info(
+                "[latency_arb_sports] align_diag odds_events_total=%s odds_events_by_sport=%s poly_games_by_sport=%s "
+                "candidates_checked_by_sport=%s candidates_after_time_filter=%s candidates_after_name_filter=%s "
+                "best_match_score=%.3f best_match_reason=%s",
+                odds_events_total,
+                json.dumps(odds_events_by_sport, ensure_ascii=False, sort_keys=True),
+                json.dumps(poly_games_by_sport, ensure_ascii=False, sort_keys=True),
+                json.dumps(candidates_checked_by_sport, ensure_ascii=False, sort_keys=True),
+                json.dumps(candidates_after_time_filter_by_sport, ensure_ascii=False, sort_keys=True),
+                json.dumps(candidates_after_name_filter_by_sport, ensure_ascii=False, sort_keys=True),
+                best_match_score,
+                best_match_reason,
+            )
             self._write_cycle_metrics_json(
                 len(open_games),
                 cycle_counters["reference_aligned"],
@@ -2507,12 +2655,24 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 betfair_first_ws_rows=len(bf_events_list),
                 ws_rows_usable=ws_health.get("ws_rows_usable", 0),
                 ws_rows_missing_meta=ws_health.get("ws_rows_missing_meta", 0),
+                ws_rows_completed_from_rest=ws_health.get("ws_rows_completed_from_rest", 0),
+                meta_cache_hits=ws_health.get("meta_cache_hits", 0),
                 drop_pre_game=cycle_counters["drop_pre_game"],
                 drop_reference_stale=cycle_counters["drop_reference_stale"],
                 drop_reference_lag=cycle_counters["drop_reference_lag"],
                 drop_alignment_none=cycle_counters["drop_alignment_none"],
                 drop_token_map=cycle_counters["drop_token_map"],
                 ref_health_state=ref_health_state,
+                odds_events_total=odds_events_total,
+                odds_events_by_sport=odds_events_by_sport,
+                poly_games_by_sport=poly_games_by_sport,
+                candidates_checked_by_sport=candidates_checked_by_sport,
+                candidates_after_time_filter=candidates_after_time_filter_by_sport,
+                candidates_after_name_filter=candidates_after_name_filter_by_sport,
+                best_match_score=best_match_score,
+                best_match_reason=best_match_reason,
+                rest_limit_notice=str(rest_limit.get("rest_limit_notice") or ""),
+                rest_limit_reset_left_s=float(rest_limit.get("rest_limit_reset_left_s") or 0.0),
             )
             await self._drain_poly_followups(clob)
 

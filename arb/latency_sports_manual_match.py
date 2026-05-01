@@ -69,10 +69,16 @@ def upsert_manual_match(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     save_manual_matches(items)
+    try:
+        from arb.latency_sports_ai_rejects import clear_ai_reject
+
+        clear_ai_reject(cid)
+    except Exception:
+        pass
     return items[cid]
 
 
-def delete_manual_match(condition_id: str) -> bool:
+def delete_manual_match(condition_id: str, *, clear_ai_reject: bool = True) -> bool:
     cid = (condition_id or "").strip()
     if not cid:
         return False
@@ -81,6 +87,13 @@ def delete_manual_match(condition_id: str) -> bool:
         return False
     del items[cid]
     save_manual_matches(items)
+    if clear_ai_reject:
+        try:
+            from arb.latency_sports_ai_rejects import clear_ai_reject as _clear_rej
+
+            _clear_rej(cid)
+        except Exception:
+            pass
     return True
 
 

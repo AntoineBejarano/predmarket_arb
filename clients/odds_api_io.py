@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -120,6 +121,10 @@ _WS_WATCHDOG_POLL_SEC = 30.0
 _REST_PER_SPORT_MIN_INTERVAL_SEC = 30.0
 # Si /events sport=X devuelve lista vacía, no insistir durante esta ventana.
 _REST_EMPTY_SPORT_BACKOFF_SEC = 600.0
+# Máximo buffer pendiente por conexión WS para parse incremental.
+_WS_JSON_BUFFER_MAX_BYTES = 1_000_000
+# TTL de metadata event-level (home/away) obtenida por REST /events.
+_EVENT_META_TTL_SEC = 3600.0
 
 
 @dataclass
@@ -133,6 +138,7 @@ class OddsEvent:
     updated_at: str
     event_id: str
     sport: str
+    event_date_s: str = ""
 
 
 def remove_vig(
@@ -253,6 +259,109 @@ def _ml_first_row(markets: Any) -> tuple[Optional[dict[str, Any]], Optional[str]
     return None, None
 
 
+def _extract_home_away_from_event_payload(raw: dict[str, Any]) -> tuple[str, str]:
+    """Extrae home/away desde payload de /events con tolerancia a variantes."""
+    home = str(raw.get("home") or raw.get("home_team") or "").strip()
+    away = str(raw.get("away") or raw.get("away_team") or "").strip()
+    if home and away:
+        return home, away
+    # Variantes típicas: teams/participants como lista de strings o dicts {name}.
+    arr = raw.get("teams")
+    if not isinstance(arr, list) or len(arr) < 2:
+        arr = raw.get("participants")
+    if isinstance(arr, list) and len(arr) >= 2:
+        t0, t1 = arr[0], arr[1]
+        n0 = str(t0.get("name") if isinstance(t0, dict) else t0 or "").strip()
+        n1 = str(t1.get("name") if isinstance(t1, dict) else t1 or "").strip()
+        if n0 and n1:
+            return n0, n1
+    return home, away
+
+
+def _json_prefix_looks_incomplete(buf: str) -> bool:
+    """
+    Heurística: True cuando ``buf`` parece prefijo JSON incompleto (recuperable en siguiente chunk).
+    Evita contar como error casos parciales típicos.
+    """
+    s = buf.lstrip()
+    if not s:
+        return True
+    if s[0] not in "{[":
+        return False
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            continue
+        if ch == "}":
+            if not stack or stack[-1] != "{":
+                return False
+            stack.pop()
+            continue
+        if ch == "]":
+            if not stack or stack[-1] != "[":
+                return False
+            stack.pop()
+            continue
+    return in_str or bool(stack)
+
+
+def _consume_ws_json_buffer(
+    *,
+    buffer: str,
+    chunk: str,
+    max_buffer_size: int = _WS_JSON_BUFFER_MAX_BYTES,
+) -> tuple[list[Any], str, int, Optional[str]]:
+    """
+    Parse incremental para WS:
+    - Soporta 1 JSON por frame, múltiples JSON concatenados y chunks parciales.
+    - Devuelve: (objetos_parseados, buffer_restante, errores_irrecuperables, overflow_prefix).
+    """
+    decoder = json.JSONDecoder()
+    out: list[Any] = []
+    errors = 0
+    overflow_prefix: Optional[str] = None
+    if chunk:
+        buffer += chunk
+    while True:
+        s = buffer.lstrip()
+        if not s:
+            buffer = ""
+            break
+        buffer = s
+        try:
+            obj, idx = decoder.raw_decode(buffer)
+        except json.JSONDecodeError:
+            if _json_prefix_looks_incomplete(buffer):
+                break
+            errors += 1
+            # Basura irrecuperable al inicio: descartar 1 char y reintentar.
+            buffer = buffer[1:]
+            continue
+        out.append(obj)
+        buffer = buffer[idx:]
+    if len(buffer) > int(max_buffer_size):
+        overflow_prefix = buffer[:500]
+        errors += 1
+        buffer = ""
+    return out, buffer, errors, overflow_prefix
+
+
 def _bookie_matches_wanted(bk: str, wanted: frozenset[str]) -> bool:
     """Compara con los nombres configurados (identificadores oficiales /v3/bookmakers), case-insensitive."""
     if not wanted:
@@ -270,6 +379,7 @@ def _oddsevents_from_odds_payload(
     eid = str(payload.get("id") or "")
     home = str(payload.get("home") or "").strip()
     away = str(payload.get("away") or "").strip()
+    event_date_s = str(payload.get("date") or payload.get("commence") or payload.get("startDate") or "").strip()
     out: list[OddsEvent] = []
     bks = payload.get("bookmakers")
     if isinstance(bks, dict):
@@ -307,6 +417,7 @@ def _oddsevents_from_odds_payload(
                 updated_at=upd_at or "",
                 event_id=eid,
                 sport=sport_slug,
+                event_date_s=event_date_s,
             )
         )
     return out
@@ -327,12 +438,16 @@ class OddsApiIo:
         self._lock = asyncio.Lock()
         self._ws_odds_cache: dict[str, dict[str, OddsEvent]] = {}
         self._rest_cache: dict[str, tuple[float, list[OddsEvent]]] = {}
+        # Metadata canónica por event_id desde REST /events: (updated_mono, home, away).
+        self._event_meta_by_id: dict[str, tuple[float, str, str]] = {}
+        # event_id → slug IO (tennis, …) visto en REST; sirve para etiquetar ticks WS sin campo sport.
+        self._event_sport_by_id: dict[str, tuple[float, str]] = {}
         self._ws_runner_task: Optional[asyncio.Task[None]] = None
         self._ws_watchdog_task: Optional[asyncio.Task[None]] = None
         self._ws_cancel = asyncio.Event()
-        # Una conexión activa por sport suscrito.
+        # odds-api.io: **una conexión WebSocket por API key**; varias a la vez cierran la anterior.
+        # Guardamos como máximo un socket activo (clave fija, no es slug de deporte).
         self._ws_current_by_sport: dict[str, aiohttp.ClientWebSocketResponse] = {}
-        self._ws_tasks_by_sport: dict[str, asyncio.Task[None]] = {}
         self._raw_logged = False
         # Backoff bulk REST: /events + /odds/multi (per-sport para que un 429 en tenis no apague basket)
         self._rest_bulk_backoff_until_per_sport: dict[str, float] = {}
@@ -357,6 +472,12 @@ class OddsApiIo:
         self._rest_last_attempt_per_sport: dict[str, float] = {}
         # Sports que devolvieron lista vacía: marcados aquí para no insistir en /odds/multi sin meta-cache.
         self._rest_empty_sport_until: dict[str, float] = {}
+        # Contadores de merge WS + metadata REST.
+        self._meta_cache_hits: int = 0
+        self._ws_rows_completed_from_rest: int = 0
+        # Última señal de cuota/límite REST para mostrar en dashboard.
+        self._last_rest_limit_notice: str = ""
+        self._last_rest_limit_until_mono: float = 0.0
 
     def set_betfair_tick_callback(self, cb: Optional[BetfairTickCallback]) -> None:
         """latency_arb_sports lo conecta para reaccionar al instante a cada tick Betfair válido."""
@@ -372,6 +493,13 @@ class OddsApiIo:
         if not clean:
             clean = [s.strip() for s in ODDS_API_IO_SPORTS_EMBEDDED.split(",") if s.strip()]
         clean = list(dict.fromkeys(clean))
+        if len(clean) > 10:
+            dropped = clean[10:]
+            clean = clean[:10]
+            log.warning(
+                "[odds_api_io] WS: odds-api.io admite como máximo 10 deportes por conexión; omitidos: %s",
+                ",".join(dropped),
+            )
         self._ws_runner_task = asyncio.create_task(self._ws_runner_loop(clean), name="odds_api_io_ws")
         if self._ws_watchdog_task is None or self._ws_watchdog_task.done():
             self._ws_watchdog_task = asyncio.create_task(self._ws_watchdog_loop(), name="odds_api_io_ws_watchdog")
@@ -442,7 +570,7 @@ class OddsApiIo:
 
     async def stop_ws_stream(self) -> None:
         self._ws_cancel.set()
-        for t in (self._ws_runner_task, self._ws_watchdog_task, self._bootstrap_task, *self._ws_tasks_by_sport.values()):
+        for t in (self._ws_runner_task, self._ws_watchdog_task, self._bootstrap_task):
             if t is None:
                 continue
             t.cancel()
@@ -453,7 +581,6 @@ class OddsApiIo:
         self._ws_runner_task = None
         self._ws_watchdog_task = None
         self._bootstrap_task = None
-        self._ws_tasks_by_sport = {}
 
     def ws_age_last_msg_sec(self) -> Optional[float]:
         """Edad (s) del último mensaje WS recibido (tipo cualquiera). None si aún no hay conexión."""
@@ -524,6 +651,45 @@ class OddsApiIo:
             "ws_msgs_by_type": dict(self._ws_msgs_by_type),
         }
 
+    def _remember_rest_limit_notice(self, status: int, where: str, body: str) -> None:
+        if status not in (401, 403, 429):
+            return
+        snippet = re.sub(r"\s+", " ", (body or "").replace("\n", " ").strip())[:220]
+        msg = f"REST {status} en {where}"
+        if snippet:
+            msg = f"{msg}: {snippet}"
+        self._last_rest_limit_notice = msg
+        if status == 429:
+            m = re.search(
+                r"resets?\s+in\s+(\d+)\s+minutes?(?:\s+and\s+(\d+)\s+seconds?)?",
+                body or "",
+                flags=re.I,
+            )
+            if m:
+                mins = int(m.group(1))
+                secs = int(m.group(2) or "0")
+                self._last_rest_limit_until_mono = time.monotonic() + max(0, mins * 60 + secs)
+                return
+        self._last_rest_limit_until_mono = max(
+            self._last_rest_limit_until_mono,
+            time.monotonic() + float(_REST_BULK_BACKOFF_SEC),
+        )
+
+    def rest_limit_status(self) -> dict[str, Any]:
+        now = time.monotonic()
+        left = max(0.0, float(self._last_rest_limit_until_mono - now))
+        if left <= 0.0:
+            return {"rest_limit_notice": "", "rest_limit_reset_left_s": 0.0}
+        msg = str(self._last_rest_limit_notice or "").strip()
+        if not msg:
+            return {"rest_limit_notice": "", "rest_limit_reset_left_s": round(left, 1)}
+        mins = int(left // 60)
+        secs = int(left % 60)
+        return {
+            "rest_limit_notice": f"{msg} · reset aprox en {mins}m {secs}s",
+            "rest_limit_reset_left_s": round(left, 1),
+        }
+
     def _rest_quota_pop_old(self) -> None:
         now = time.monotonic()
         while self._rest_quota_ts and now - self._rest_quota_ts[0] > _REST_QUOTA_WINDOW_SEC:
@@ -548,6 +714,104 @@ class OddsApiIo:
 
     def _set_bulk_backoff_global_auth(self, sec: float = _REST_AUTH_BACKOFF_SEC) -> None:
         self._rest_bulk_backoff_global_until = max(self._rest_bulk_backoff_global_until, time.monotonic() + float(sec))
+
+    def _prune_event_meta_cache(self) -> None:
+        now = time.monotonic()
+        stale: list[str] = []
+        for eid, (ts, _h, _a) in self._event_meta_by_id.items():
+            if now - float(ts) > _EVENT_META_TTL_SEC:
+                stale.append(eid)
+        for eid in stale:
+            self._event_meta_by_id.pop(eid, None)
+
+    def _prune_event_sport_cache(self) -> None:
+        now = time.monotonic()
+        stale: list[str] = []
+        for eid, (ts, _sp) in self._event_sport_by_id.items():
+            if now - float(ts) > _EVENT_META_TTL_SEC:
+                stale.append(eid)
+        for eid in stale:
+            self._event_sport_by_id.pop(eid, None)
+
+    def _remember_event_sport(self, event_id: str, io_sport: str) -> None:
+        eid = str(event_id or "").strip()
+        sp = str(io_sport or "").strip().lower()
+        if not eid or not sp:
+            return
+        self._prune_event_sport_cache()
+        self._event_sport_by_id[eid] = (time.monotonic(), sp)
+
+    def _get_event_sport(self, event_id: str) -> str:
+        self._prune_event_sport_cache()
+        eid = str(event_id or "").strip()
+        row = self._event_sport_by_id.get(eid)
+        if not row:
+            return ""
+        _ts, sp = row
+        return str(sp or "").strip().lower()
+
+    def _set_event_meta(self, event_id: str, home: str, away: str) -> None:
+        eid = str(event_id or "").strip()
+        if not eid:
+            return
+        h = normalize_name_order(str(home or "").strip()) if str(home or "").strip() else ""
+        a = normalize_name_order(str(away or "").strip()) if str(away or "").strip() else ""
+        if not h or not a:
+            return
+        self._event_meta_by_id[eid] = (time.monotonic(), h, a)
+
+    def _get_event_meta(self, event_id: str) -> tuple[str, str]:
+        self._prune_event_meta_cache()
+        eid = str(event_id or "").strip()
+        row = self._event_meta_by_id.get(eid)
+        if not row:
+            return "", ""
+        _ts, home, away = row
+        return home, away
+
+    def _merge_with_event_meta(self, ev: OddsEvent) -> tuple[OddsEvent, bool]:
+        """Rellena home/away desde cache REST por event_id sin tocar odds WS."""
+        home = str(ev.home or "").strip()
+        away = str(ev.away or "").strip()
+        completed = False
+        if home and away:
+            return ev, completed
+        mh, ma = self._get_event_meta(ev.event_id)
+        if mh and ma:
+            self._meta_cache_hits += 1
+            if not home:
+                home = mh
+            if not away:
+                away = ma
+            if home and away:
+                completed = True
+        if not completed:
+            return ev, completed
+        return (
+            OddsEvent(
+                home=home,
+                away=away,
+                home_odds=ev.home_odds,
+                away_odds=ev.away_odds,
+                draw_odds=ev.draw_odds,
+                bookie=ev.bookie,
+                updated_at=ev.updated_at,
+                event_id=ev.event_id,
+                sport=ev.sport,
+                event_date_s=ev.event_date_s,
+            ),
+            completed,
+        )
+
+    def _rest_events_for_sport_slug(self, sport_slug: str) -> list[OddsEvent]:
+        now = time.monotonic()
+        row = self._rest_cache.get(str(sport_slug or "").strip().lower())
+        if not row:
+            return []
+        ts, events = row
+        if now - ts > self.cache_ttl:
+            return []
+        return list(events)
 
     async def _ws_watchdog_loop(self) -> None:
         """Cierra la WS activa si lleva > _WS_IDLE_RESET_SEC sin mensajes (la reabrirá _ws_runner_loop)."""
@@ -583,34 +847,53 @@ class OddsApiIo:
         """Solo lectura de caché; en REST la caché se rellena vía refresh_rest_cache."""
         k = sport.strip().lower()
         sport_slug = str(ODDS_KEY_TO_IO_SPORT.get(k, k)).strip().lower()
-        # WS suele estar suscrito solo a un subconjunto (p. ej. tenis). Si no hay ticks,
-        # seguir con REST para basketball/football/etc. sin apagar el WS global.
-        if self.ws_enabled:
-            ws_events = self._flatten_ws_cache_io_sport(sport_slug)
-            if ws_events:
-                return ws_events
-        now = time.monotonic()
-        row = self._rest_cache.get(sport_slug)
-        if not row:
-            return []
-        ts, events = row
-        if now - ts > self.cache_ttl:
-            return []
-        return list(events)
+        ws_events = self._flatten_ws_cache_io_sport(sport_slug) if self.ws_enabled else []
+        rest_events = self._rest_events_for_sport_slug(sport_slug)
+        by_key: dict[tuple[str, str], OddsEvent] = {}
+        for ev in rest_events:
+            by_key[(str(ev.event_id), str(ev.bookie).casefold())] = ev
+        for ev in ws_events:
+            by_key[(str(ev.event_id), str(ev.bookie).casefold())] = ev
+        out: list[OddsEvent] = []
+        completed = 0
+        for ev in by_key.values():
+            mev, was_completed = self._merge_with_event_meta(ev)
+            out.append(mev)
+            if was_completed:
+                completed += 1
+        if completed > 0:
+            self._ws_rows_completed_from_rest += int(completed)
+        out.sort(key=lambda e: (self._bookie_priority(e.bookie), e.event_id))
+        return out
 
     def has_ws_odds_for_io_sport(self, io_sport: str) -> bool:
         """True si hay al menos un tick WS en caché para el slug IO (p. ej. tennis)."""
         return len(self._flatten_ws_cache_io_sport(str(io_sport or "").strip().lower())) > 0
+
+    def has_ws_incomplete_for_io_sport(self, io_sport: str) -> bool:
+        """True si hay filas WS del sport con home/away vacíos incluso tras merge con cache REST."""
+        events = self._flatten_ws_cache_io_sport(str(io_sport or "").strip().lower())
+        if not events:
+            return False
+        for ev in events:
+            mev, _ = self._merge_with_event_meta(ev)
+            if not (mev.home or "").strip() or not (mev.away or "").strip():
+                return True
+        return False
 
     def ws_health_counts(self) -> dict[str, int]:
         """Diagnóstico WS: filas utilizables vs filas incompletas (home/away)."""
         total = 0
         usable = 0
         missing_meta = 0
+        completed_from_rest = 0
         for by_bk in self._ws_odds_cache.values():
             for ev in by_bk.values():
                 total += 1
-                has_meta = bool((ev.home or "").strip() and (ev.away or "").strip())
+                mev, completed = self._merge_with_event_meta(ev)
+                if completed:
+                    completed_from_rest += 1
+                has_meta = bool((mev.home or "").strip() and (mev.away or "").strip())
                 if has_meta:
                     usable += 1
                 else:
@@ -619,6 +902,9 @@ class OddsApiIo:
             "ws_rows_total": int(total),
             "ws_rows_usable": int(usable),
             "ws_rows_missing_meta": int(missing_meta),
+            "ws_rows_completed_from_rest": int(completed_from_rest),
+            "meta_cache_entries": int(len(self._event_meta_by_id)),
+            "meta_cache_hits": int(self._meta_cache_hits),
         }
 
     def _flatten_ws_cache_io_sport(self, sport_slug: str) -> list[OddsEvent]:
@@ -692,6 +978,8 @@ class OddsApiIo:
             async with self._lock:
                 self._rest_cache[io_sport] = (time.monotonic(), [])
             return
+        for row in events_rows:
+            self._set_event_meta(row.event_id, row.home, row.away)
         async with self._lock:
             self._rest_cache[io_sport] = (time.monotonic(), events_rows)
 
@@ -704,6 +992,7 @@ class OddsApiIo:
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
+                self._remember_rest_limit_notice(resp.status, f"GET /events sport={io_sport}", text)
                 if resp.status in (401, 403):
                     self._set_bulk_backoff_global_auth(_REST_AUTH_BACKOFF_SEC)
                 _raise_if_rest_quota_error(resp.status, text, f"GET /events sport={io_sport}")
@@ -715,6 +1004,11 @@ class OddsApiIo:
         for ev in evs:
             if not isinstance(ev, dict):
                 continue
+            eid_raw = ev.get("id")
+            eid = str(eid_raw).strip() if eid_raw is not None else ""
+            if eid:
+                h_raw, a_raw = _extract_home_away_from_event_payload(ev)
+                self._set_event_meta(eid, h_raw, a_raw)
             eid = ev.get("id")
             if eid is not None:
                 ids.append(str(eid))
@@ -733,6 +1027,9 @@ class OddsApiIo:
             chunk = ids[i : i + 10]
             multi = await self._rest_odds_multi(session, chunk, io_sport)
             out.extend(multi)
+        for row in out:
+            if row.event_id:
+                self._remember_event_sport(row.event_id, row.sport or io_sport)
         return out
 
     async def _rest_odds_multi(
@@ -750,6 +1047,7 @@ class OddsApiIo:
         ) as resp:
             text = await resp.text()
             if resp.status != 200:
+                self._remember_rest_limit_notice(resp.status, "GET /odds/multi", text)
                 if resp.status in (401, 403):
                     self._set_bulk_backoff_global_auth(_REST_AUTH_BACKOFF_SEC)
                 _raise_if_rest_quota_error(resp.status, text, "GET /odds/multi")
@@ -769,28 +1067,24 @@ class OddsApiIo:
         return rows
 
     async def _ws_runner_loop(self, sports: list[str]) -> None:
-        # Un loop independiente por sport para que cada mensaje quede etiquetado por canal.
-        self._ws_tasks_by_sport = {
-            sport_slug: asyncio.create_task(
-                self._ws_sport_loop(sport_slug),
-                name=f"odds_api_io_ws_{sport_slug}",
-            )
-            for sport_slug in sports
-        }
+        # Documentación odds-api.io: una conexión WS por API key; deportes en un único query `sport=a,b,c`.
+        sport_q = ",".join(sports)
+        ws_task = asyncio.create_task(
+            self._ws_sport_loop(sport_q),
+            name="odds_api_io_ws_live",
+        )
         try:
             await self._ws_cancel.wait()
         finally:
-            for t in self._ws_tasks_by_sport.values():
-                t.cancel()
-            await asyncio.gather(*self._ws_tasks_by_sport.values(), return_exceptions=True)
-            self._ws_tasks_by_sport = {}
+            ws_task.cancel()
+            await asyncio.gather(ws_task, return_exceptions=True)
 
-    async def _ws_sport_loop(self, bound_sport: str) -> None:
+    async def _ws_sport_loop(self, bound_sport_csv: str) -> None:
         attempt = 0
         backoff_i = 0
         while not self._ws_cancel.is_set():
             try:
-                await self._ws_once(bound_sport)
+                await self._ws_once(bound_sport_csv)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -802,7 +1096,7 @@ class OddsApiIo:
                     backoff_i += 1
                 log.warning(
                     "[odds_api_io] WS_RECONNECT sport=%s attempt=%s delay=%ss err=%s",
-                    bound_sport,
+                    bound_sport_csv,
                     attempt,
                     delay,
                     e,
@@ -818,25 +1112,27 @@ class OddsApiIo:
                 break
             await asyncio.sleep(2.0)
 
-    async def _ws_once(self, bound_sport: str) -> None:
+    async def _ws_once(self, bound_sport_csv: str) -> None:
         q = {
             "apiKey": self.api_key,
             "markets": self.markets_ws,
-            "sport": bound_sport,
+            "sport": bound_sport_csv,
             "status": "live",
         }
         bm_ws = _ws_bookmakers_query_value(self.bookmakers_csv)
         url = f"{WS_BASE}?{urlencode(q)}&bookmakers={quote(bm_ws, safe=',+')}"
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=None)
+        _WS_CONN_KEY = "__live__"
         async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS, timeout=timeout) as session:
-            log.info("[odds_api_io] WS connecting sport=%s", bound_sport)
+            log.info("[odds_api_io] WS connecting sport=%s", bound_sport_csv)
             async with session.ws_connect(url, heartbeat=30.0) as ws:
-                self._ws_current_by_sport[bound_sport] = ws
+                self._ws_current_by_sport[_WS_CONN_KEY] = ws
                 # En cuanto se conecta, marcar last_msg para que el watchdog no dispare durante el handshake.
                 self._ws_last_msg_mono = time.monotonic()
                 try:
                     ws_first_msg_types: set[str] = set()
                     welcome_ok = False
+                    ws_json_buffer = ""
                     while not self._ws_cancel.is_set():
                         msg = await ws.receive()
                         # Cualquier mensaje del WS (incluso heartbeats / no-text) cuenta como "vivo".
@@ -850,52 +1146,75 @@ class OddsApiIo:
                             break
                         if msg.type != WSMsgType.TEXT:
                             continue
-                        # Cuenta de mensajes TEXT (incluso si luego no se parsea bien o no es dict).
+                        # Cuenta de frames TEXT recibidos.
                         self._ws_msgs_text_total += 1
-                        try:
-                            data = json.loads(msg.data)
-                        except json.JSONDecodeError:
+                        objs, ws_json_buffer, parse_errors, overflow_prefix = _consume_ws_json_buffer(
+                            buffer=ws_json_buffer,
+                            chunk=str(msg.data or ""),
+                        )
+                        if parse_errors:
                             self._ws_msgs_by_type["__json_error__"] = (
-                                self._ws_msgs_by_type.get("__json_error__", 0) + 1
+                                self._ws_msgs_by_type.get("__json_error__", 0) + int(parse_errors)
                             )
-                            continue
-                        if not isinstance(data, dict):
-                            self._ws_msgs_by_type["__non_dict__"] = (
-                                self._ws_msgs_by_type.get("__non_dict__", 0) + 1
+                        if overflow_prefix is not None:
+                            log.warning(
+                                "[odds_api_io] WS_JSON_BUFFER_OVERFLOW sport=%s size>%s prefix=%r",
+                                bound_sport_csv,
+                                _WS_JSON_BUFFER_MAX_BYTES,
+                                overflow_prefix,
                             )
-                            continue
-                        typ = str(data.get("type") or "").lower()
-                        type_key = typ or "__no_type__"
-                        self._ws_msgs_by_type[type_key] = self._ws_msgs_by_type.get(type_key, 0) + 1
-                        if typ and typ not in ws_first_msg_types:
-                            ws_first_msg_types.add(typ)
-                            log.info(
-                                "[odds_api_io] WS_FIRST_MSG type=%s bookie=%s event_id=%s home=%s away=%s",
-                                typ,
+                        log.debug(
+                            "[odds_api_io] WS_JSON_CHUNK sport=%s objs=%s buffer_left=%s parse_errors=%s",
+                            bound_sport_csv,
+                            len(objs),
+                            len(ws_json_buffer),
+                            int(parse_errors),
+                        )
+                        for data in objs:
+                            if not isinstance(data, dict):
+                                self._ws_msgs_by_type["__non_dict__"] = (
+                                    self._ws_msgs_by_type.get("__non_dict__", 0) + 1
+                                )
+                                continue
+                            log.debug(
+                                "[odds_api_io] WS_JSON_OBJ sport=%s type=%s bookie=%s event_id=%s",
+                                bound_sport_csv,
+                                str(data.get("type") or "").lower(),
                                 str(data.get("bookie") or "").strip(),
-                                str(data.get("id") or "").strip(),
-                                str(data.get("home") or "").strip(),
-                                str(data.get("away") or "").strip(),
+                                str(data.get("id") or data.get("event_id") or "").strip(),
                             )
-                        if typ == "welcome":
-                            welcome_ok = True
-                            bks = data.get("bookmakers") or []
-                            bk_list = list(bks) if isinstance(bks, list) else []
-                            log.info("[odds_api_io] WS_CONNECTED bookmakers=%s", bk_list)
-                            continue
-                        if not welcome_ok:
-                            continue
-                        if typ in ("created", "updated") and not self._raw_logged:
-                            self._raw_logged = True
-                            log.info("[odds_api_io] RAW_MSG %s", json.dumps(data)[:500])
-                        if typ in ("created", "updated"):
-                            await self._apply_ws_created_updated(data, bound_sport, typ)
-                        elif typ == "deleted":
-                            await self._apply_ws_deleted(data)
-                        elif typ == "no_markets":
-                            log.debug("[odds_api_io] no_markets id=%s", data.get("id"))
+                            typ = str(data.get("type") or "").lower()
+                            type_key = typ or "__no_type__"
+                            self._ws_msgs_by_type[type_key] = self._ws_msgs_by_type.get(type_key, 0) + 1
+                            if typ and typ not in ws_first_msg_types:
+                                ws_first_msg_types.add(typ)
+                                log.info(
+                                    "[odds_api_io] WS_FIRST_MSG type=%s bookie=%s event_id=%s home=%s away=%s",
+                                    typ,
+                                    str(data.get("bookie") or "").strip(),
+                                    str(data.get("id") or "").strip(),
+                                    str(data.get("home") or "").strip(),
+                                    str(data.get("away") or "").strip(),
+                                )
+                            if typ == "welcome":
+                                welcome_ok = True
+                                bks = data.get("bookmakers") or []
+                                bk_list = list(bks) if isinstance(bks, list) else []
+                                log.info("[odds_api_io] WS_CONNECTED bookmakers=%s", bk_list)
+                                continue
+                            if not welcome_ok:
+                                continue
+                            if typ in ("created", "updated") and not self._raw_logged:
+                                self._raw_logged = True
+                                log.info("[odds_api_io] RAW_MSG %s", json.dumps(data)[:500])
+                            if typ in ("created", "updated"):
+                                await self._apply_ws_created_updated(data, bound_sport_csv, typ)
+                            elif typ == "deleted":
+                                await self._apply_ws_deleted(data)
+                            elif typ == "no_markets":
+                                log.debug("[odds_api_io] no_markets id=%s", data.get("id"))
                 finally:
-                    self._ws_current_by_sport.pop(bound_sport, None)
+                    self._ws_current_by_sport.pop(_WS_CONN_KEY, None)
 
     async def _apply_ws_deleted(self, data: dict[str, Any]) -> None:
         eid = str(data.get("id") or "")
@@ -911,7 +1230,7 @@ class OddsApiIo:
             else:
                 self._ws_odds_cache.pop(eid, None)
 
-    async def _apply_ws_created_updated(self, data: dict[str, Any], bound_sport: str, message_type: str) -> None:
+    async def _apply_ws_created_updated(self, data: dict[str, Any], bound_sport_csv: str, message_type: str) -> None:
         eid = str(data.get("id") or "")
         bookie = str(data.get("bookie") or "").strip()
         if not eid or not bookie:
@@ -927,14 +1246,24 @@ class OddsApiIo:
             return
         home = str(data.get("home") or "").strip()
         away = str(data.get("away") or "").strip()
-        sport_guess = str(bound_sport or "").strip().lower()
         incoming_sport = _coerce_io_sport_slug(data.get("sport"))
-        if incoming_sport and incoming_sport != sport_guess:
+        from_rest = self._get_event_sport(eid)
+        query_slugs = [s.strip().lower() for s in (bound_sport_csv or "").split(",") if s.strip()]
+        sport_resolved = incoming_sport or from_rest or ""
+        if not sport_resolved and len(query_slugs) == 1:
+            sport_resolved = query_slugs[0]
+        if incoming_sport:
+            self._remember_event_sport(eid, incoming_sport)
+        elif from_rest:
+            pass
+        elif sport_resolved:
+            self._remember_event_sport(eid, sport_resolved)
+        if incoming_sport and query_slugs and incoming_sport not in query_slugs:
             log.debug(
-                "[odds_api_io] WS_SPORT_MISMATCH event_id=%s payload=%s bound=%s",
+                "[odds_api_io] WS_SPORT_MISMATCH event_id=%s payload=%s query=%s",
                 eid,
                 incoming_sport,
-                sport_guess,
+                bound_sport_csv,
             )
         async with self._lock:
             prev = self._ws_odds_cache.get(eid, {}).get(bookie)
@@ -943,6 +1272,8 @@ class OddsApiIo:
                 home = str(prev.home or "").strip()
             if not away:
                 away = str(prev.away or "").strip()
+            if not sport_resolved:
+                sport_resolved = str(prev.sport or "").strip().lower()
         if not home or not away:
             log.debug(
                 "[odds_api_io] WS_INCOMPLETE event_id=%s bookie=%s home=%r away=%r sport=%r",
@@ -950,7 +1281,7 @@ class OddsApiIo:
                 bookie,
                 home,
                 away,
-                sport_guess,
+                sport_resolved or bound_sport_csv,
             )
         row, upd_at = _ml_first_row(data.get("markets"))
         if row is None:
@@ -971,6 +1302,8 @@ class OddsApiIo:
             home = normalize_name_order(home)
         if away:
             away = normalize_name_order(away)
+        if home and away:
+            self._set_event_meta(eid, home, away)
         ev = OddsEvent(
             home=home,
             away=away,
@@ -980,14 +1313,17 @@ class OddsApiIo:
             bookie=bookie,
             updated_at=upd_at or "",
             event_id=eid,
-            sport=sport_guess or "",
+            sport=sport_resolved or "",
+            event_date_s=str(data.get("date") or data.get("commence") or data.get("startDate") or "").strip(),
         )
         async with self._lock:
             self._ws_odds_cache.setdefault(eid, {})[bookie] = ev
+        if sport_resolved:
+            self._remember_event_sport(eid, sport_resolved)
         # Marca tick válido y dispara callback (motor latency_arb_sports reacciona al instante).
         self._ws_last_tick_mono = time.monotonic()
         cb = self._betfair_tick_callback
-        if cb is not None and home and away and sport_guess:
+        if cb is not None and home and away and sport_resolved:
             try:
                 await cb(ev)
             except Exception as e:

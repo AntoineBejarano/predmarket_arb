@@ -48,6 +48,7 @@
         <span class="text-slate-400">WS msg: <span id="capture-age-msg" class="text-slate-200 font-mono">—</span></span>
         <span class="text-slate-400">WS tick: <span id="capture-age-tick" class="text-slate-200 font-mono">—</span></span>
         <span class="text-slate-400">REST bulk backoff: <span id="capture-bulk" class="text-slate-200 font-mono">—</span></span>
+        <span class="text-slate-400">REST límite: <span id="capture-rest-limit" class="text-amber-200 font-mono">—</span></span>
         <span class="text-slate-400">REST quota 60min: <span id="capture-quota" class="text-slate-200 font-mono">—</span></span>
         <span class="text-slate-400">Tick dispatch: <span id="capture-dispatch" class="text-slate-200 font-mono">—</span></span>
       </div>
@@ -112,8 +113,17 @@
           Lista <strong class="text-slate-400">pendiente</strong>: mercados Gamma tipo moneyline (sin match automático de nombres en la caché IO del último ciclo del motor).
           Elige el evento IO de la lista, marca invertir si el local/visitante va cruzado, y pulsa <strong class="text-slate-400">Aprobar</strong>: el motor lo usará en el siguiente ciclo igual que un match automático (misma lógica CLOB / edge / dry o live).
           Sin candidatos = la caché IO aún no trae filas para ese deporte en ese ciclo.
+          Si la IA descarta un partido, deja de listarse aquí (se guarda en <code class="text-slate-600">latency_sports_ai_rejected.json</code>; borrar entrada o <code class="text-slate-600">DELETE /api/arb/latency_sports/ai-reject/&lt;condition_id&gt;</code> lo revierte).
         </p>
         <p id="pending-mm-meta" class="text-[11px] text-slate-600 font-mono mt-1">—</p>
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <button type="button" onclick="runAiManualMatch({ skipConfirm: false })"
+            class="text-xs px-3 py-1.5 rounded-lg bg-violet-700 hover:bg-violet-600 text-white border border-violet-500/40">
+            IA OpenRouter: matchear / descartar en JSON
+          </button>
+          <span class="text-[10px] text-slate-500 max-w-xl leading-snug">Lee el snapshot pending actual y actualiza <code class="text-slate-600">manual_matches</code> (upsert o borra según la IA). Irreversible en un clic.</span>
+        </div>
+        <p id="ai-mm-status" class="text-[11px] text-violet-200/90 font-mono mt-2 min-h-[1.25rem] whitespace-pre-wrap">—</p>
       </div>
       <div class="overflow-x-auto rounded-lg border border-slate-700">
         <table class="w-full text-xs text-left min-w-[960px]">
@@ -570,6 +580,19 @@
     }
 
     var _pendingMmRows = [];
+    /** Evita recursión refresh → IA → refresh. */
+    var _latencySportsSkipAutoAi = false;
+    /** Una sola auto-execución por pestaña al ver pending por primera vez. */
+    var _latencySportsAiAutoOnce = false;
+
+    function setAiMmStatus(text, isErr) {
+      const el = document.getElementById("ai-mm-status");
+      if (!el) return;
+      el.textContent = text || "—";
+      el.className =
+        "text-[11px] font-mono mt-2 min-h-[1.25rem] whitespace-pre-wrap " +
+        (isErr ? "text-red-300/90" : "text-violet-200/90");
+    }
 
     async function refreshManualMatchPanels() {
       const tbP = document.getElementById("pending-mm-tbody");
@@ -589,9 +612,11 @@
       const rows = Array.isArray(pend.pending) ? pend.pending : [];
       _pendingMmRows = rows;
       if (meta) {
+        var hid = pend.ai_rejected_hidden_in_ui != null ? " · ocultos_ia=" + pend.ai_rejected_hidden_in_ui : "";
         meta.textContent =
           "pending_count=" +
           (pend.pending_count != null ? pend.pending_count : rows.length) +
+          hid +
           " · updated_at=" +
           (pend.updated_at || "—");
       }
@@ -672,6 +697,82 @@
             );
           })
           .join("");
+      }
+      if (!_latencySportsSkipAutoAi && rows.length > 0 && !_latencySportsAiAutoOnce) {
+        _latencySportsAiAutoOnce = true;
+        setAiMmStatus("IA: ejecutando automático (primera carga con pendientes)…", false);
+        await runAiManualMatch({ skipConfirm: true, auto: true });
+      }
+    }
+
+    async function runAiManualMatch(opts) {
+      opts = opts || {};
+      var skipConfirm = !!opts.skipConfirm;
+      var isAuto = !!opts.auto;
+      if (
+        !skipConfirm &&
+        !confirm(
+          "Se enviará el pending actual a OpenRouter y se escribirá en latency_sports_manual_matches.json " +
+            "(enlace válido = guardar; sin match / rechazo / error de id = borrar enlace si existía). ¿Continuar?"
+        )
+      ) {
+        return;
+      }
+      if (!isAuto) setAiMmStatus("IA: llamando a OpenRouter…", false);
+      try {
+        const r = await fetch("/api/arb/latency_sports/ai-match-run", {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        const t = await r.text();
+        let j = {};
+        try {
+          j = JSON.parse(t);
+        } catch (e) {}
+        if (!r.ok) {
+          var errLine = "Error " + r.status + ": " + (j.detail || t);
+          setAiMmStatus(errLine, true);
+          alert(errLine);
+          return;
+        }
+        const summary =
+          new Date().toISOString() +
+          " · ok=" +
+          j.ok +
+          " skipped=" +
+          (j.skipped != null ? j.skipped : "—") +
+          (j.reason ? " reason=" + j.reason : "") +
+          " model=" +
+          (j.openrouter_model || "—") +
+          " tasks=" +
+          (j.tasks_count != null ? j.tasks_count : "—") +
+          " matched=" +
+          (j.matched != null ? j.matched : "—") +
+          " delete_calls=" +
+          (j.delete_calls != null ? j.delete_calls : "—") +
+          " deleted_existing=" +
+          (j.deleted_existing != null ? j.deleted_existing : "—") +
+          " ai_rows=" +
+          (j.ai_decision_rows != null ? j.ai_decision_rows : "—") +
+          " finish=" +
+          (j.openrouter_finish_reason != null && j.openrouter_finish_reason !== ""
+            ? j.openrouter_finish_reason
+            : "—") +
+          " rejects_saved=" +
+          (j.ai_rejects_recorded != null ? j.ai_rejects_recorded : "—");
+        setAiMmStatus(summary, false);
+        if (!isAuto) {
+          alert(summary + "\n\nLogs API: líneas [latency_sports_ai] y ai-match-run.");
+        }
+        _latencySportsSkipAutoAi = true;
+        try {
+          await refreshManualMatchPanels();
+        } finally {
+          _latencySportsSkipAutoAi = false;
+        }
+      } catch (e) {
+        setAiMmStatus(String(e), true);
+        alert(String(e));
       }
     }
 
@@ -817,6 +918,12 @@
       setText(
         "capture-bulk",
         s.bulk_backoff_left_s == null ? "—" : Number(s.bulk_backoff_left_s).toFixed(0) + "s"
+      );
+      setText(
+        "capture-rest-limit",
+        s.rest_limit_notice && String(s.rest_limit_notice).trim()
+          ? String(s.rest_limit_notice)
+          : "—"
       );
       setText(
         "capture-quota",
