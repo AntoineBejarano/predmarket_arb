@@ -53,9 +53,44 @@ def remove_vig(
 def normalize_team_label(s: str) -> str:
     s = unicodedata.normalize("NFKD", (s or "").strip().lower())
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^\w\s]+", " ", s, flags=re.UNICODE)
     s = " ".join(s.split())
     return s
 
+
+def sport_tags_from_hint(sport_slug: Optional[str]) -> frozenset[str]:
+    """Etiquetas gruesas para desambiguar alias (p. ej. Spurs NBA vs EPL)."""
+    if not sport_slug:
+        return frozenset()
+    sl = str(sport_slug).strip().lower()
+    tags: set[str] = set()
+    if "nba" in sl or sl in ("basketball", "basketball_nba"):
+        tags.add("nba")
+    if "epl" in sl or "premier" in sl or sl == "soccer_epl":
+        tags.add("epl")
+        tags.add("soccer")
+    if sl.startswith("soccer_") or sl in ("football", "soccer", "soccer_uefa_champs_league", "soccer_uefa_europa_league"):
+        tags.add("soccer")
+    if sl in ("ice-hockey", "icehockey_nhl"):
+        tags.add("nhl")
+    return frozenset(tags)
+
+
+# Grupos de tokens sinónimos: (tokens, tags_requeridos) tags_requeridos=None → siempre si hay intersección.
+# tags_requeridos no vacío → se aplica solo si sport_tags_from_hint ∩ tags_requeridos ≠ ∅.
+_TOKEN_SYNONYM_GROUPS: list[tuple[frozenset[str], Optional[frozenset[str]]]] = [
+    (frozenset({"cleveland", "cavaliers", "cavs", "cle", "clevelandcavaliers"}), None),
+    (frozenset({"toronto", "raptors", "tor", "torontoraptors"}), None),
+    (frozenset({"manchester", "united", "man", "utd", "manutd", "manchesterunited", "manunited"}), frozenset({"epl", "soccer"})),
+    (frozenset({"tottenham", "spurs", "hotspur", "tottenhamhotspur"}), frozenset({"epl", "soccer"})),
+    (frozenset({"san", "antonio", "spurs", "sanantonio"}), frozenset({"nba"})),
+    (frozenset({"manchester", "city", "mancity", "manc", "manchestercity"}), frozenset({"epl", "soccer"})),
+    (frozenset({"west", "ham", "westham", "whu"}), frozenset({"epl", "soccer"})),
+    (frozenset({"nottingham", "forest", "nottm", "nffc"}), frozenset({"epl", "soccer"})),
+    (frozenset({"wolverhampton", "wanderers", "wolves", "wwfc"}), frozenset({"epl", "soccer"})),
+    (frozenset({"brighton", "hove", "albion", "bha"}), frozenset({"epl", "soccer"})),
+    (frozenset({"newcastle", "nufc"}), frozenset({"epl", "soccer"})),
+]
 
 # Odds API nombres largos → nicknames tipo Gamma (Odds largo / Gamma corto).
 _ALIAS_MAP: dict[str, str] = {
@@ -113,11 +148,13 @@ _ALIAS_MAP: dict[str, str] = {
     "bournemouth fc": "bournemouth",
     "aston villa": "aston villa",
     "liverpool fc": "liverpool",
+    "man utd": "man united",
+    "man utd.": "man united",
 }
 
 _CLUB_SUFFIXES: tuple[str, ...] = tuple(
     sorted(
-        (" fc", " cf", " sc", " ac", " bc", " afc", " fk", " if", " bk"),
+        (" fc", " cf", " sc", " ac", " bc", " afc", " fk", " if", " bk", " club"),
         key=len,
         reverse=True,
     )
@@ -138,7 +175,7 @@ def _strip_club_suffixes(t: str) -> str:
 
 _CLUB_PREFIXES: tuple[str, ...] = tuple(
     sorted(
-        ("afc ", "fc ", "cf ", "as ", "ac ", "ss ", "us "),
+        ("afc ", "fc ", "cf ", "as ", "ac ", "ss ", "us ", "club "),
         key=len,
         reverse=True,
     )
@@ -159,12 +196,11 @@ def _strip_club_prefixes(t: str) -> str:
 
 def normalize_team_for_match(s: str) -> str:
     """
-    Normaliza para matching Odds ↔ Gamma:
+    Normaliza para matching Odds ↔ Gamma (forma compacta legada):
     1) lowercase + espacios (normalize_team_label),
-    2) strip sufijos de club al final,
-    3) strip prefijos de club al inicio,
-    4) lookup en _ALIAS_MAP,
-    5) fallback última palabra.
+    2) strip sufijos/prefijos de club,
+    3) lookup en _ALIAS_MAP,
+    4) fallback última palabra (compat.).
     """
     t = normalize_team_label(s)
     if not t:
@@ -174,7 +210,186 @@ def normalize_team_for_match(s: str) -> str:
     if t in _ALIAS_MAP:
         return _ALIAS_MAP[t]
     parts = t.split()
+    if len(parts) >= 2 and parts[0] in ("man", "los", "new", "golden", "san", "oklahoma", "portland"):
+        joined = "".join(parts)
+        if joined in _ALIAS_MAP:
+            return _ALIAS_MAP[joined]
     return parts[-1] if parts else ""
+
+
+def _base_tokens_from_label(t: str) -> set[str]:
+    if not t:
+        return set()
+    out: set[str] = set()
+    for w in t.split():
+        if w:
+            out.add(w)
+    collapsed = "".join(t.split())
+    if collapsed and collapsed != t.replace(" ", ""):
+        pass
+    if collapsed:
+        out.add(collapsed)
+    return out
+
+
+def expand_team_tokens(name: str, sport_slug: Optional[str] = None) -> frozenset[str]:
+    """
+    Tokens para matching robusto: palabras normalizadas + expansión por grupos de sinónimos.
+    """
+    t = normalize_team_label(name)
+    if not t:
+        return frozenset()
+    t2 = _strip_club_suffixes(_strip_club_prefixes(t))
+    tokens: set[str] = set(_base_tokens_from_label(t2))
+    if t2 in _ALIAS_MAP:
+        alias_val = normalize_team_label(_ALIAS_MAP[t2])
+        tokens |= _base_tokens_from_label(alias_val)
+        tokens.add("".join(alias_val.split()))
+    compact = normalize_team_for_match(name)
+    if compact:
+        tokens.add(compact)
+        tokens |= _base_tokens_from_label(compact)
+    sport_tags = sport_tags_from_hint(sport_slug)
+    for group, req in _TOKEN_SYNONYM_GROUPS:
+        if req is not None and not (sport_tags & req):
+            continue
+        if tokens & group:
+            tokens |= group
+    return frozenset(x for x in tokens if x)
+
+
+# Tokens geográficos compartidos por varios clubes distintos (no bastan solos para match 1.0).
+_GEO_SHARED_TOKENS = frozenset({"manchester", "los", "new", "san", "st"})
+
+
+def _token_pair_score(ta: str, tb: str) -> float:
+    if not ta or not tb:
+        return 0.0
+    if ta == tb:
+        if ta in _GEO_SHARED_TOKENS:
+            return 0.35
+        return 1.0
+    if ta in tb or tb in ta:
+        return 0.95
+    mx = max(len(ta), len(tb))
+    if mx == 0:
+        return 0.0
+    d = float(levenshtein(ta, tb))
+    sim = 1.0 - d / mx
+    if d < 3 and min(len(ta), len(tb)) <= 5:
+        sim = max(sim, 0.82)
+    return max(0.0, min(1.0, sim))
+
+
+def team_token_sets_match_score(tokens_a: frozenset[str], tokens_b: frozenset[str]) -> float:
+    """Score 0–1 entre dos conjuntos de tokens (mismo equipo bajo distintas formas)."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    inter = tokens_a & tokens_b
+    if inter:
+        core = inter - _GEO_SHARED_TOKENS
+        if core:
+            return 1.0
+    best = 0.0
+    for ta in tokens_a:
+        for tb in tokens_b:
+            best = max(best, _token_pair_score(ta, tb))
+    union = tokens_a | tokens_b
+    if union:
+        jacc_like = len(inter) / len(union) if union else 0.0
+        best = max(best, jacc_like)
+    return best
+
+
+def _manchester_city_vs_united_false_pair(a: str, b: str) -> bool:
+    """Evita confundir Manchester City con Manchester United (mismo prefijo geográfico)."""
+    na, nb = normalize_team_label(a), normalize_team_label(b)
+    if "manchester" not in na or "manchester" not in nb:
+        return False
+
+    def _is_city_side(s: str) -> bool:
+        return bool(re.search(r"\bcity\b", s)) or "mancity" in s.replace(" ", "") or "man city" in s
+
+    def _is_united_side(s: str) -> bool:
+        return bool(re.search(r"\bunited\b", s)) or bool(re.search(r"\butd\b", s)) or "manutd" in s.replace(
+            " ", ""
+        )
+
+    return (_is_city_side(na) and _is_united_side(nb)) or (_is_city_side(nb) and _is_united_side(na))
+
+
+def single_side_match_score(a: str, b: str, *, sport_slug: Optional[str] = None) -> float:
+    """Score 0–1 de que dos nombres de equipo se refieran al mismo club."""
+    if not (a or "").strip() or not (b or "").strip():
+        return 0.0
+    if _manchester_city_vs_united_false_pair(a, b):
+        return 0.05
+    sa = expand_team_tokens(a, sport_slug)
+    sb = expand_team_tokens(b, sport_slug)
+    sc = team_token_sets_match_score(sa, sb)
+    if sc >= 0.55:
+        return sc
+    ca, cb = normalize_team_for_match(a), normalize_team_for_match(b)
+    if _team_match_normalized_tokens(ca, cb):
+        return max(sc, 0.88)
+    mx = max(len(ca), len(cb))
+    if mx and ca and cb:
+        d = float(levenshtein(ca, cb))
+        sc = max(sc, 1.0 - d / mx)
+    return sc
+
+
+TEAM_PAIR_MATCH_THRESHOLD = 0.72
+
+
+def team_pair_match_score(
+    poly_home: str,
+    poly_away: str,
+    odds_home: str,
+    odds_away: str,
+    *,
+    sport_slug: Optional[str] = None,
+) -> tuple[float, str]:
+    """
+    Score del par Poly vs Odds (directo o home/away cruzado). Retorna (score, direct|swap|none).
+    """
+    ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
+    oh, oa = (odds_home or "").strip(), (odds_away or "").strip()
+    if not ph or not pa or not oh or not oa:
+        return 0.0, "none"
+    d_h = single_side_match_score(ph, oh, sport_slug=sport_slug)
+    d_a = single_side_match_score(pa, oa, sport_slug=sport_slug)
+    direct = (d_h + d_a) / 2.0
+    if direct >= TEAM_PAIR_MATCH_THRESHOLD and d_h >= 0.5 and d_a >= 0.5:
+        return direct, "direct"
+    s_h = single_side_match_score(ph, oa, sport_slug=sport_slug)
+    s_a = single_side_match_score(pa, oh, sport_slug=sport_slug)
+    swap = (s_h + s_a) / 2.0
+    if swap >= TEAM_PAIR_MATCH_THRESHOLD and s_h >= 0.5 and s_a >= 0.5:
+        return swap, "swap"
+    best = max(direct, swap)
+    tag = "none"
+    if best == direct and direct > 0:
+        tag = "partial_direct"
+    elif best == swap and swap > 0:
+        tag = "partial_swap"
+    return best, tag
+
+
+def normalized_poly_odds_token_lists(
+    poly_home: str,
+    poly_away: str,
+    odds_home: str,
+    odds_away: str,
+    *,
+    sport_slug: Optional[str] = None,
+) -> tuple[list[str], list[str]]:
+    """Listas ordenadas de tokens para diagnóstico JSON."""
+    ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
+    oh, oa = (odds_home or "").strip(), (odds_away or "").strip()
+    poly_t = expand_team_tokens(ph, sport_slug) | expand_team_tokens(pa, sport_slug)
+    odds_t = expand_team_tokens(oh, sport_slug) | expand_team_tokens(oa, sport_slug)
+    return sorted(poly_t), sorted(odds_t)
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -208,8 +423,8 @@ def _team_match_normalized_tokens(a: str, b: str) -> bool:
 
 
 def normalized_strings_match(a: str, b: str) -> bool:
-    """Misma lógica que teams_match_odds_gamma sobre tokens ya normalizados (p. ej. blobs)."""
-    return _team_match_normalized_tokens(a, b)
+    """Compat.: matching sobre strings ya normalizados."""
+    return single_side_match_score(a, b, sport_slug=None) >= 0.55 or _team_match_normalized_tokens(a, b)
 
 
 _BLOB_VS_SPLIT = re.compile(r"\s+(?:vs\.?|v|@)\s+|\s+[-–]\s+", re.IGNORECASE)
@@ -231,44 +446,68 @@ def _gamma_blob_team_chunks(blob: str) -> list[str]:
     return parts
 
 
-def odds_team_matches_gamma_blob(odds_team: str, blob: str) -> bool:
+def _blob_context_tags(blob: str) -> frozenset[str]:
+    """Heurística para desambiguar Spurs sin sport_slug en blobs Gamma."""
+    b = (blob or "").lower()
+    tags: set[str] = set()
+    if "nba" in b or "san antonio" in b or "basketball" in b:
+        tags.add("nba")
+    if "epl" in b or "premier" in b or "tottenham" in b or "hotspur" in b:
+        tags.add("epl")
+        tags.add("soccer")
+    return frozenset(tags)
+
+
+def odds_team_matches_gamma_blob(
+    odds_team: str,
+    blob: str,
+    *,
+    sport_slug: Optional[str] = None,
+) -> bool:
     """
     True si el nombre Odds coincide con el texto Gamma (título+slug con varios equipos).
-    Prueba match contra el blob completo y contra cada tramo separado por 'vs'.
     """
-    n_o = normalize_team_for_match(odds_team)
-    if not n_o:
+    blob_tags = _blob_context_tags(blob)
+    effective_sport = sport_slug
+    if not sport_tags_from_hint(sport_slug) and blob_tags:
+        effective_sport = "soccer_epl" if blob_tags & {"epl", "soccer"} and not (blob_tags & {"nba"}) else "basketball_nba"
+    n_o_tokens = expand_team_tokens(odds_team, effective_sport)
+    if not n_o_tokens:
         return False
     n_full = normalize_team_label(blob)
-    if n_full and normalized_strings_match(n_o, n_full):
-        return True
+    if n_full:
+        full_tokens = expand_team_tokens(n_full, effective_sport)
+        if team_token_sets_match_score(n_o_tokens, full_tokens) >= 0.55:
+            return True
     chunks = _gamma_blob_team_chunks(blob)
     if len(chunks) >= 2:
         for chunk in chunks:
-            n_chunk = normalize_team_for_match(chunk)
-            if normalized_strings_match(n_o, n_chunk):
+            ct = expand_team_tokens(chunk, effective_sport)
+            if team_token_sets_match_score(n_o_tokens, ct) >= 0.55:
                 return True
         return False
-    n_single = normalize_team_for_match(blob)
-    return normalized_strings_match(n_o, n_single)
+    n_single = expand_team_tokens(blob, effective_sport)
+    return team_token_sets_match_score(n_o_tokens, n_single) >= 0.55
 
 
-def _teams_match_odds_gamma_impl(odds_name: str, gamma_name: str) -> bool:
-    """Implementación base: dos nombres ya acotados a un equipo."""
-    a = normalize_team_for_match(odds_name)
-    b = normalize_team_for_match(gamma_name)
-    return _team_match_normalized_tokens(a, b)
+def _teams_match_odds_gamma_impl(odds_name: str, gamma_name: str, *, sport_slug: Optional[str] = None) -> bool:
+    return single_side_match_score(odds_name, gamma_name, sport_slug=sport_slug) >= 0.55
 
 
-def teams_match_odds_gamma(odds_name: str, gamma_name: str) -> bool:
+def teams_match_odds_gamma(
+    odds_name: str,
+    gamma_name: str,
+    *,
+    sport_slug: Optional[str] = None,
+) -> bool:
     """
     True si el equipo Odds API y el label Gamma (outcome corto o texto largo) coinciden.
     Textos con varios equipos (p. ej. título con \"vs\") comparan por segmentos.
     """
     chunks = _gamma_blob_team_chunks(gamma_name)
     if len(chunks) >= 2:
-        return odds_team_matches_gamma_blob(odds_name, gamma_name)
-    return _teams_match_odds_gamma_impl(odds_name, gamma_name)
+        return odds_team_matches_gamma_blob(odds_name, gamma_name, sport_slug=sport_slug)
+    return _teams_match_odds_gamma_impl(odds_name, gamma_name, sport_slug=sport_slug)
 
 
 def find_odds_event_matching_teams(
@@ -285,9 +524,8 @@ def find_odds_event_matching_teams(
         oa = str(ev.get("away_team") or "").strip()
         if not oh or not oa:
             continue
-        if (teams_match_odds_gamma(ph, oh) and teams_match_odds_gamma(pa, oa)) or (
-            teams_match_odds_gamma(ph, oa) and teams_match_odds_gamma(pa, oh)
-        ):
+        sc, _ = team_pair_match_score(ph, pa, oh, oa, sport_slug=None)
+        if sc >= TEAM_PAIR_MATCH_THRESHOLD:
             return ev
     return None
 

@@ -159,7 +159,7 @@ def _print_match_hints(games: list[Any], client: OddsApiIo, limit: int) -> None:
             continue
         n_in += 1
         pool = _events_for_poly_game(client, g.sport_slug)
-        hit = find_event_matching_teams(pool, g.home, g.away)
+        hit = find_event_matching_teams(pool, g.home, g.away, g.sport_slug)
         if hit is not None:
             n_hit += 1
     print(f"partidos_Gamma_no_pregame={n_in}  con_match_odds_io={n_hit}")
@@ -171,7 +171,7 @@ def _print_match_hints(games: list[Any], client: OddsApiIo, limit: int) -> None:
         if not POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug):
             continue
         pool = _events_for_poly_game(client, g.sport_slug)
-        hit = find_event_matching_teams(pool, g.home, g.away)
+        hit = find_event_matching_teams(pool, g.home, g.away, g.sport_slug)
         if shown >= limit:
             break
         shown += 1

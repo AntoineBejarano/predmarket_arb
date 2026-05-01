@@ -23,7 +23,14 @@ from aiohttp import WSMsgType
 
 from arb.base import ArbStrategy
 from arb.latency_sports_manual_match import load_manual_matches
-from clients.odds_api import normalize_team_for_match, odds_team_matches_gamma_blob, teams_match_odds_gamma
+from clients.odds_api import (
+    TEAM_PAIR_MATCH_THRESHOLD,
+    normalized_poly_odds_token_lists,
+    normalize_team_for_match,
+    odds_team_matches_gamma_blob,
+    team_pair_match_score,
+    teams_match_odds_gamma,
+)
 from clients.odds_api_io import (
     ODDS_API_IO_SPORTS_EMBEDDED,
     OddsApiIo,
@@ -376,14 +383,40 @@ class OpenPolymarketGame:
     kickoff_utc: Optional[datetime] = None
 
 
-def _odds_io_updated_age_sec(odds_event: OddsEvent) -> Optional[float]:
+def _summarize_numeric_list_min_p50_max(values: list[float]) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    if not values:
+        return None, None, None
+    s = sorted(float(x) for x in values)
+    return float(s[0]), float(s[len(s) // 2]), float(s[-1])
+
+
+def _odds_io_reference_instant_utc(odds_event: OddsEvent) -> Optional[datetime]:
+    """
+    Instante UTC más reciente para edad de referencia: max(updated_at parseado, ws_received_at_utc).
+    Los ticks WS fijan ws_received_at_utc con reloj UTC aware; si updatedAt del book viene naive u offset
+    raro, no envejece artificialmente la referencia frente al tick recién aplicado.
+    """
+    parts: list[datetime] = []
+    ws_raw = str(getattr(odds_event, "ws_received_at_utc", "") or "").strip()
+    if ws_raw:
+        w = _parse_iso_utc(ws_raw)
+        if w is not None:
+            parts.append(w)
     raw = (odds_event.updated_at or "").strip()
-    if not raw:
+    if raw:
+        u = _parse_iso_utc(raw)
+        if u is not None:
+            parts.append(u)
+    if not parts:
         return None
-    u = _parse_iso_utc(raw)
-    if u is None:
+    return max(parts)
+
+
+def _odds_io_updated_age_sec(odds_event: OddsEvent) -> Optional[float]:
+    ref = _odds_io_reference_instant_utc(odds_event)
+    if ref is None:
         return None
-    return (datetime.now(timezone.utc) - u).total_seconds()
+    return (datetime.now(timezone.utc) - ref).total_seconds()
 
 
 def _is_reference_stale_for_io(odds_event: OddsEvent) -> bool:
@@ -449,7 +482,7 @@ def _compute_briefing_cycle_counts(
         if not odds_key:
             continue
         evs = odds_events_by_key.get(odds_key) or []
-        if find_event_matching_teams(evs, g.home, g.away) is not None:
+        if find_event_matching_teams(evs, g.home, g.away, g.sport_slug) is not None:
             io_name_hit += 1
     return {
         "briefing_pre_game_distant": int(pre_distant),
@@ -495,7 +528,7 @@ def _build_pending_manual_payload(
         if not ok:
             continue
         events_list = odds_events_by_key.get(ok) or []
-        if find_event_matching_teams(events_list, g.home, g.away) is not None:
+        if find_event_matching_teams(events_list, g.home, g.away, g.sport_slug) is not None:
             continue
         cid = (g.condition_id or "").strip()
         if not cid:
@@ -905,7 +938,12 @@ def _gamma_event_usable(ev: dict[str, Any]) -> bool:
     return api_bool_true(ev.get("active", True))
 
 
-def _event_matches_odds_teams(ev: dict[str, Any], home_odds: str, away_odds: str) -> bool:
+def _event_matches_odds_teams(
+    ev: dict[str, Any],
+    home_odds: str,
+    away_odds: str,
+    sport_hint: Optional[str] = None,
+) -> bool:
     """Evento Gamma cuyo title/slug menciona ambos equipos (orden irrelevante)."""
     title = str(ev.get("title") or "").strip()
     if ":" in title:
@@ -914,8 +952,8 @@ def _event_matches_odds_teams(ev: dict[str, Any], home_odds: str, away_odds: str
     blob = (title + " " + slug).strip()
     if len(blob) < 3:
         return False
-    ok_h = odds_team_matches_gamma_blob(home_odds, blob)
-    ok_a = odds_team_matches_gamma_blob(away_odds, blob)
+    ok_h = odds_team_matches_gamma_blob(home_odds, blob, sport_slug=sport_hint)
+    ok_a = odds_team_matches_gamma_blob(away_odds, blob, sport_slug=sport_hint)
     if not (ok_h and ok_a):
         nh = normalize_team_for_match(home_odds)
         na = normalize_team_for_match(away_odds)
@@ -1104,7 +1142,7 @@ def _pick_open_game_from_public_search_page(
         ev0 = _merge_root_markets_into_event(raw, root_markets)
         sslug = str(ev0.get("slug") or "?")
         usable = _gamma_event_usable(ev0)
-        teams = _event_matches_odds_teams(ev0, odds_ev.home, odds_ev.away)
+        teams = _event_matches_odds_teams(ev0, odds_ev.home, odds_ev.away, odds_ev.sport or None)
         if _ps_filter_logged < _ps_filter_cap:
             _ps_filter_logged += 1
             log.debug(
@@ -1190,10 +1228,12 @@ def _pick_best_market_in_event(
 
 def _align_odds_io_to_game(ev: OddsEvent, game: OpenPolymarketGame) -> Optional[tuple[str, float, str, float]]:
     """(nombre lado Poly home, decimal, nombre lado Poly away, decimal) alineado con game.home/game.away."""
-    gh, ga = (game.home or "").strip(), (game.away or "").strip()
-    if teams_match_odds_gamma(gh, ev.home) and teams_match_odds_gamma(ga, ev.away):
+    gh, ga = normalize_name_order((game.home or "").strip()), normalize_name_order((game.away or "").strip())
+    sk = (game.sport_slug or "").strip() or None
+    oh, oa = normalize_name_order(str(ev.home or "").strip()), normalize_name_order(str(ev.away or "").strip())
+    if teams_match_odds_gamma(gh, oh, sport_slug=sk) and teams_match_odds_gamma(ga, oa, sport_slug=sk):
         return ev.home, ev.home_odds, ev.away, ev.away_odds
-    if teams_match_odds_gamma(gh, ev.away) and teams_match_odds_gamma(ga, ev.home):
+    if teams_match_odds_gamma(gh, oa, sport_slug=sk) and teams_match_odds_gamma(ga, oh, sport_slug=sk):
         return ev.away, ev.away_odds, ev.home, ev.home_odds
     return None
 
@@ -1221,41 +1261,87 @@ def _filter_odds_candidates_by_time(
     return out
 
 
-def _count_name_aligned_candidates(events: list[OddsEvent], poly_home: str, poly_away: str) -> int:
+def _pick_best_odds_candidate_by_time(
+    game: OpenPolymarketGame,
+    events: list[OddsEvent],
+) -> tuple[Optional[OddsEvent], Optional[float]]:
+    """OddsEvent con menor |Δcommence| vs kickoff Poly; delta None si no computable."""
+    if not events:
+        return None, None
+    k0 = game.kickoff_utc
+    best_ev: Optional[OddsEvent] = None
+    best_abs: Optional[float] = None
+    if k0 is not None:
+        for ev in events:
+            k1 = _odds_event_kickoff_utc(ev)
+            if k1 is None:
+                continue
+            d = abs((k1 - k0).total_seconds())
+            if best_abs is None or d < best_abs:
+                best_abs = float(d)
+                best_ev = ev
+        if best_ev is not None:
+            return best_ev, best_abs
+    return events[0], None
+
+
+def _count_name_aligned_candidates(
+    events: list[OddsEvent],
+    poly_home: str,
+    poly_away: str,
+    sport_slug: Optional[str] = None,
+) -> int:
     ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
     if not ph or not pa:
         return 0
+    sk = (sport_slug or "").strip() or None
+    phn, pan = normalize_name_order(ph), normalize_name_order(pa)
     n = 0
     for ev in events:
+        oh, oa = normalize_name_order(str(ev.home or "")), normalize_name_order(str(ev.away or ""))
         if (
-            teams_match_odds_gamma(ph, ev.home)
-            and teams_match_odds_gamma(pa, ev.away)
+            teams_match_odds_gamma(phn, oh, sport_slug=sk)
+            and teams_match_odds_gamma(pan, oa, sport_slug=sk)
         ) or (
-            teams_match_odds_gamma(ph, ev.away)
-            and teams_match_odds_gamma(pa, ev.home)
+            teams_match_odds_gamma(phn, oa, sport_slug=sk)
+            and teams_match_odds_gamma(pan, oh, sport_slug=sk)
         ):
             n += 1
     return n
 
 
-def _best_match_summary(events: list[OddsEvent], poly_home: str, poly_away: str) -> tuple[float, str]:
+def _best_match_summary(
+    events: list[OddsEvent],
+    poly_home: str,
+    poly_away: str,
+    sport_slug: Optional[str] = None,
+) -> tuple[float, str]:
     ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
     if not ph or not pa or not events:
         return 0.0, "no_candidates"
+    sk = (sport_slug or "").strip() or None
+    phn, pan = normalize_name_order(ph), normalize_name_order(pa)
     best_score = 0.0
     best_reason = "no_name_match"
     for ev in events:
-        direct_home = teams_match_odds_gamma(ph, ev.home)
-        direct_away = teams_match_odds_gamma(pa, ev.away)
-        swap_home = teams_match_odds_gamma(ph, ev.away)
-        swap_away = teams_match_odds_gamma(pa, ev.home)
+        oh, oa = normalize_name_order(str(ev.home or "")), normalize_name_order(str(ev.away or ""))
+        direct_home = teams_match_odds_gamma(phn, oh, sport_slug=sk)
+        direct_away = teams_match_odds_gamma(pan, oa, sport_slug=sk)
+        swap_home = teams_match_odds_gamma(phn, oa, sport_slug=sk)
+        swap_away = teams_match_odds_gamma(pan, oh, sport_slug=sk)
         if direct_home and direct_away:
             return 1.0, "name_exact_direct"
         if swap_home and swap_away:
             return 1.0, "name_exact_swapped"
+        pr, tag = team_pair_match_score(phn, pan, oh, oa, sport_slug=sk)
+        if pr >= TEAM_PAIR_MATCH_THRESHOLD:
+            return float(pr), f"pair_{tag}"
         if direct_home or direct_away or swap_home or swap_away:
-            best_score = max(best_score, 0.5)
+            best_score = max(best_score, 0.5, pr)
             best_reason = "name_partial"
+        elif pr > best_score:
+            best_score = float(pr)
+            best_reason = f"pair_{tag}"
     return best_score, best_reason
 
 
@@ -1265,24 +1351,25 @@ def _map_outcomes_to_tokens(
     odds_away: str,
 ) -> tuple[Optional[str], Optional[str]]:
     """Devuelve (token_odds_home, token_odds_away) alineando labels Gamma con equipos Odds."""
+    sk = (g.sport_key or "").strip() or None
     tok_home: Optional[str] = None
     tok_away: Optional[str] = None
     for label, tid in g.outcome_tokens:
-        if tok_home is None and teams_match_odds_gamma(odds_home, label):
+        if tok_home is None and teams_match_odds_gamma(odds_home, label, sport_slug=sk):
             tok_home = tid
     for label, tid in g.outcome_tokens:
         if tid == tok_home:
             continue
-        if tok_away is None and teams_match_odds_gamma(odds_away, label):
+        if tok_away is None and teams_match_odds_gamma(odds_away, label, sport_slug=sk):
             tok_away = tid
     if tok_home and tok_away and tok_home != tok_away:
         return tok_home, tok_away
     if len(g.outcome_tokens) == 2:
         t0, t1 = g.outcome_tokens[0][1], g.outcome_tokens[1][1]
         l0, l1 = g.outcome_tokens[0][0], g.outcome_tokens[1][0]
-        if teams_match_odds_gamma(odds_home, l0) and teams_match_odds_gamma(odds_away, l1):
+        if teams_match_odds_gamma(odds_home, l0, sport_slug=sk) and teams_match_odds_gamma(odds_away, l1, sport_slug=sk):
             return t0, t1
-        if teams_match_odds_gamma(odds_home, l1) and teams_match_odds_gamma(odds_away, l0):
+        if teams_match_odds_gamma(odds_home, l1, sport_slug=sk) and teams_match_odds_gamma(odds_away, l0, sport_slug=sk):
             return t1, t0
     return None, None
 
@@ -1650,6 +1737,34 @@ class LatencyArbSportsStrategy(ArbStrategy):
         except Exception as e:
             log.warning("[latency_arb_sports] snapshot csv append: %s", e)
 
+    async def _emit_poll_catalog_skip_row(
+        self,
+        game: OpenPolymarketGame,
+        odds_sport_key: str,
+        odds_ev: OddsEvent,
+        action: str,
+        reason: str,
+    ) -> None:
+        await self.log_signal_async(
+            {
+                "action": action,
+                "reason": reason,
+                "game_slug": (game.slug or (game.condition_id or "")[:24] or ""),
+                "league": str(game.sport_slug or odds_sport_key or ""),
+                "home_team": (game.home or "").strip(),
+                "away_team": (game.away or "").strip(),
+                "side": "",
+                "token_id": "",
+                "price_poly": "",
+                "prob_pinnacle": "",
+                "edge": "",
+                "size_usdc": "0",
+                "status": "SKIP",
+                "trigger": "poll",
+            }
+        )
+        log.warning("[latency_arb_sports] %s event_id=%s %s", action, odds_ev.event_id, reason)
+
     def _write_cycle_metrics_json(
         self,
         open_poly_games: int,
@@ -1684,6 +1799,23 @@ class LatencyArbSportsStrategy(ArbStrategy):
         best_match_reason: str = "",
         rest_limit_notice: str = "",
         rest_limit_reset_left_s: float = 0.0,
+        time_filter_pass_but_name_fail: int = 0,
+        name_filter_attempts: int = 0,
+        name_filter_pass: int = 0,
+        name_filter_fail: int = 0,
+        name_filter_fail_examples: Optional[list[Any]] = None,
+        stale_age_min_sec: Optional[float] = None,
+        stale_age_p50_sec: Optional[float] = None,
+        stale_age_max_sec: Optional[float] = None,
+        drop_stale_examples: Optional[list[Any]] = None,
+        catalog_events_total: int = 0,
+        catalog_candidates_added: int = 0,
+        catalog_match_attempts: int = 0,
+        catalog_match_found: int = 0,
+        catalog_hydrate_attempts: int = 0,
+        catalog_hydrate_ok: int = 0,
+        catalog_hydrate_fail: int = 0,
+        catalog_hydrate_quota_blocked: int = 0,
     ) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
@@ -1752,6 +1884,23 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "best_match_reason": str(best_match_reason or ""),
                 "rest_limit_notice": str(rest_limit_notice or ""),
                 "rest_limit_reset_left_s": round(float(rest_limit_reset_left_s or 0.0), 1),
+                "time_filter_pass_but_name_fail": int(time_filter_pass_but_name_fail),
+                "name_filter_attempts": int(name_filter_attempts),
+                "name_filter_pass": int(name_filter_pass),
+                "name_filter_fail": int(name_filter_fail),
+                "name_filter_fail_examples": list(name_filter_fail_examples or []),
+                "stale_age_min_sec": stale_age_min_sec,
+                "stale_age_p50_sec": stale_age_p50_sec,
+                "stale_age_max_sec": stale_age_max_sec,
+                "drop_stale_examples": list(drop_stale_examples or []),
+                "catalog_events_total": int(catalog_events_total),
+                "catalog_candidates_added": int(catalog_candidates_added),
+                "catalog_match_attempts": int(catalog_match_attempts),
+                "catalog_match_found": int(catalog_match_found),
+                "catalog_hydrate_attempts": int(catalog_hydrate_attempts),
+                "catalog_hydrate_ok": int(catalog_hydrate_ok),
+                "catalog_hydrate_fail": int(catalog_hydrate_fail),
+                "catalog_hydrate_quota_blocked": int(catalog_hydrate_quota_blocked),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1779,7 +1928,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         poly_key = POLY_SLUG_TO_ODDS_KEY.get(str(sport_slug).strip().lower())
         if not poly_key:
             return []
-        return self._odds_client.get_cached_odds(_client_poly_key_for_odds_io(poly_key, sport_slug))
+        return self._odds_client.get_matching_candidate_events(
+            _client_poly_key_for_odds_io(poly_key, sport_slug)
+        )
 
     async def run_once(self) -> None:
         """Compat: no usado si run_loop está sobrescrito; mantener vacío mínimo."""
@@ -2324,7 +2475,6 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     len(cached),
                     list(self._odds_client._ws_odds_cache.keys())[:3],
                 )
-            odds_events_by_key: dict[str, list[OddsEvent]] = {}
             keys_order: list[str] = []
             cycle_counters = _empty_match_counters()
             poly_games_by_sport: dict[str, int] = {}
@@ -2371,12 +2521,35 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     continue
                 if not self._odds_client.get_cached_odds(pk2):
                     await self._odds_client.refresh_rest_cache(sess, pk2)
-            for g in open_games:
-                ok = POLY_SLUG_TO_ODDS_KEY.get(g.sport_slug)
-                if not ok:
+            io_sports_for_catalog: set[str] = set()
+            for pkc in sorted(distinct_pk):
+                ioc = poly_odds_key_to_io_sport(pkc)
+                if ioc:
+                    io_sports_for_catalog.add(ioc)
+            catalog_diag: dict[str, int] = {
+                "catalog_events_total": 0,
+                "catalog_candidates_added": 0,
+                "catalog_match_attempts": 0,
+                "catalog_match_found": 0,
+                "catalog_hydrate_attempts": 0,
+                "catalog_hydrate_ok": 0,
+                "catalog_hydrate_fail": 0,
+                "catalog_hydrate_quota_blocked": 0,
+            }
+            for ioc in sorted(io_sports_for_catalog):
+                catalog_diag["catalog_events_total"] += await self._odds_client.refresh_events_catalog(sess, ioc)
+            pk_to_ok: dict[str, str] = {}
+            for g2 in open_games:
+                ok2 = POLY_SLUG_TO_ODDS_KEY.get(g2.sport_slug)
+                if not ok2:
                     continue
-                pk = _client_poly_key_for_odds_io(ok, g.sport_slug)
-                odds_events_by_key[ok] = self._odds_client.get_cached_odds(pk)
+                pk2b = _client_poly_key_for_odds_io(ok2, g2.sport_slug)
+                pk_to_ok[pk2b] = ok2
+            odds_events_by_key: dict[str, list[OddsEvent]] = {}
+            for pk_u, ok in sorted(pk_to_ok.items()):
+                evs, st = self._odds_client.get_matching_candidate_events_with_stats(pk_u)
+                odds_events_by_key[ok] = evs
+                catalog_diag["catalog_candidates_added"] += int(st.get("catalog_candidates_added", 0))
             odds_keys_loaded = {k for k, evs in odds_events_by_key.items() if evs}
             odds_events_by_sport = {k: len(v) for k, v in odds_events_by_key.items() if v}
             odds_events_total = int(sum(odds_events_by_sport.values()))
@@ -2445,6 +2618,13 @@ class LatencyArbSportsStrategy(ArbStrategy):
             match_sem = asyncio.Semaphore(int(_HARDCODE_MATCH_PARALLELISM))
             processed_lock = asyncio.Lock()
             diag_lock = asyncio.Lock()
+            name_filter_diag: dict[str, Any] = {
+                "attempts": 0,
+                "pass": 0,
+                "time_but_name_fail": 0,
+                "examples": [],
+            }
+            stale_diag: dict[str, Any] = {"ages": [], "examples": []}
 
             def _acc_cycle(src: dict[str, int]) -> None:
                 for k in cycle_counters:
@@ -2464,7 +2644,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         if not cid_bf or cid_bf in processed_condition_ids:
                             return _empty_match_counters()
                         processed_condition_ids.add(cid_bf)
-                    st_bf = await self._process_matched_poly_odds(sess, clob, game_bf, odds_key_bf, odds_ev)
+                    st_bf = await self._process_matched_poly_odds(
+                        sess, clob, game_bf, odds_key_bf, odds_ev, stale_diag=stale_diag
+                    )
                     out = _empty_match_counters()
                     out["pipeline_entered"] = 0 if int(st_bf.get("drop_pre_game", 0)) > 0 else 1
                     for k in out:
@@ -2485,8 +2667,13 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         return _empty_match_counters()
                     events_list = odds_events_by_key.get(odds_key) or []
                     events_time_filtered = _filter_odds_candidates_by_time(game, events_list)
-                    name_candidates = _count_name_aligned_candidates(events_time_filtered, game.home, game.away)
-                    b_score, b_reason = _best_match_summary(events_time_filtered, game.home, game.away)
+                    sk_game = (game.sport_slug or "").strip() or None
+                    name_candidates = _count_name_aligned_candidates(
+                        events_time_filtered, game.home, game.away, sk_game
+                    )
+                    b_score, b_reason = _best_match_summary(
+                        events_time_filtered, game.home, game.away, sk_game
+                    )
                     async with diag_lock:
                         sport_diag = str(game.sport_slug or "").strip().lower() or "unknown"
                         candidates_checked_by_sport[sport_diag] = (
@@ -2502,9 +2689,49 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         if b_score >= best_match_score:
                             best_match_score = float(b_score)
                             best_match_reason = str(b_reason)
+                        name_filter_diag["attempts"] += int(len(events_time_filtered))
+                        name_filter_diag["pass"] += int(name_candidates)
+                        if len(events_time_filtered) > 0 and int(name_candidates) == 0:
+                            name_filter_diag["time_but_name_fail"] += 1
+                            ex: list[Any] = name_filter_diag["examples"]
+                            if len(ex) < 10:
+                                bev, dsec = _pick_best_odds_candidate_by_time(game, events_time_filtered)
+                                if bev is not None:
+                                    ph, pa = (game.home or "").strip(), (game.away or "").strip()
+                                    phn = normalize_name_order(ph)
+                                    pan = normalize_name_order(pa)
+                                    ohn = normalize_name_order(str(bev.home or ""))
+                                    oan = normalize_name_order(str(bev.away or ""))
+                                    ms, _mt = team_pair_match_score(
+                                        phn, pan, ohn, oan, sport_slug=sk_game
+                                    )
+                                    pt, ot = normalized_poly_odds_token_lists(
+                                        phn, pan, ohn, oan, sport_slug=sk_game
+                                    )
+                                    ex.append(
+                                        {
+                                            "sport_slug": sport_diag,
+                                            "reason": "time_ok_name_fail",
+                                            "best_candidate_by_time": {
+                                                "poly_home": ph,
+                                                "poly_away": pa,
+                                                "odds_home": str(bev.home or ""),
+                                                "odds_away": str(bev.away or ""),
+                                                "commence_delta_sec": dsec,
+                                                "normalized_poly_tokens": pt,
+                                                "normalized_odds_tokens": ot,
+                                                "match_score": round(float(ms), 4),
+                                            },
+                                        }
+                                    )
                     pool_for_match = events_time_filtered if events_time_filtered else events_list
-                    odds_ev = find_event_matching_teams(pool_for_match, game.home, game.away)
+                    if any(bool(getattr(e, "catalog_metadata_only", False)) for e in pool_for_match):
+                        catalog_diag["catalog_match_attempts"] += 1
+                    odds_ev = find_event_matching_teams(
+                        pool_for_match, game.home, game.away, sk_game
+                    )
                     manual_tw: Optional[tuple[str, float, str, float]] = None
+                    manual_swap: Optional[bool] = None
                     if odds_ev is None and cid_g:
                         mm = manual_map.get(cid_g)
                         if isinstance(mm, dict):
@@ -2514,17 +2741,63 @@ class LatencyArbSportsStrategy(ArbStrategy):
                                 for ev in pool_for_match:
                                     if str(ev.event_id) == eid:
                                         odds_ev = ev
-                                        manual_tw = _manual_tw_from_odds_event(ev, swap)
+                                        manual_swap = swap
                                         break
                     if odds_ev is None:
                         return _empty_match_counters()
+                    io_hydr = poly_odds_key_to_io_sport(
+                        _client_poly_key_for_odds_io(odds_key, str(game.sport_slug or ""))
+                    )
+                    if bool(getattr(odds_ev, "catalog_metadata_only", False)):
+                        catalog_diag["catalog_match_found"] += 1
+                        catalog_diag["catalog_hydrate_attempts"] += 1
+                        if not io_hydr:
+                            await self._emit_poll_catalog_skip_row(
+                                game,
+                                odds_key,
+                                odds_ev,
+                                "SKIP:CATALOG_NO_ODDS",
+                                "missing_io_sport_for_catalog_hydrate",
+                            )
+                            return _empty_match_counters()
+                        ev2, hst = await self._odds_client.hydrate_event_odds(sess, odds_ev.event_id, io_hydr)
+                        if hst == "quota_blocked":
+                            catalog_diag["catalog_hydrate_quota_blocked"] += 1
+                            await self._emit_poll_catalog_skip_row(
+                                game,
+                                odds_key,
+                                odds_ev,
+                                "SKIP:CATALOG_HYDRATE_FAIL",
+                                "rest_quota_or_backoff",
+                            )
+                            return _empty_match_counters()
+                        if ev2 is None:
+                            catalog_diag["catalog_hydrate_fail"] += 1
+                            await self._emit_poll_catalog_skip_row(
+                                game,
+                                odds_key,
+                                odds_ev,
+                                "SKIP:CATALOG_HYDRATE_FAIL",
+                                "odds_multi_empty_or_invalid_odds",
+                            )
+                            return _empty_match_counters()
+                        catalog_diag["catalog_hydrate_ok"] += 1
+                        odds_ev = ev2
+                    if manual_swap is not None:
+                        manual_tw = _manual_tw_from_odds_event(odds_ev, manual_swap)
                     async with processed_lock:
                         if cid_g and cid_g in processed_condition_ids:
                             return _empty_match_counters()
                         if cid_g:
                             processed_condition_ids.add(cid_g)
                     st = await self._process_matched_poly_odds(
-                        sess, clob, game, odds_key, odds_ev, manual_tw=manual_tw
+                        sess,
+                        clob,
+                        game,
+                        odds_key,
+                        odds_ev,
+                        manual_tw=manual_tw,
+                        stale_diag=stale_diag,
                     )
                     out = _empty_match_counters()
                     out["pipeline_entered"] = 0 if int(st.get("drop_pre_game", 0)) > 0 else 1
@@ -2567,7 +2840,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             ):
                 for game in open_games[:5]:
                     odds_key = POLY_SLUG_TO_ODDS_KEY.get(game.sport_slug, game.sport_slug)
-                    odds_events = self._odds_client.get_cached_odds(
+                    odds_events = self._odds_client.get_matching_candidate_events(
                         _client_poly_key_for_odds_io(odds_key, game.sport_slug)
                     )
                     odds_time = _filter_odds_candidates_by_time(game, odds_events)
@@ -2579,7 +2852,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         game.sport_slug,
                         len(odds_events),
                         len(odds_time),
-                        _count_name_aligned_candidates(odds_time, game.home, game.away),
+                        _count_name_aligned_candidates(odds_time, game.home, game.away, game.sport_slug),
                         preview,
                     )
                 self._ref_debug_done = True
@@ -2641,6 +2914,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 best_match_score,
                 best_match_reason,
             )
+            stale_ages = [float(x) for x in (stale_diag.get("ages") or [])]
+            st_min, st_p50, st_max = _summarize_numeric_list_min_p50_max(stale_ages)
             self._write_cycle_metrics_json(
                 len(open_games),
                 cycle_counters["reference_aligned"],
@@ -2673,6 +2948,25 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 best_match_reason=best_match_reason,
                 rest_limit_notice=str(rest_limit.get("rest_limit_notice") or ""),
                 rest_limit_reset_left_s=float(rest_limit.get("rest_limit_reset_left_s") or 0.0),
+                time_filter_pass_but_name_fail=int(name_filter_diag["time_but_name_fail"]),
+                name_filter_attempts=int(name_filter_diag["attempts"]),
+                name_filter_pass=int(name_filter_diag["pass"]),
+                name_filter_fail=max(
+                    0, int(name_filter_diag["attempts"]) - int(name_filter_diag["pass"])
+                ),
+                name_filter_fail_examples=list(name_filter_diag["examples"]),
+                stale_age_min_sec=st_min,
+                stale_age_p50_sec=st_p50,
+                stale_age_max_sec=st_max,
+                drop_stale_examples=list(stale_diag.get("examples") or []),
+                catalog_events_total=int(catalog_diag.get("catalog_events_total", 0)),
+                catalog_candidates_added=int(catalog_diag.get("catalog_candidates_added", 0)),
+                catalog_match_attempts=int(catalog_diag.get("catalog_match_attempts", 0)),
+                catalog_match_found=int(catalog_diag.get("catalog_match_found", 0)),
+                catalog_hydrate_attempts=int(catalog_diag.get("catalog_hydrate_attempts", 0)),
+                catalog_hydrate_ok=int(catalog_diag.get("catalog_hydrate_ok", 0)),
+                catalog_hydrate_fail=int(catalog_diag.get("catalog_hydrate_fail", 0)),
+                catalog_hydrate_quota_blocked=int(catalog_diag.get("catalog_hydrate_quota_blocked", 0)),
             )
             await self._drain_poly_followups(clob)
 
@@ -2770,10 +3064,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
         manual_tw: Optional[tuple[str, float, str, float]] = None,
         tick_received_mono: Optional[float] = None,
         trigger: str = "poll",
+        stale_diag: Optional[dict[str, Any]] = None,
     ) -> dict[str, int]:
         acc: dict[str, int] = _empty_match_counters()
         acc["emitted_signal"] = 0
         acc["emitted_low_edge"] = 0
+        if bool(getattr(odds_event, "catalog_metadata_only", False)):
+            log.warning(
+                "[latency_arb_sports] catalog_metadata_only event_id=%s blocked_at_process_matched",
+                odds_event.event_id,
+            )
+            return acc
 
         def _ms_tick_to_now() -> Optional[float]:
             if tick_received_mono is None:
@@ -2840,6 +3141,39 @@ class LatencyArbSportsStrategy(ArbStrategy):
             return acc
         if _is_reference_stale_for_io(odds_event):
             acc["drop_reference_stale"] = 1
+            now_u = datetime.now(timezone.utc)
+            now_iso = now_u.isoformat().replace("+00:00", "Z")
+            raw_u = str(odds_event.updated_at or "").strip()
+            parsed_u = _parse_iso_utc(raw_u)
+            parsed_iso = parsed_u.isoformat().replace("+00:00", "Z") if parsed_u is not None else None
+            ws_recv = str(getattr(odds_event, "ws_received_at_utc", "") or "").strip()
+            log.info(
+                "[latency_arb_sports] DROP_STALE event_id=%s now_utc=%s odds_updated_at_raw=%r "
+                "odds_updated_at_parsed_utc=%s ws_received_at_utc=%r computed_age_sec=%s stale_threshold_sec=%s",
+                odds_event.event_id,
+                now_iso,
+                raw_u or None,
+                parsed_iso,
+                ws_recv or None,
+                ref_age_s_early,
+                float(_HARDCODE_STALE_ODDS_IO_SEC),
+            )
+            if stale_diag is not None:
+                if ref_age_s_early is not None:
+                    stale_diag.setdefault("ages", []).append(float(ref_age_s_early))
+                ex_list: list[Any] = stale_diag.setdefault("examples", [])
+                if len(ex_list) < 10:
+                    ex_list.append(
+                        {
+                            "event_id": str(odds_event.event_id),
+                            "now_utc": now_iso,
+                            "odds_updated_at_raw": raw_u,
+                            "odds_updated_at_parsed_utc": parsed_iso,
+                            "ws_received_at_utc": ws_recv or None,
+                            "computed_age_sec": ref_age_s_early,
+                            "stale_threshold_sec": float(_HARDCODE_STALE_ODDS_IO_SEC),
+                        }
+                    )
             await _emit_drop_skip_row_if_tick(
                 "SKIP:STALE",
                 f"odds_io_age_s={ref_age_s_early:.1f}>stale={_HARDCODE_STALE_ODDS_IO_SEC:.0f}"

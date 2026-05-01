@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
@@ -19,9 +19,10 @@ from aiohttp import WSMsgType
 from typing import Awaitable, Callable
 
 from clients.odds_api import implied_prob as _implied_prob
-from clients.odds_api import levenshtein
 from clients.odds_api import normalize_team_for_match
 from clients.odds_api import remove_vig as _remove_vig_probs
+from clients.odds_api import team_pair_match_score
+from clients.odds_api import TEAM_PAIR_MATCH_THRESHOLD
 
 log = logging.getLogger("odds_api_io")
 
@@ -125,6 +126,19 @@ _REST_EMPTY_SPORT_BACKOFF_SEC = 600.0
 _WS_JSON_BUFFER_MAX_BYTES = 1_000_000
 # TTL de metadata event-level (home/away) obtenida por REST /events.
 _EVENT_META_TTL_SEC = 3600.0
+# Snapshot GET /v3/events por deporte (catálogo matching; sin /odds/multi aquí).
+_EVENTS_CATALOG_TTL_SEC_DEFAULT = 180.0
+# Hidratación puntual tras match catalog-only: cuánto tiempo conservar fila en caché auxiliar.
+_HYDRATED_ODDS_BY_EID_TTL_SEC = 900.0
+
+
+@dataclass(frozen=True)
+class CatalogRow:
+    event_id: str
+    home: str
+    away: str
+    event_date_s: str
+    io_sport: str
 
 
 @dataclass
@@ -139,6 +153,10 @@ class OddsEvent:
     event_id: str
     sport: str
     event_date_s: str = ""
+    # ISO8601 UTC al aplicar tick WS (evita stale si updatedAt del book viene naive/offset raro).
+    ws_received_at_utc: str = ""
+    # True: fila solo para matching (GET /events); prohibido calcular edge hasta hidratar cuotas reales.
+    catalog_metadata_only: bool = False
 
 
 def remove_vig(
@@ -163,9 +181,6 @@ def normalize_name_order(name: str) -> str:
     return name
 
 
-_TEAM_IO_SIMILARITY_MIN = 0.6
-
-
 def _coerce_io_sport_slug(sport_val: Any) -> str:
     """WS/REST: slug IO (p. ej. tennis) desde string o dict tipo {slug: tennis}."""
     if sport_val is None:
@@ -175,49 +190,25 @@ def _coerce_io_sport_slug(sport_val: Any) -> str:
     return str(sport_val).strip().lower()
 
 
-def _levenshtein_similarity_ratio(a: str, b: str) -> float:
-    """1.0 = iguales; 0.0 = muy distintos (dist / longitud máxima)."""
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    d = float(levenshtein(a, b))
-    mx = max(len(a), len(b))
-    return 1.0 - (d / mx) if mx else 0.0
-
-
-def _team_similar_for_io_pair(poly_side: str, odds_side: str) -> bool:
-    """
-    Poly vs odds-api.io: compara cadenas ya en minúscula y sin prefijos/sufijos de club
-    (normalize_team_for_match) tras orden nombre/apellido (normalize_name_order).
-    Requiere similitud Levenshtein ≥ 60% salvo igualdad exacta.
-    """
-    a = normalize_team_for_match(normalize_name_order(poly_side))
-    b = normalize_team_for_match(normalize_name_order(odds_side))
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    return _levenshtein_similarity_ratio(a, b) >= _TEAM_IO_SIMILARITY_MIN
-
-
 def find_event_matching_teams(
     events: list[OddsEvent],
     poly_home: str,
     poly_away: str,
+    poly_sport_slug: Optional[str] = None,
 ) -> Optional[OddsEvent]:
     ph, pa = (poly_home or "").strip(), (poly_away or "").strip()
     if not ph or not pa:
         return None
+    phn = normalize_name_order(ph)
+    pan = normalize_name_order(pa)
     for ev in events:
         oh_raw, oa_raw = (ev.home or "").strip(), (ev.away or "").strip()
         if not oh_raw or not oa_raw:
             continue
         oh = normalize_name_order(oh_raw)
         oa = normalize_name_order(oa_raw)
-        if (_team_similar_for_io_pair(ph, oh) and _team_similar_for_io_pair(pa, oa)) or (
-            _team_similar_for_io_pair(ph, oa) and _team_similar_for_io_pair(pa, oh)
-        ):
+        sc, _tag = team_pair_match_score(phn, pan, oh, oa, sport_slug=poly_sport_slug)
+        if sc >= TEAM_PAIR_MATCH_THRESHOLD:
             return ev
     return None
 
@@ -418,6 +409,8 @@ def _oddsevents_from_odds_payload(
                 event_id=eid,
                 sport=sport_slug,
                 event_date_s=event_date_s,
+                ws_received_at_utc="",
+                catalog_metadata_only=False,
             )
         )
     return out
@@ -478,6 +471,14 @@ class OddsApiIo:
         # Última señal de cuota/límite REST para mostrar en dashboard.
         self._last_rest_limit_notice: str = ""
         self._last_rest_limit_until_mono: float = 0.0
+        # Catálogo GET /events completo por io_sport (TTL corto); matching ampliado sin multi masivo.
+        self.events_catalog_ttl_sec = float(
+            os.getenv("ODDS_API_IO_EVENTS_CATALOG_TTL_SEC") or _EVENTS_CATALOG_TTL_SEC_DEFAULT
+        )
+        self._events_catalog: dict[str, tuple[float, list[CatalogRow]]] = {}
+        self._catalog_last_fetch_mono_per_sport: dict[str, float] = {}
+        # event_id → (mono, OddsEvent) tras hydrate puntual (/odds/multi 1 id).
+        self._hydrated_odds_by_eid: dict[str, tuple[float, OddsEvent]] = {}
 
     def set_betfair_tick_callback(self, cb: Optional[BetfairTickCallback]) -> None:
         """latency_arb_sports lo conecta para reaccionar al instante a cada tick Betfair válido."""
@@ -799,6 +800,8 @@ class OddsApiIo:
                 event_id=ev.event_id,
                 sport=ev.sport,
                 event_date_s=ev.event_date_s,
+                ws_received_at_utc=getattr(ev, "ws_received_at_utc", "") or "",
+                catalog_metadata_only=bool(getattr(ev, "catalog_metadata_only", False)),
             ),
             completed,
         )
@@ -865,6 +868,207 @@ class OddsApiIo:
             self._ws_rows_completed_from_rest += int(completed)
         out.sort(key=lambda e: (self._bookie_priority(e.bookie), e.event_id))
         return out
+
+    def _primary_wanted_bookie(self) -> str:
+        for b in self.bookmakers_csv.split(","):
+            t = b.strip()
+            if t:
+                return t
+        return "Betfair Exchange"
+
+    def _prune_hydrated_odds_cache(self) -> None:
+        now = time.monotonic()
+        stale = [
+            eid
+            for eid, row in self._hydrated_odds_by_eid.items()
+            if now - float(row[0]) > _HYDRATED_ODDS_BY_EID_TTL_SEC
+        ]
+        for eid in stale:
+            self._hydrated_odds_by_eid.pop(eid, None)
+
+    def _catalog_row_to_stub_odds_event(self, row: CatalogRow) -> OddsEvent:
+        h_raw, a_raw = str(row.home or "").strip(), str(row.away or "").strip()
+        h = normalize_name_order(h_raw) if h_raw else ""
+        a = normalize_name_order(a_raw) if a_raw else ""
+        bk = self._primary_wanted_bookie()
+        return OddsEvent(
+            home=h or h_raw,
+            away=a or a_raw,
+            home_odds=-1.0,
+            away_odds=-1.0,
+            draw_odds=None,
+            bookie=bk,
+            updated_at="",
+            event_id=str(row.event_id).strip(),
+            sport=str(row.io_sport or "").strip().lower(),
+            event_date_s=str(row.event_date_s or "").strip(),
+            ws_received_at_utc="",
+            catalog_metadata_only=True,
+        )
+
+    def get_matching_candidate_events_with_stats(self, sport: str) -> tuple[list[OddsEvent], dict[str, int]]:
+        """
+        WS ∪ REST (get_cached_odds) ∪ hidratados puntuales ∪ stubs del catálogo /events (sin duplicar event_id+bookie).
+        stats: catalog_events_total (filas catálogo frescas), catalog_candidates_added (stubs añadidos).
+        """
+        k = sport.strip().lower()
+        io_sport = str(ODDS_KEY_TO_IO_SPORT.get(k, k)).strip().lower()
+        stats = {"catalog_events_total": 0, "catalog_candidates_added": 0}
+        base = self.get_cached_odds(sport)
+        self._prune_hydrated_odds_cache()
+        now = time.monotonic()
+        cat_row = self._events_catalog.get(io_sport)
+        if cat_row and (now - cat_row[0]) < self.events_catalog_ttl_sec:
+            stats["catalog_events_total"] = len(cat_row[1])
+        by_key: dict[tuple[str, str], OddsEvent] = {}
+        for ev in base:
+            by_key[(str(ev.event_id), str(ev.bookie).casefold())] = ev
+        for eid, (ts, hev) in list(self._hydrated_odds_by_eid.items()):
+            if now - float(ts) > _HYDRATED_ODDS_BY_EID_TTL_SEC:
+                continue
+            key = (str(eid), str(hev.bookie).casefold())
+            by_key[key] = hev
+        ids_in_merge = {str(ev.event_id) for ev in by_key.values()}
+        if cat_row and (now - cat_row[0]) < self.events_catalog_ttl_sec:
+            bk0 = self._primary_wanted_bookie().casefold()
+            for cr in cat_row[1]:
+                eid_c = str(cr.event_id).strip()
+                if not eid_c:
+                    continue
+                if eid_c in ids_in_merge:
+                    continue
+                stub = self._catalog_row_to_stub_odds_event(cr)
+                by_key[(eid_c, bk0)] = stub
+                ids_in_merge.add(eid_c)
+                stats["catalog_candidates_added"] += 1
+        out = list(by_key.values())
+        out.sort(key=lambda e: (self._bookie_priority(e.bookie), e.event_id))
+        return out, stats
+
+    def get_matching_candidate_events(self, sport: str) -> list[OddsEvent]:
+        evs, _st = self.get_matching_candidate_events_with_stats(sport)
+        return evs
+
+    async def refresh_events_catalog(self, session: aiohttp.ClientSession, io_sport: str) -> int:
+        """GET /v3/events sin /odds/multi. Devuelve nº de filas del catálogo (válido o tras skip por TTL/cuota)."""
+        sp = str(io_sport or "").strip().lower()
+        if not sp:
+            return 0
+        now = time.monotonic()
+        row = self._events_catalog.get(sp)
+        if row and (now - row[0]) < self.events_catalog_ttl_sec:
+            return len(row[1])
+        last_cat = float(self._catalog_last_fetch_mono_per_sport.get(sp, 0.0))
+        if last_cat > 0.0 and (now - last_cat) < _REST_PER_SPORT_MIN_INTERVAL_SEC:
+            return len(row[1]) if row else 0
+        if self._bulk_backoff_blocked(sp):
+            return len(row[1]) if row else 0
+        if not self._rest_quota_can_consume():
+            return len(row[1]) if row else 0
+        try:
+            rows = await self._rest_fetch_events_catalog_only(session, sp)
+        except OddsApiIoRestQuotaError:
+            self._set_bulk_backoff_for_sport(sp, _REST_BULK_BACKOFF_SEC)
+            return len(row[1]) if row else 0
+        except Exception as e:
+            log.warning("[odds_api_io] refresh_events_catalog sport=%s err: %s", sp, e)
+            return len(row[1]) if row else 0
+        self._catalog_last_fetch_mono_per_sport[sp] = time.monotonic()
+        async with self._lock:
+            self._events_catalog[sp] = (time.monotonic(), rows)
+        return len(rows)
+
+    async def _rest_fetch_events_catalog_only(
+        self, session: aiohttp.ClientSession, io_sport: str
+    ) -> list[CatalogRow]:
+        params = {"apiKey": self.api_key, "sport": io_sport}
+        url = f"{BASE_REST}/events"
+        self._rest_quota_consume()
+        async with session.get(
+            url, params=params, headers=_DEFAULT_HEADERS, timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                self._remember_rest_limit_notice(resp.status, f"GET /events catalog sport={io_sport}", text)
+                if resp.status in (401, 403):
+                    self._set_bulk_backoff_global_auth(_REST_AUTH_BACKOFF_SEC)
+                _raise_if_rest_quota_error(resp.status, text, f"GET /events catalog sport={io_sport}")
+                log.warning(
+                    "[odds_api_io] GET /events catalog sport=%s HTTP %s: %s",
+                    io_sport,
+                    resp.status,
+                    text[:300],
+                )
+                return []
+            data = json.loads(text)
+        evs = data if isinstance(data, list) else []
+        out: list[CatalogRow] = []
+        for ev in evs:
+            if not isinstance(ev, dict):
+                continue
+            eid_raw = ev.get("id")
+            eid = str(eid_raw).strip() if eid_raw is not None else ""
+            if not eid:
+                continue
+            h_raw, a_raw = _extract_home_away_from_event_payload(ev)
+            self._set_event_meta(eid, h_raw, a_raw)
+            self._remember_event_sport(eid, io_sport)
+            ds = str(ev.get("date") or ev.get("commence") or ev.get("startDate") or "").strip()
+            out.append(
+                CatalogRow(
+                    event_id=eid,
+                    home=h_raw,
+                    away=a_raw,
+                    event_date_s=ds,
+                    io_sport=io_sport,
+                )
+            )
+        return out
+
+    async def hydrate_event_odds(
+        self, session: aiohttp.ClientSession, event_id: str, io_sport: str
+    ) -> tuple[Optional[OddsEvent], str]:
+        """
+        GET /odds/multi para un solo event_id. Devuelve (OddsEvent|None, status):
+        ok | quota_blocked | fail
+        """
+        eid = str(event_id or "").strip()
+        sp = str(io_sport or "").strip().lower()
+        if not eid or not sp:
+            return None, "fail"
+        if self._bulk_backoff_blocked(sp):
+            return None, "quota_blocked"
+        if not self._rest_quota_can_consume():
+            return None, "quota_blocked"
+        try:
+            rows = await self._rest_odds_multi(session, [eid], sp)
+        except OddsApiIoRestQuotaError:
+            self._set_bulk_backoff_for_sport(sp, _REST_BULK_BACKOFF_SEC)
+            return None, "quota_blocked"
+        except Exception as e:
+            log.warning("[odds_api_io] hydrate_event_odds event_id=%s err: %s", eid, e)
+            return None, "fail"
+        if not rows:
+            return None, "fail"
+        ev = rows[0]
+        if ev.home_odds <= 1.0 or ev.away_odds <= 1.0:
+            return None, "fail"
+        ev2 = OddsEvent(
+            home=ev.home,
+            away=ev.away,
+            home_odds=ev.home_odds,
+            away_odds=ev.away_odds,
+            draw_odds=ev.draw_odds,
+            bookie=ev.bookie,
+            updated_at=ev.updated_at,
+            event_id=ev.event_id,
+            sport=ev.sport or sp,
+            event_date_s=ev.event_date_s,
+            ws_received_at_utc=getattr(ev, "ws_received_at_utc", "") or "",
+            catalog_metadata_only=False,
+        )
+        self._hydrated_odds_by_eid[eid] = (time.monotonic(), ev2)
+        return ev2, "ok"
 
     def has_ws_odds_for_io_sport(self, io_sport: str) -> bool:
         """True si hay al menos un tick WS en caché para el slug IO (p. ej. tennis)."""
@@ -1289,14 +1493,15 @@ class OddsApiIo:
         ho, ao, d_o = _parse_ml_odds_row(row)
         if ho is None or ao is None:
             return
+        recv_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         if message_type == "updated":
             log.info(
-                "[odds_api_io] TICK event_id=%s bookie=%s\n   home_odds=%s away_odds=%s\n   received_at=%s",
+                "[odds_api_io] TICK event_id=%s bookie=%s\n   home_odds=%s away_odds=%s\n   received_at_utc=%s",
                 eid,
                 bookie,
                 ho,
                 ao,
-                datetime.utcnow().isoformat(),
+                recv_iso,
             )
         if home:
             home = normalize_name_order(home)
@@ -1315,6 +1520,8 @@ class OddsApiIo:
             event_id=eid,
             sport=sport_resolved or "",
             event_date_s=str(data.get("date") or data.get("commence") or data.get("startDate") or "").strip(),
+            ws_received_at_utc=recv_iso,
+            catalog_metadata_only=False,
         )
         async with self._lock:
             self._ws_odds_cache.setdefault(eid, {})[bookie] = ev

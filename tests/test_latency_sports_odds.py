@@ -3,14 +3,39 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from arb.latency_arb_sports import (
     GammaSportMarket,
     _event_matches_odds_teams,
+    _odds_io_reference_instant_utc,
+    _odds_io_updated_age_sec,
     _pick_best_market_in_event,
 )
 from clients.odds_api import implied_prob, remove_vig, teams_match_odds_gamma
+from clients.odds_api_io import OddsEvent, find_event_matching_teams
+
+
+class TestStaleReferenceUtc(unittest.TestCase):
+    def test_ws_received_trumps_stale_book_updated_at(self) -> None:
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
+        ev = OddsEvent(
+            home="A",
+            away="B",
+            home_odds=2.0,
+            away_odds=2.0,
+            draw_odds=None,
+            bookie="Betfair Exchange",
+            updated_at="2000-01-01T00:00:00",
+            event_id="x",
+            sport="tennis",
+            ws_received_at_utc=recent,
+        )
+        ref = _odds_io_reference_instant_utc(ev)
+        assert ref is not None
+        age = _odds_io_updated_age_sec(ev)
+        assert age is not None
+        self.assertLess(age, 30.0, msg="age should use ws_received_at, not ancient updated_at")
 
 
 class TestLatencySportsOdds(unittest.TestCase):
@@ -85,6 +110,69 @@ class TestTeamMatching(unittest.TestCase):
         for odds_name, gamma_name in pairs:
             with self.subTest(odds=odds_name, gamma=gamma_name):
                 self.assertFalse(teams_match_odds_gamma(odds_name, gamma_name))
+
+    def test_nba_cle_tor_variants(self) -> None:
+        nba = "basketball_nba"
+        self.assertTrue(
+            teams_match_odds_gamma("Cleveland Cavaliers", "Cavaliers vs Raptors", sport_slug=nba)
+        )
+        self.assertTrue(
+            teams_match_odds_gamma("Toronto Raptors", "Cavaliers vs Raptors", sport_slug=nba)
+        )
+        self.assertTrue(
+            teams_match_odds_gamma("CLE", "cle vs tor", sport_slug=nba)
+        )
+        self.assertTrue(
+            teams_match_odds_gamma("Toronto Raptors", "Cleveland Cavaliers vs Toronto Raptors", sport_slug=nba)
+        )
+        self.assertTrue(
+            teams_match_odds_gamma("Cleveland Cavaliers", "Toronto Raptors vs Cleveland Cavaliers", sport_slug=nba)
+        )
+
+    def test_find_event_matching_teams_nba_swap(self) -> None:
+        ev = OddsEvent(
+            home="Cleveland Cavaliers",
+            away="Toronto Raptors",
+            home_odds=2.0,
+            away_odds=2.0,
+            draw_odds=None,
+            bookie="Betfair Exchange",
+            updated_at="",
+            event_id="e1",
+            sport="basketball",
+        )
+        pool = [ev]
+        hit = find_event_matching_teams(pool, "Raptors", "Cavaliers", "basketball_nba")
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertEqual(hit.event_id, "e1")
+
+    def test_epl_man_utd_spurs(self) -> None:
+        epl = "soccer_epl"
+        self.assertTrue(
+            teams_match_odds_gamma("Manchester United", "Man United vs Spurs", sport_slug=epl)
+        )
+        self.assertTrue(
+            teams_match_odds_gamma("Tottenham Hotspur", "Man United vs Spurs", sport_slug=epl)
+        )
+        self.assertTrue(
+            teams_match_odds_gamma("Tottenham Hotspur", "Tottenham vs Manchester United", sport_slug=epl)
+        )
+        ev = OddsEvent(
+            home="Manchester United",
+            away="Tottenham Hotspur",
+            home_odds=2.0,
+            away_odds=2.0,
+            draw_odds=None,
+            bookie="Betfair Exchange",
+            updated_at="",
+            event_id="epl1",
+            sport="football",
+        )
+        hit = find_event_matching_teams(
+            [ev], "Man United", "Spurs", epl
+        )
+        self.assertIsNotNone(hit)
 
 
 if __name__ == "__main__":
