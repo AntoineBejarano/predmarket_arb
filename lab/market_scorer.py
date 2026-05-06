@@ -20,6 +20,8 @@ log = logging.getLogger("market_scorer")
 
 BUFFER_PATH = REPO_ROOT / "data" / "scorer_state" / "candles_buffer.parquet"
 _CANDLE_BUFFER_COLS = ("open_time", "open", "high", "low", "close", "volume")
+# Misma regla que ``ready``: al menos N velas cerradas en buffer (WS o parquet normalizado).
+MIN_CANDLES_READY = 20
 
 BINANCE_KLINE_WS = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -63,6 +65,29 @@ def _nearest_round_1000(price: float) -> float:
     return round(price / 1000.0) * 1000.0
 
 
+def _normalize_restored_candle_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Misma forma que ``_ingest_binance_closed`` (claves open_time, open, high, low, close, volume).
+    ``open_time`` en ms UTC (int); OHLCV float. Parquet/pandas pueden devolver Timestamp o numpy.
+    """
+    try:
+        t_raw = row["open_time"]
+        if isinstance(t_raw, pd.Timestamp):
+            open_time_ms = int(t_raw.value // 1_000_000)
+        else:
+            open_time_ms = int(float(t_raw))
+        return {
+            "open_time": open_time_ms,
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "volume": float(row["volume"]),
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 class MarketScorer:
     """
     Escucha Binance kline 1m y (opcional) Polymarket CLOB market WS;
@@ -98,7 +123,7 @@ class MarketScorer:
         - liquidity_usdc: float | None — liquidez top 5 niveles (bids+asks)
         - spot_price: float | None
         - candles_below_ptb: int — últimas 5 velas cerradas con close < PTB (0 si N/A)
-        - ready: bool — True si buffer >= 20 velas y WS conectados
+        - ready: bool — True si buffer >= MIN_CANDLES_READY velas y WS conectados
         """
         with self._lock:
             candles = list(self._candles)
@@ -108,7 +133,12 @@ class MarketScorer:
             bn_ok = self._binance_connected
             cl_ok = self._clob_connected
             n_candles = len(candles)
-            ready = n_candles >= 20 and bn_ok and (token_tgt is None or cl_ok)
+            ready = n_candles >= MIN_CANDLES_READY and bn_ok and (token_tgt is None or cl_ok)
+            log.debug(
+                "ready check: buffer=%d min_required=%d",
+                n_candles,
+                MIN_CANDLES_READY,
+            )
 
         spot: float | None = None
         clob_mid: float | None = None
@@ -166,7 +196,7 @@ class MarketScorer:
             liq_a = sum(float(asks[p]) * float(p) for p in ask_prices)
             liquidity = float(liq_b + liq_a)
 
-        if n_candles < 20:
+        if n_candles < MIN_CANDLES_READY:
             score, components = self._apply_rules_12_13(
                 score,
                 components,
@@ -248,7 +278,7 @@ class MarketScorer:
                 components["vwap"] = vw
 
         # 4 Bollinger 20, 2 std
-        if len(df) >= 20:
+        if len(df) >= MIN_CANDLES_READY:
             mid = df["close"].rolling(20).mean()
             std = df["close"].rolling(20).std()
             lower = mid - 2 * std
@@ -450,9 +480,14 @@ class MarketScorer:
                 if len(self._candles) > 0:
                     return
                 for row in records:
-                    self._candles.append(
-                        {c: row[c] for c in _CANDLE_BUFFER_COLS}
-                    )
+                    norm = _normalize_restored_candle_row(row)
+                    if norm is None:
+                        log.warning(
+                            "Buffer parquet: fila omitida (no alineable a claves WS): %s",
+                            row,
+                        )
+                        continue
+                    self._candles.append(norm)
                 nbuf = len(self._candles)
                 first_ot = self._candles[0]["open_time"] if self._candles else "—"
                 last_ot = self._candles[-1]["open_time"] if self._candles else "—"
@@ -493,6 +528,7 @@ class MarketScorer:
         with self._lock:
             self._candles.append(row)
             n = len(self._candles)
+        log.info("VELA CERRADA: close=%.2f buffer_len=%d", float(k["c"]), n)
         if n > 0 and n % 5 == 0:
             self._save_buffer()
 

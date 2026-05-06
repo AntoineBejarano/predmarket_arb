@@ -86,7 +86,13 @@
       <section id="summary" class="grid sm:grid-cols-2 gap-3 text-sm"></section>
 
       <section>
-        <h2 class="text-sm font-medium text-slate-300 mb-2">Últimas filas (settle / trades)</h2>
+        <h2 class="text-sm font-medium text-slate-300 mb-2">Últimas filas del CSV (engine)</h2>
+        <p class="text-[11px] text-slate-500 mb-2 max-w-4xl">
+          En la tabla, <strong class="text-slate-300">un trade = una fila</strong>: se fusionan la entrada (fill) y el cierre (settle) del mismo <code class="text-slate-400">market_id</code>;
+          la columna <code class="text-slate-400">timestamp_utc</code> muestra <span class="text-emerald-300/90">entrada → cierre</span>. Los snapshots repetidos entre medias no se listan.
+          <span class="inline-flex items-center gap-1 rounded border border-amber-700/50 bg-amber-950/30 px-1.5 py-0.5 font-mono text-amber-200 ml-1">SOLO ENTRADA</span>
+          = hay fill en este recorte pero no aparece el settle en las mismas filas cargadas (suele ser por el límite de líneas: el cierre puede estar más arriba en el CSV).
+        </p>
         <div class="overflow-x-auto rounded-lg border border-slate-700">
           <table class="min-w-full text-xs font-mono">
             <thead class="bg-slate-800 text-slate-400 text-left">
@@ -195,7 +201,12 @@
         </div>
       </div>
       <div>
-        <h3 class="text-xs font-medium text-slate-500 uppercase mb-2">Log CSV</h3>
+        <h3 class="text-xs font-medium text-slate-500 uppercase mb-1">Log CSV</h3>
+        <p class="text-[10px] text-slate-500 mb-2 leading-relaxed">
+          Misma vista que Control: <span class="text-emerald-300 font-semibold">TRADE</span> = entrada+cierre fusionados (ts con
+          <span class="font-mono text-slate-400">→</span>);
+          <span class="text-amber-300 font-semibold">SOLO ENTRADA</span> = solo ves el fill en el recorte cargado (el settle puede estar en líneas que ya no entran en el límite). Sin etiqueta = snapshot.
+        </p>
         <div class="overflow-x-auto max-h-64 overflow-y-auto rounded-lg border border-slate-700">
           <table class="min-w-full text-[11px] font-mono">
             <thead class="bg-slate-950 text-slate-400 sticky top-0 z-10">
@@ -271,7 +282,7 @@
       return r.json();
     }
     async function fetchLog() {
-      const r = await fetch("/api/arb/strategy/" + SLUG + "/log?limit=80", {
+      const r = await fetch("/api/arb/strategy/" + SLUG + "/log?limit=500", {
         cache: "no-store",
         headers: { Accept: "application/json" },
       });
@@ -283,6 +294,96 @@
       if (cls) n.className = cls;
       if (text != null) n.textContent = text;
       return n;
+    }
+    function rowTsAny(r) {
+      return String((r && (r.timestamp_utc || r.timestamp)) || "");
+    }
+    /** Fusiona fill+settle (mismo market_id) en una fila para la UI; oculta snapshots entre medias. */
+    function sixcycleBuildMergedDisplayRows(rows) {
+      if (!rows || !rows.length) return rows;
+      var chrono = rows.slice().sort(function (a, b) {
+        return rowTsAny(a).localeCompare(rowTsAny(b));
+      });
+      var pendingFill = {};
+      var closedMids = {};
+      var out = [];
+      chrono.forEach(function (r) {
+        var mid = String((r && r.market_id) || "").trim();
+        if (!mid) {
+          out.push(r);
+          return;
+        }
+        var k = sixcycleTradeKindRaw(r);
+        if (k === "fill") {
+          pendingFill[mid] = r;
+          return;
+        }
+        if (k === "settle") {
+          var fill = pendingFill[mid];
+          if (fill) {
+            out.push(sixcycleMergedTradeRow(fill, r));
+            delete pendingFill[mid];
+            closedMids[mid] = true;
+          } else {
+            out.push(r);
+          }
+          return;
+        }
+        if (pendingFill[mid]) return;
+        if (closedMids[mid]) return;
+        out.push(r);
+      });
+      Object.keys(pendingFill).forEach(function (mid) {
+        out.push(sixcycleOpenTradeRow(pendingFill[mid]));
+      });
+      return out;
+    }
+    function sixcycleMergedTradeRow(fill, settle) {
+      var o = {};
+      Object.keys(fill).forEach(function (k) {
+        if (k.indexOf("__") === 0) return;
+        o[k] = fill[k];
+      });
+      Object.keys(settle).forEach(function (k) {
+        if (k.indexOf("__") === 0) return;
+        var v = settle[k];
+        if (v != null && String(v).trim() !== "") o[k] = v;
+      });
+      o.timestamp_utc = rowTsAny(fill) + " → " + rowTsAny(settle);
+      o.__ui_merged = "closed";
+      return o;
+    }
+    function sixcycleOpenTradeRow(fill) {
+      var o = {};
+      Object.keys(fill).forEach(function (k) {
+        if (k.indexOf("__") === 0) return;
+        o[k] = fill[k];
+      });
+      o.timestamp_utc = rowTsAny(fill) + " · (sin fila settle en este recorte)";
+      o.phase = "SOLO_ENTRADA";
+      o.__ui_merged = "open";
+      return o;
+    }
+    /** Igual que sixcycleTradeKind pero sin leer __ui_merged (uso interno al fusionar). */
+    function sixcycleTradeKindRaw(row) {
+      if (!row || typeof row !== "object") return "";
+      // SETTLED lleva también stake/fill en el CSV: hay que detectar settle antes que fill.
+      var ph = (row.phase || "").toUpperCase().trim();
+      var rs = String(row.reason || "")
+        .toLowerCase()
+        .trim();
+      if (ph === "SETTLED" || rs === "settle") return "settle";
+      var st = row.stake_usdc;
+      var fp = row.fill_price;
+      if (st != null && String(st).trim() !== "" && fp != null && String(fp).trim() !== "") return "fill";
+      return "";
+    }
+    /** "" | "fill" | "settle" — respeta filas fusionadas en la UI. */
+    function sixcycleTradeKind(row) {
+      if (!row || typeof row !== "object") return "";
+      if (row.__ui_merged === "closed") return "settle";
+      if (row.__ui_merged === "open") return "fill";
+      return sixcycleTradeKindRaw(row);
     }
     function renderSummary(strategies) {
       const s = (strategies || []).find((x) => x.slug === SLUG) || {};
@@ -318,14 +419,51 @@
         msg.textContent = "Sin filas aún en el CSV.";
         return;
       }
-      msg.textContent = String(rows.length) + " filas (máx. 80 mostradas).";
-      const cols = Object.keys(rows[0]);
+      var displayRows = sixcycleBuildMergedDisplayRows(rows);
+      if (!displayRows.length) {
+        msg.textContent = "Sin filas en vista tras fusionar.";
+        return;
+      }
+      msg.textContent =
+        String(rows.length) +
+        " filas CSV → " +
+        String(displayRows.length) +
+        " en vista (1 fila por trade; snapshots entre fill y settle ocultos).";
+      const cols = Object.keys(displayRows[0]).filter(function (k) {
+        return k.indexOf("__") !== 0;
+      });
+      thead.appendChild(el("th", "px-2 py-2 font-normal text-lime-300/90 sticky left-0 bg-slate-800 z-[1]", "Tipo"));
       cols.forEach((c) => thead.appendChild(el("th", "px-2 py-2 font-normal", c)));
-      rows.slice().reverse().forEach((row) => {
+      displayRows.slice().reverse().forEach((row) => {
         const tr = document.createElement("tr");
-        tr.className = "hover:bg-slate-800/60";
+        const kind = sixcycleTradeKind(row);
+        if (kind === "fill") {
+          tr.className =
+            "hover:bg-emerald-900/25 bg-emerald-950/40 border-l-4 border-l-lime-400 ring-1 ring-inset ring-lime-400/20";
+        } else if (kind === "settle") {
+          tr.className =
+            "hover:bg-emerald-900/30 bg-emerald-950/45 border-l-4 border-l-emerald-400 ring-1 ring-inset ring-emerald-500/25";
+        } else {
+          tr.className = "hover:bg-slate-800/60";
+        }
+        const tdKind = document.createElement("td");
+        tdKind.className =
+          "px-2 py-1.5 whitespace-nowrap sticky left-0 z-[1] font-sans text-[10px] font-bold align-middle " +
+          (kind === "fill"
+            ? "bg-emerald-950/80 text-lime-200 border-r border-emerald-800/60"
+            : kind === "settle"
+              ? "bg-emerald-950/80 text-emerald-200 border-r border-emerald-800/60"
+              : "bg-slate-900/95 text-slate-600 border-r border-slate-800");
+        if (row.__ui_merged === "closed") tdKind.textContent = "TRADE";
+        else if (row.__ui_merged === "open") tdKind.textContent = "SOLO ENTRADA";
+        else if (kind === "fill") tdKind.textContent = "TRADE · entrada";
+        else if (kind === "settle") tdKind.textContent = "TRADE · cierre";
+        else tdKind.textContent = "—";
+        tr.appendChild(tdKind);
         cols.forEach((c) => {
-          tr.appendChild(el("td", "px-2 py-1.5 text-slate-300 whitespace-nowrap max-w-[14rem] truncate", String(row[c] ?? "")));
+          const td = el("td", "px-2 py-1.5 text-slate-300 whitespace-nowrap max-w-[14rem] truncate", String(row[c] ?? ""));
+          if (kind === "fill" || kind === "settle") td.className += " text-slate-100";
+          tr.appendChild(td);
         });
         tbody.appendChild(tr);
       });
@@ -434,8 +572,9 @@
         return row.timestamp_utc || row.timestamp || "";
       }
       function rowPhase(row) {
+        if (row && row.__ui_merged === "open") return "SOLO_ENTRADA";
         const ph0 = (row.phase || "").toUpperCase().trim();
-        if (ph0 === "SETTLED" || ph0 === "EJECUTANDO") return ph0;
+        if (ph0 === "SETTLED" || ph0 === "EJECUTANDO" || ph0 === "SOLO_ENTRADA") return ph0;
         const res = (row.resolved || "").toLowerCase().trim();
         if (res === "win" || res === "loss") return "SETTLED";
         const filled = String(row.filled || "").toLowerCase();
@@ -443,8 +582,17 @@
         return "SKIPPED";
       }
       function logRowClass(row) {
-        const ph = rowPhase(row);
+        const kind = typeof sixcycleTradeKind === "function" ? sixcycleTradeKind(row) : "";
         const res = (row.resolved || "").toLowerCase().trim();
+        if (kind === "fill") {
+          return "bg-emerald-950/50 border-l-4 border-l-lime-400 ring-1 ring-inset ring-lime-400/25";
+        }
+        if (kind === "settle") {
+          if (res === "win") return "bg-emerald-950/45 border-l-4 border-l-emerald-400 ring-1 ring-inset ring-emerald-500/30";
+          if (res === "loss") return "bg-red-950/35 border-l-4 border-l-red-400 ring-1 ring-inset ring-red-500/25";
+          return "bg-teal-950/40 border-l-4 border-l-teal-400 ring-1 ring-inset ring-teal-500/25";
+        }
+        const ph = rowPhase(row);
         if (ph === "SETTLED") return res === "win" ? "bg-emerald-950/30" : "bg-red-950/25";
         if (ph === "EXECUTED") return "bg-orange-950/20";
         if (ph === "EJECUTANDO") return "bg-slate-800/50";
@@ -456,6 +604,7 @@
         if (p === "EJECUTANDO") return "bg-orange-900/40 text-orange-200 border border-orange-700/50";
         if (p === "SETTLING") return "bg-purple-900/40 text-purple-200 border border-purple-700/50";
         if (p === "SETTLED") return "bg-emerald-900/35 text-emerald-200 border border-emerald-700/40";
+        if (p === "SOLO_ENTRADA") return "bg-amber-900/40 text-amber-200 border border-amber-700/50";
         if (p === "SKIPPED" || p === "OFFLINE") return "bg-slate-700 text-slate-300";
         return "bg-slate-700 text-slate-400";
       }
@@ -699,10 +848,44 @@
           tr.className = logRowClass(r);
           const ph = rowPhase(r);
           const mercado = (r.market_slug && String(r.market_slug).trim()) || r.market_id || r.slug || "";
-          [rowTs(r), ph, mercado, r.direction || "", r.edge || "", r.stake_usdc || "", r.resolved || "", r.pnl_usdc || ""].forEach(function (cell) {
+          const kind = typeof sixcycleTradeKind === "function" ? sixcycleTradeKind(r) : "";
+          const cells = [rowTs(r), ph, mercado, r.direction || "", r.edge || "", r.stake_usdc || "", r.resolved || "", r.pnl_usdc || ""];
+          cells.forEach(function (cell, idx) {
             const td = document.createElement("td");
-            td.className = "px-2 py-1 text-slate-300 whitespace-nowrap max-w-[9rem] truncate";
-            td.textContent = cell;
+            td.className =
+              "px-2 py-1 whitespace-nowrap max-w-[9rem] truncate " +
+              (kind ? "text-slate-100 font-medium" : "text-slate-300");
+            if (idx === 0) {
+              if (r.__ui_merged === "closed") {
+                const sp = document.createElement("span");
+                sp.className =
+                  "mr-1.5 inline-block shrink-0 rounded px-1 py-0.5 text-[9px] font-black uppercase tracking-wide bg-emerald-500 text-slate-950";
+                sp.textContent = "TRADE";
+                td.appendChild(sp);
+              } else if (r.__ui_merged === "open") {
+                const sp = document.createElement("span");
+                sp.className =
+                  "mr-1.5 inline-block shrink-0 rounded px-1 py-0.5 text-[9px] font-black uppercase tracking-wide bg-amber-400 text-amber-950";
+                sp.textContent = "SOLO ENTR.";
+                sp.title = "Fill en vista; settle no está en las filas cargadas (límite). El resultado puede existir más arriba en el CSV.";
+                td.appendChild(sp);
+              } else if (kind === "fill") {
+                const sp = document.createElement("span");
+                sp.className =
+                  "mr-1.5 inline-block shrink-0 rounded px-1 py-0.5 text-[9px] font-black uppercase tracking-wide bg-lime-400 text-emerald-950";
+                sp.textContent = "Trade";
+                td.appendChild(sp);
+              } else if (kind === "settle") {
+                const sp = document.createElement("span");
+                sp.className =
+                  "mr-1.5 inline-block shrink-0 rounded px-1 py-0.5 text-[9px] font-black uppercase tracking-wide bg-emerald-500 text-slate-950";
+                sp.textContent = "Cierre";
+                td.appendChild(sp);
+              }
+              td.appendChild(document.createTextNode(cell));
+            } else {
+              td.textContent = cell;
+            }
             tr.appendChild(td);
           });
           tb.appendChild(tr);
@@ -711,11 +894,13 @@
 
       async function loadHistory() {
         try {
-          const r = await fetch("/api/sixcycle/history?limit=100");
+          const r = await fetch("/api/sixcycle/history?limit=600");
           const rows = await r.json();
           if (!Array.isArray(rows)) return;
-          fillTradesTable(rows);
-          fillLogTable(rows);
+          var merged =
+            typeof sixcycleBuildMergedDisplayRows === "function" ? sixcycleBuildMergedDisplayRows(rows) : rows;
+          fillTradesTable(merged);
+          fillLogTable(merged);
           buildEquityChart(rows);
         } catch (e) {
           console.warn("history", e);
