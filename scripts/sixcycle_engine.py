@@ -45,14 +45,14 @@ import signal as sig_module
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import aiohttp
 import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
+from rich.text import Text
 
 from clients.poly_clob import PolyCLOBClient, _level_price, _level_size
 from clients.poly_parse import api_bool_true, extract_yes_token_id, parse_json_maybe
@@ -69,25 +69,37 @@ KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 SCAN_INTERVAL_SECONDS = float(os.getenv("SCAN_INTERVAL_SECONDS", "30.0"))
 PREPARE_LAST_SECONDS = int(os.getenv("SIXCYCLE_PREPARE_LAST_SECONDS", "90"))
 GAMMA_API_URL = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com").rstrip("/")
+BINANCE_REST_URL = os.getenv("BINANCE_REST_URL", "https://api.binance.com").rstrip("/")
 
-_CSV_FIELDS = [
-    "timestamp",
+CSV_COLUMNS = [
+    "timestamp_utc",
+    "phase",
     "market_id",
-    "direction",
-    "model_prob",
+    "market_slug",
+    "minutes_elapsed",
     "clob_yes_price",
+    "clob_no_price",
+    "clob_extreme",
+    "liquidity_usdc",
+    "score",
+    "scorer_direction",
+    "scorer_confirms",
+    "signal",
+    "direction",
     "edge",
     "stake_usdc",
-    "filled",
+    "fill_price",
     "simulated",
     "resolved",
+    "resolution_up",
     "pnl_usdc",
+    "win",
     "win_streak",
-    "cycle_ms_scan",
-    "cycle_ms_predict",
-    "cycle_ms_validate",
-    "cycle_ms_size",
-    "cycle_ms_fill",
+    "trades_total",
+    "win_rate_pct",
+    "pnl_cumulative_usdc",
+    "reason",
+    "dry_run",
 ]
 
 _DEFAULT_HEADERS = {
@@ -121,6 +133,9 @@ SIXCYCLE_STATE: dict[str, Any] = {
     "win_streak": 0,
     "best_streak": 0,
     "dry_run": DRY_RUN,
+    "clob_extreme": "NEUTRAL",
+    "clob_no_price": None,
+    "clob_bar": "",
 }
 
 
@@ -136,6 +151,17 @@ def _floor_5m_window_ts_utc(now: datetime) -> int:
 
 def _slug_btc_5m(window_ts: int) -> str:
     return f"btc-updown-5m-{window_ts}"
+
+
+def _window_ts_from_btc_slug(slug: str) -> int | None:
+    """``btc-updown-5m-<unix>`` → inicio UTC de la ventana 5m en segundos."""
+    pref = "btc-updown-5m-"
+    if not slug.startswith(pref):
+        return None
+    try:
+        return int(slug[len(pref) :])
+    except ValueError:
+        return None
 
 
 def next_market_slug_ts_for_prepare(now: datetime | None = None) -> int:
@@ -236,6 +262,46 @@ def _gamma_price_to_beat(data: dict[str, Any]) -> float | None:
     return None
 
 
+async def _fetch_binance_5m_open(
+    http: aiohttp.ClientSession, window_start_ts: int, symbol: str = "BTCUSDT"
+) -> float | None:
+    """
+    OPEN de la vela 5m en Binance cuyo *open time* coincide con ``window_start_ts`` (UTC, segundos).
+
+    Los mercados Gamma ``btc-updown-5m-<ts>`` suelen no traer ``openPrice``; el PTB on-chain
+    es Chainlink al inicio de ventana — aquí usamos el open Binance 5m como proxy de UI/scorer.
+    """
+    st_ms = int(window_start_ts) * 1000
+    url = f"{BINANCE_REST_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": "5m", "startTime": st_ms, "limit": 1}
+    try:
+        async with http.get(url, params=params) as resp:
+            if resp.status != 200:
+                return None
+            arr = json.loads(await resp.text())
+        if not isinstance(arr, list) or not arr:
+            return None
+        row0 = arr[0]
+        if not isinstance(row0, (list, tuple)) or len(row0) < 2:
+            return None
+        return float(row0[1])
+    except Exception as e:  # noqa: BLE001
+        log.debug("binance 5m open ts=%s: %s", window_start_ts, e)
+        return None
+
+
+async def _resolve_price_to_beat(
+    http: aiohttp.ClientSession, data: dict[str, Any], slug: str
+) -> float | None:
+    ptb = _gamma_price_to_beat(data)
+    if ptb is not None:
+        return ptb
+    wts = _window_ts_from_btc_slug(slug)
+    if wts is None:
+        return None
+    return await _fetch_binance_5m_open(http, wts)
+
+
 def _model_prob_from_signal(signal: dict[str, Any]) -> float:
     """Proxy P(UP) para CLOBSignalFilter a partir de dirección y confianza del scorer."""
     d = signal.get("direction")
@@ -245,6 +311,63 @@ def _model_prob_from_signal(signal: dict[str, Any]) -> float:
     if d == "DOWN":
         return 0.5 - conf * 0.5
     return 0.5
+
+
+def _clob_extreme(clob_yes: float | None) -> Literal["UP", "DOWN", "NEUTRAL"]:
+    if clob_yes is None:
+        return "NEUTRAL"
+    try:
+        y = float(clob_yes)
+    except (TypeError, ValueError):
+        return "NEUTRAL"
+    if y != y:
+        return "NEUTRAL"
+    if y < 0.35:
+        return "UP"
+    if y > 0.65:
+        return "DOWN"
+    return "NEUTRAL"
+
+
+def _clob_bar_plain(clob_yes: float | None) -> str:
+    """Barra texto para panel/SSE (sin markup Rich)."""
+    ex = _clob_extreme(clob_yes)
+    if ex == "UP":
+        return "CLOB " + "█" * 12 + " UP   (YES<0.35)"
+    if ex == "DOWN":
+        return "CLOB " + "█" * 12 + " DOWN (YES>0.65)"
+    return "CLOB " + "░" * 12 + " neutro"
+
+
+def _clob_bar_rich(clob_yes: float | None) -> Text:
+    ex = _clob_extreme(clob_yes)
+    if ex == "UP":
+        return Text.from_markup("[bold green]CLOB ████████████[/] [green]UP[/] [dim](YES<0.35)[/]")
+    if ex == "DOWN":
+        return Text.from_markup("[bold red]CLOB ████████████[/] [red]DOWN[/] [dim](YES>0.65)[/]")
+    return Text.from_markup("[dim]CLOB ░░░░░░░░░░░░ neutro[/]")
+
+
+def _minutes_elapsed_from_tte(tte_sec: float | None) -> str:
+    if tte_sec is None:
+        return ""
+    try:
+        elapsed = max(0.0, min(300.0, 300.0 - float(tte_sec)))
+        return f"{elapsed / 60.0:.2f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _scorer_confirms_extreme(signal: dict[str, Any], extreme: str) -> bool:
+    d = signal.get("direction")
+    if d is None or extreme == "NEUTRAL":
+        return False
+    d = str(d).upper()
+    if extreme == "UP" and d == "UP":
+        return True
+    if extreme == "DOWN" and d == "DOWN":
+        return True
+    return False
 
 
 class SixCycleEngine:
@@ -275,7 +398,68 @@ class SixCycleEngine:
         self._prepare_slug: str = ""
         self._pending_signal: dict[str, Any] = {}
         self._last_val_snapshot: dict[str, Any] = {}
+        self._open_positions: dict[str, dict[str, Any]] = {}
         self._ensure_csv_header()
+
+    def _validate_with_clob_extreme_override(
+        self, signal: dict[str, Any], clob_yes: float, liquidity: float
+    ) -> dict[str, Any]:
+        """
+        Primero CLOBSignalFilter; si no hay señal y el CLOB está en extremo con liquidez OK,
+        re-evalúa con model_prob sintético (misma clase, sin tocar clob_signal_filter.py).
+        """
+        val = self.cycle_validate(signal, clob_yes, liquidity)
+        if val.get("signal"):
+            return val
+        if liquidity < MIN_LIQUIDITY_USDC:
+            return val
+        eps = 1e-5
+        if clob_yes > 0.65:
+            m_try = min(0.5, float(clob_yes) - MIN_EDGE - eps)
+            m_try = max(0.01, m_try)
+            direction = "NO"
+            edge = float(clob_yes) - m_try
+            log.info(
+                "CLOB extremo detectado: yes=%.3f → %s edge=%.3f",
+                clob_yes,
+                direction,
+                edge,
+            )
+            v2 = self._filter.evaluate(
+                m_try,
+                float(clob_yes),
+                min_edge=MIN_EDGE,
+                min_liquidity_usdc=MIN_LIQUIDITY_USDC,
+                liquidity=float(liquidity),
+            )
+            if v2.get("signal") and str(v2.get("direction")) == "NO":
+                r = dict(v2)
+                r["reason"] = str(r.get("reason", "")) + " [clob_extreme>0.65]"
+                return r
+        elif clob_yes < 0.35:
+            # Debe quedar estrictamente > 0.5 para rama YES del filtro.
+            m_try = max(0.5 + 2e-4, float(clob_yes) + MIN_EDGE + eps)
+            m_try = min(0.99, m_try)
+            direction = "YES"
+            edge = m_try - float(clob_yes)
+            log.info(
+                "CLOB extremo detectado: yes=%.3f → %s edge=%.3f",
+                clob_yes,
+                direction,
+                edge,
+            )
+            v2 = self._filter.evaluate(
+                m_try,
+                float(clob_yes),
+                min_edge=MIN_EDGE,
+                min_liquidity_usdc=MIN_LIQUIDITY_USDC,
+                liquidity=float(liquidity),
+            )
+            if v2.get("signal") and str(v2.get("direction")) == "YES":
+                r = dict(v2)
+                r["reason"] = str(r.get("reason", "")) + " [clob_extreme<0.35]"
+                return r
+        return val
 
     def _sync_sixcycle_state(
         self,
@@ -363,6 +547,15 @@ class SixCycleEngine:
             except (TypeError, ValueError):
                 clob_yes = None
 
+        clob_no: float | None = None
+        if clob_yes is not None:
+            try:
+                clob_no = max(0.0, min(1.0, 1.0 - float(clob_yes)))
+            except (TypeError, ValueError):
+                clob_no = None
+        clob_ex_s = _clob_extreme(clob_yes)
+        clob_bar_s = _clob_bar_plain(clob_yes)
+
         liq: float | None = None
         if sig.get("liquidity_usdc") is not None:
             try:
@@ -425,10 +618,25 @@ class SixCycleEngine:
             "win_streak": int(self.win_streak),
             "best_streak": int(self.best_streak),
             "dry_run": bool(DRY_RUN),
+            "clob_extreme": clob_ex_s,
+            "clob_no_price": clob_no,
+            "clob_bar": clob_bar_s,
         }
         with SIXCYCLE_STATE_LOCK:
             SIXCYCLE_STATE.clear()
             SIXCYCLE_STATE.update(payload)
+
+    def _publish_trade_counters_to_state(self) -> None:
+        """Actualiza solo KPIs de carrera en ``SIXCYCLE_STATE`` (p. ej. tras settle en tarea aparte)."""
+        now = datetime.now(timezone.utc).isoformat()
+        wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
+        with SIXCYCLE_STATE_LOCK:
+            SIXCYCLE_STATE["timestamp_utc"] = now
+            SIXCYCLE_STATE["trades"] = int(self.trades)
+            SIXCYCLE_STATE["win_rate"] = round(wr, 2)
+            SIXCYCLE_STATE["pnl_usdc"] = round(float(self.pnl_usdc), 6)
+            SIXCYCLE_STATE["win_streak"] = int(self.win_streak)
+            SIXCYCLE_STATE["best_streak"] = int(self.best_streak)
 
     async def shutdown(self) -> None:
         """Solicita salida del bucle principal; ``run()`` hace ``scorer.stop()`` en ``finally``."""
@@ -506,7 +714,7 @@ class SixCycleEngine:
                 data = data[0] if data else {}
             if not isinstance(data, dict):
                 return None
-            return _gamma_price_to_beat(data)
+            return await _resolve_price_to_beat(http, data, slug)
         except Exception as e:  # noqa: BLE001
             log.debug("next_market_ptb %s: %s", slug, e)
         return None
@@ -571,16 +779,110 @@ class SixCycleEngine:
 
     def _ensure_csv_header(self) -> None:
         self._csv_path.parent.mkdir(parents=True, exist_ok=True)
+        expected = ",".join(CSV_COLUMNS)
         if not self._csv_path.is_file() or self._csv_path.stat().st_size == 0:
             with self._csv_path.open("w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+                w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 w.writeheader()
+            return
+        try:
+            with self._csv_path.open("r", encoding="utf-8") as f:
+                first = f.readline().strip()
+        except OSError:
+            first = ""
+        if first == expected:
+            return
+        bak = self._csv_path.with_name(self._csv_path.name + ".bak_" + str(int(time.time())))
+        try:
+            self._csv_path.rename(bak)
+            log.warning("Cabecera CSV sixcycle distinta: archivo anterior → %s", bak.name)
+        except OSError as e:
+            log.warning("No se pudo rotar CSV anterior (%s); se trunca cabecera nueva.", e)
+        with self._csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            w.writeheader()
 
     async def _append_csv(self, row: dict[str, Any]) -> None:
         async with self._csv_lock:
             with self._csv_path.open("a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=_CSV_FIELDS, extrasaction="ignore")
-                w.writerow({k: row.get(k, "") for k in _CSV_FIELDS})
+                w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+                w.writerow({k: row.get(k, "") for k in CSV_COLUMNS})
+
+    def _csv_bool(self, v: Any) -> str:
+        if v is True or str(v).lower() in ("true", "1", "yes"):
+            return "true"
+        if v is False or str(v).lower() in ("false", "0", "no"):
+            return "false"
+        return ""
+
+    def _csv_row_scan(
+        self,
+        *,
+        phase: str,
+        market: dict[str, Any] | None,
+        signal: dict[str, Any],
+        val: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        ts = datetime.now(timezone.utc).isoformat()
+        wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
+        m = market or {}
+        mid = str(m.get("market_id", "") or "")
+        slug = str(m.get("market_slug", "") or "")
+        tte = m.get("tte_sec")
+        yes = m.get("clob_yes_price")
+        liq = m.get("liquidity_usdc")
+        try:
+            yes_f = float(yes) if yes is not None else None
+        except (TypeError, ValueError):
+            yes_f = None
+        no_f = max(0.0, min(1.0, 1.0 - yes_f)) if yes_f is not None else None
+        extreme = _clob_extreme(yes_f)
+        try:
+            liq_f = float(liq) if liq is not None else 0.0
+        except (TypeError, ValueError):
+            liq_f = 0.0
+        try:
+            score_i = int(signal.get("score", 0) or 0)
+        except (TypeError, ValueError):
+            score_i = 0
+        sdir = signal.get("direction")
+        sdir_s = str(sdir) if sdir is not None else ""
+        confirms = _scorer_confirms_extreme(signal, extreme)
+        v = val or {}
+        sig_b = bool(v.get("signal"))
+        edge_v = v.get("edge", "")
+        dir_v = str(v.get("direction", "") or "")
+        reason_v = str(v.get("reason", "") or "")
+        return {
+            "timestamp_utc": ts,
+            "phase": phase,
+            "market_id": mid,
+            "market_slug": slug,
+            "minutes_elapsed": _minutes_elapsed_from_tte(float(tte) if tte is not None else None),
+            "clob_yes_price": f"{yes_f:.6f}" if yes_f is not None else "",
+            "clob_no_price": f"{no_f:.6f}" if no_f is not None else "",
+            "clob_extreme": extreme,
+            "liquidity_usdc": f"{liq_f:.4f}" if liq is not None else "",
+            "score": str(score_i),
+            "scorer_direction": sdir_s,
+            "scorer_confirms": self._csv_bool(confirms),
+            "signal": self._csv_bool(sig_b),
+            "direction": dir_v,
+            "edge": f"{float(edge_v):.6f}" if edge_v != "" and edge_v is not None else "",
+            "stake_usdc": "",
+            "fill_price": "",
+            "simulated": "",
+            "resolved": "",
+            "resolution_up": "",
+            "pnl_usdc": "",
+            "win": "",
+            "win_streak": str(self.win_streak),
+            "trades_total": str(self.trades),
+            "win_rate_pct": f"{wr:.2f}",
+            "pnl_cumulative_usdc": f"{self.pnl_usdc:.6f}",
+            "reason": reason_v,
+            "dry_run": self._csv_bool(DRY_RUN),
+        }
 
     async def run(self) -> None:
         """Loop infinito con SCAN_INTERVAL_SECONDS entre iteraciones."""
@@ -720,9 +1022,10 @@ class SixCycleEngine:
                         for m in markets:
                             try:
                                 t_val = time.perf_counter()
+                                clob_book = float(m["clob_yes_price"])
                                 clob_px = signal.get("clob_yes_price")
                                 if clob_px is None:
-                                    clob_px = float(m["clob_yes_price"])
+                                    clob_px = clob_book
                                 else:
                                     clob_px = float(clob_px)
                                 liq_ws = signal.get("liquidity_usdc")
@@ -731,7 +1034,8 @@ class SixCycleEngine:
                                     if liq_ws is not None
                                     else float(m["liquidity_usdc"])
                                 )
-                                val = self.cycle_validate(signal, clob_px, liq)
+                                # Extremos CLOB vs precio YES del scan (evita desalineación con WS del scorer).
+                                val = self._validate_with_clob_extreme_override(signal, clob_book, liq)
                                 self._last_val_snapshot = dict(val)
                                 cycle_validate_ms = (time.perf_counter() - t_val) * 1000.0
                             except Exception as e:  # noqa: BLE001
@@ -798,6 +1102,14 @@ class SixCycleEngine:
                                     clob,
                                 )
                                 cycle_fill_ms = (time.perf_counter() - t_fill) * 1000.0
+                                log.info(
+                                    "FILL: market=%s dir=%s stake=%.2f price=%.4f simulated=%s",
+                                    str(m["market_id"]),
+                                    str(val.get("direction") or "YES"),
+                                    stake,
+                                    float(fill_out.get("price", fill_price)),
+                                    fill_out.get("simulated", True),
+                                )
                             except Exception as e:  # noqa: BLE001
                                 log.warning("cycle_fill error", extra={"error": str(e)})
                                 if not DRY_RUN:
@@ -815,11 +1127,14 @@ class SixCycleEngine:
 
                             settle_payload = {
                                 "market_id": str(m["market_id"]),
+                                "market_slug": str(m.get("market_slug", "")),
                                 "direction": str(val.get("direction") or "YES"),
                                 "stake_usdc": stake,
                                 "fill_price": float(fill_out.get("price", fill_price)),
                                 "model_prob": model_prob,
                                 "clob_yes_price": float(m["clob_yes_price"]),
+                                "liquidity_usdc": float(m["liquidity_usdc"]),
+                                "tte_sec": float(m["tte_sec"]),
                                 "edge": float(val["edge"]),
                                 "filled": bool(fill_out.get("filled")),
                                 "simulated": bool(fill_out.get("simulated", True)),
@@ -828,8 +1143,18 @@ class SixCycleEngine:
                                 "cycle_ms_validate": round(cycle_validate_ms, 2),
                                 "cycle_ms_size": round(cycle_size_ms, 2),
                                 "cycle_ms_fill": round(cycle_fill_ms, 2),
+                                "signal_snapshot": dict(signal),
+                                "val_snapshot": dict(val),
                             }
                             self._settle_payload_pending = settle_payload
+                            self._open_positions[str(m["market_id"])] = {
+                                "market_id": str(m["market_id"]),
+                                "market_slug": str(m.get("market_slug", "")),
+                                "direction": str(val.get("direction") or "YES"),
+                                "stake_usdc": stake,
+                                "clob_yes_price": float(m["clob_yes_price"]),
+                                "edge": float(val["edge"]),
+                            }
                             task = asyncio.create_task(
                                 self.cycle_settle(
                                     str(m["market_id"]),
@@ -851,11 +1176,28 @@ class SixCycleEngine:
                                 "Sin señal — edge insuficiente o sin mercados activos"
                             )
 
+                        try:
+                            m0 = markets[0] if markets else None
+                            scan_row = self._csv_row_scan(
+                                phase="EJECUTANDO",
+                                market=m0,
+                                signal=signal,
+                                val=dict(self._last_val_snapshot) if self._last_val_snapshot else None,
+                            )
+                            await self._append_csv(scan_row)
+                        except Exception as e:  # noqa: BLE001
+                            log.debug("scan csv row: %s", e)
+
                         self._sync_sixcycle_state(
                             "EJECUTANDO",
                             signal=signal,
                             markets=markets,
                         )
+                        if markets:
+                            try:
+                                self._console.print(_clob_bar_rich(float(markets[0]["clob_yes_price"])))
+                            except (KeyError, TypeError, ValueError):
+                                self._console.print(_clob_bar_rich(None))
                         self._render_dashboard(
                             mode,
                             cycle_scan_ms,
@@ -1005,6 +1347,7 @@ class SixCycleEngine:
             out.append(
                 {
                     "market_id": mid,
+                    "market_slug": slug,
                     "question": str(data.get("question", "")),
                     "token_yes_id": str(yid),
                     "token_no_id": str(nid) if nid else "",
@@ -1012,7 +1355,7 @@ class SixCycleEngine:
                     "tte_sec": float(tte),
                     "clob_yes_price": float(px),
                     "liquidity_usdc": float(liq),
-                    "price_to_beat": _gamma_price_to_beat(data),
+                    "price_to_beat": await _resolve_price_to_beat(http, data, slug),
                 }
             )
             break
@@ -1133,6 +1476,8 @@ class SixCycleEngine:
         url = f"{GAMMA_API_URL}/markets/{market_id}"
         resolved = ""
         pnl = 0.0
+        up_won_final: bool | None = None
+        won = False
         try:
             while True:
                 try:
@@ -1187,6 +1532,7 @@ class SixCycleEngine:
                     resolved = "unknown"
                     pnl = 0.0
                     break
+                up_won_final = bool(up_won)
                 bet_up = direction == "YES"
                 won = (bet_up and up_won) or ((not bet_up) and (not up_won))
                 if won:
@@ -1215,26 +1561,86 @@ class SixCycleEngine:
         except Exception:
             log.exception("settle loop error", extra={"market_id": market_id})
             resolved = resolved or "error"
+
+        log.info(
+            "SETTLE: market=%s resolved=%s pnl=%.4f win=%s",
+            market_id,
+            resolved,
+            pnl,
+            won,
+        )
+
+        ts = datetime.now(timezone.utc).isoformat()
+        wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
+        try:
+            cy_f = float(payload.get("clob_yes_price", 0))
+        except (TypeError, ValueError):
+            cy_f = 0.0
+        no_f = max(0.0, min(1.0, 1.0 - cy_f)) if cy_f else 0.0
+        extreme = _clob_extreme(cy_f if cy_f else None)
+        sig_snap = payload.get("signal_snapshot") or {}
+        val_snap = payload.get("val_snapshot") or {}
+        try:
+            score_i = int(sig_snap.get("score", 0) or 0)
+        except (TypeError, ValueError):
+            score_i = 0
+        sdir = sig_snap.get("direction")
+        sdir_s = str(sdir) if sdir is not None else ""
+        confirms = _scorer_confirms_extreme(sig_snap, extreme)
+        try:
+            liq_p = float(payload.get("liquidity_usdc", 0) or 0)
+        except (TypeError, ValueError):
+            liq_p = 0.0
+        tte_p = payload.get("tte_sec")
+        try:
+            tte_f = float(tte_p) if tte_p is not None else None
+        except (TypeError, ValueError):
+            tte_f = None
+
+        win_cell = ""
+        res_up_cell = ""
+        if resolved == "win":
+            win_cell = "true"
+        elif resolved == "loss":
+            win_cell = "false"
+        if up_won_final is not None:
+            res_up_cell = self._csv_bool(up_won_final)
+
         row = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": ts,
+            "phase": "SETTLED",
             "market_id": market_id,
+            "market_slug": str(payload.get("market_slug", "") or ""),
+            "minutes_elapsed": _minutes_elapsed_from_tte(tte_f),
+            "clob_yes_price": f"{cy_f:.6f}" if payload.get("clob_yes_price") is not None else "",
+            "clob_no_price": f"{no_f:.6f}" if payload.get("clob_yes_price") is not None else "",
+            "clob_extreme": extreme,
+            "liquidity_usdc": f"{liq_p:.4f}" if payload.get("liquidity_usdc") is not None else "",
+            "score": str(score_i),
+            "scorer_direction": sdir_s,
+            "scorer_confirms": self._csv_bool(confirms),
+            "signal": self._csv_bool(bool(val_snap.get("signal"))),
             "direction": direction,
-            "model_prob": payload.get("model_prob", ""),
-            "clob_yes_price": payload.get("clob_yes_price", ""),
-            "edge": payload.get("edge", ""),
-            "stake_usdc": stake,
-            "filled": str(payload.get("filled", False)).lower(),
-            "simulated": str(payload.get("simulated", True)).lower(),
+            "edge": f"{float(payload.get('edge', 0)):.6f}",
+            "stake_usdc": f"{stake:.4f}",
+            "fill_price": f"{float(payload.get('fill_price', fill_price)):.6f}",
+            "simulated": self._csv_bool(bool(payload.get("simulated", True))),
             "resolved": resolved,
+            "resolution_up": res_up_cell,
             "pnl_usdc": f"{pnl:.6f}",
-            "win_streak": self.win_streak,
-            "cycle_ms_scan": payload.get("cycle_ms_scan", ""),
-            "cycle_ms_predict": payload.get("cycle_ms_predict", ""),
-            "cycle_ms_validate": payload.get("cycle_ms_validate", ""),
-            "cycle_ms_size": payload.get("cycle_ms_size", ""),
-            "cycle_ms_fill": payload.get("cycle_ms_fill", ""),
+            "win": win_cell,
+            "win_streak": str(self.win_streak),
+            "trades_total": str(self.trades),
+            "win_rate_pct": f"{wr:.2f}",
+            "pnl_cumulative_usdc": f"{self.pnl_usdc:.6f}",
+            "reason": "settle",
+            "dry_run": self._csv_bool(DRY_RUN),
         }
-        await self._append_csv(row)
+        try:
+            await self._append_csv(row)
+        finally:
+            self._publish_trade_counters_to_state()
+            self._open_positions.pop(market_id, None)
 
 
 async def _shutdown(engine: SixCycleEngine) -> None:

@@ -39,47 +39,42 @@
       </div>
 
       <div class="rounded-lg border border-amber-800/60 bg-amber-950/25 px-4 py-3 text-sm text-amber-100/95 space-y-2">
-        <p class="font-medium text-amber-200">Cómo arrancar Sixcycle (solo esta pantalla)</p>
-        <ol class="list-decimal list-inside text-slate-300 space-y-1 text-xs sm:text-sm">
-          <li>Pulsa <strong class="text-white">Encender</strong> en la pestaña «Control y CSV». Eso lanza <code class="text-slate-500">SixCycleEngine</code> dentro de <strong class="text-white">este API</strong> (no hace falta pulsar Start del motor genérico en <code class="text-slate-500">/arb</code>).</li>
-          <li>El botón <strong class="text-white">Apagar</strong> detiene ese proceso y desactiva la estrategia en estado.</li>
-          <li>Abre la pestaña <strong class="text-white">Vista en vivo</strong> para SSE, gráfico y tablas alimentadas por el motor en marcha.</li>
-        </ol>
-        <p class="text-xs text-slate-500">CSV: <code class="text-slate-400">$DATA_DIR/logs/crypto_5m_sixcycle.csv</code>. Independiente de <code class="text-slate-400">arb_engine</code>.</p>
+        <p class="font-medium text-amber-200">Mismo criterio que en Motor Arb</p>
+        <p class="text-xs text-slate-300">
+          <strong class="text-white">Encender / Parar</strong> (arriba) controlan solo Sixcycle en este API — no son el Start/Stop del <code class="text-slate-500">arb_engine</code> de <a href="/arb" class="text-indigo-400 hover:underline">/arb</a>.
+          El estado <strong class="text-white">EN MARCHA / PARADO</strong> es el que importa.
+        </p>
+        <p class="text-xs text-slate-500">CSV: <code class="text-slate-400">$DATA_DIR/logs/crypto_5m_sixcycle.csv</code></p>
       </div>
 
-      <div class="flex flex-wrap gap-2 mt-4" role="tablist">
-        <button type="button" id="tab-btn-control" role="tab" aria-selected="true"
-          class="px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 bg-slate-800 text-white ring-1 ring-indigo-500/50">
-          Control y CSV
-        </button>
-        <button type="button" id="tab-btn-live" role="tab" aria-selected="false"
-          class="px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 text-slate-400 hover:bg-slate-800 hover:text-slate-200">
-          Vista en vivo (SSE)
-        </button>
+      <!-- Un solo control de marcha (coherente con tarjetas del Motor Arb) -->
+      <div id="sixcycle-motor-strip" class="mt-4 rounded-xl border border-slate-600 bg-slate-800/60 px-4 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3 min-w-0">
+          <span id="run-badge" class="shrink-0 inline-flex items-center gap-2 text-sm font-bold px-4 py-2.5 rounded-lg border bg-slate-700/80 text-slate-300 border-slate-600">
+            <span id="run-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+            <span id="run-label">PARADO</span>
+          </span>
+          <div class="flex flex-wrap items-center gap-2">
+            <button type="button" id="btn-enable"
+              class="text-sm px-4 py-2 rounded-lg border border-emerald-600 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-900/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
+              Encender
+            </button>
+            <button type="button" id="btn-disable"
+              class="text-sm px-4 py-2 rounded-lg border border-red-800 bg-red-950/20 text-red-300 hover:bg-red-950/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
+              Parar
+            </button>
+            <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
+              class="text-sm px-4 py-2 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 inline-block"
+              download>CSV</a>
+          </div>
+        </div>
+        <a href="/arb" class="text-sm text-indigo-400 hover:underline shrink-0">← Motor Arb</a>
       </div>
+
     </header>
 
-    <!-- TAB: Control -->
+    <!-- Control + resumen + tabla API log -->
     <div id="tab-control" class="space-y-6">
-      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border border-slate-700 rounded-xl p-4 bg-slate-800/40">
-        <div class="flex flex-wrap items-center gap-2">
-          <span id="run-badge" class="text-xs px-2 py-1 rounded-full bg-slate-700 text-slate-400">—</span>
-          <button type="button" id="btn-enable"
-            class="text-xs px-3 py-1.5 rounded-md border border-emerald-700 text-emerald-300 hover:bg-emerald-950/40">
-            Encender
-          </button>
-          <button type="button" id="btn-disable"
-            class="text-xs px-3 py-1.5 rounded-md border border-red-800 text-red-400 hover:bg-red-950/40">
-            Apagar
-          </button>
-          <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
-            class="text-xs px-3 py-1.5 rounded-md border border-slate-600 text-slate-300 hover:bg-slate-800"
-            download>Descargar CSV</a>
-        </div>
-        <a href="/arb" class="text-xs text-indigo-400 hover:underline">← Volver al Motor Arb</a>
-      </div>
-
       <section id="summary" class="grid sm:grid-cols-2 gap-3 text-sm"></section>
 
       <section>
@@ -94,12 +89,25 @@
         </div>
         <p id="tbl-msg" class="text-xs text-slate-500 mt-2"></p>
       </section>
-    </div>
 
-    <!-- TAB: Live -->
-    <div id="tab-live" class="hidden space-y-6">
+      <h2 class="text-sm font-medium text-slate-300 pt-8 mt-2 border-t border-slate-700">
+        Panel en vivo (SSE + historial sixcycle)
+      </h2>
+      <p class="text-xs text-slate-500 -mt-1 mb-2">
+        Mismo CSV: abajo solo <strong class="text-slate-400">trades cerrados</strong> (SETTLED win/loss). El log incluye también filas de scan (EJECUTANDO).
+      </p>
+
+      <div id="lv-motor-banner" class="rounded-lg border border-amber-700/60 bg-amber-950/40 px-4 py-3 text-sm text-amber-100" style="display: none;">
+        <p class="font-medium text-amber-200">Sixcycle está PARADO</p>
+        <p class="text-xs text-slate-400 mt-1">El panel en vivo no refleja el mercado hasta que pulses <strong class="text-white">Encender</strong> arriba.</p>
+        <button type="button" id="lv-go-control"
+          class="mt-2 text-xs px-3 py-1.5 rounded-md border border-slate-500 text-slate-200 hover:bg-slate-800">
+          Ir a Encender / Parar
+        </button>
+      </div>
       <div class="flex flex-wrap items-center justify-between gap-3 border border-slate-700 rounded-xl px-4 py-3 bg-slate-800/40">
         <div class="flex flex-wrap items-center gap-3 text-sm">
+          <span id="lv-status-hint" class="text-xs font-semibold px-2 py-1 rounded-md bg-slate-700 text-slate-300">—</span>
           <span id="lv-mode-badge" class="text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-900/50 text-amber-200 border border-amber-700/50">DRY_RUN</span>
           <span class="text-slate-500 font-mono text-xs" id="lv-utc">—</span>
           <span class="text-slate-500 text-xs">SSE</span>
@@ -166,12 +174,12 @@
       </div>
 
       <div>
-        <h3 class="text-xs font-medium text-slate-500 uppercase mb-2">Últimos trades</h3>
+        <h3 class="text-xs font-medium text-slate-500 uppercase mb-2">Últimos trades (solo SETTLED)</h3>
         <div class="overflow-x-auto max-h-64 overflow-y-auto rounded-lg border border-slate-700">
           <table class="min-w-full text-[11px] font-mono">
             <thead class="bg-slate-950 text-slate-400 sticky top-0 z-10">
               <tr>
-                <th class="px-2 py-1.5 text-left">ts</th><th class="px-2 py-1.5">slug</th><th class="px-2 py-1.5">dir</th><th class="px-2 py-1.5">score</th>
+                <th class="px-2 py-1.5 text-left">ts</th><th class="px-2 py-1.5">mercado</th><th class="px-2 py-1.5">dir</th><th class="px-2 py-1.5">score</th>
                 <th class="px-2 py-1.5">edge</th><th class="px-2 py-1.5">stake</th><th class="px-2 py-1.5">fill</th><th class="px-2 py-1.5">res</th><th class="px-2 py-1.5">pnl</th><th class="px-2 py-1.5">W/L</th>
               </tr>
             </thead>
@@ -185,7 +193,7 @@
           <table class="min-w-full text-[11px] font-mono">
             <thead class="bg-slate-950 text-slate-400 sticky top-0 z-10">
               <tr>
-                <th class="px-2 py-1.5 text-left">ts</th><th class="px-2 py-1.5">phase</th><th class="px-2 py-1.5">slug</th><th class="px-2 py-1.5">dir</th>
+                <th class="px-2 py-1.5 text-left">ts</th><th class="px-2 py-1.5">phase</th><th class="px-2 py-1.5">mercado</th><th class="px-2 py-1.5">dir</th>
                 <th class="px-2 py-1.5">edge</th><th class="px-2 py-1.5">stake</th><th class="px-2 py-1.5">res</th><th class="px-2 py-1.5">pnl</th>
               </tr>
             </thead>
@@ -198,30 +206,63 @@
 
   <script>
     const SLUG = "crypto_5m_sixcycle";
-    const tabControl = document.getElementById("tab-control");
-    const tabLive = document.getElementById("tab-live");
-    const btnTabControl = document.getElementById("tab-btn-control");
-    const btnTabLive = document.getElementById("tab-btn-live");
 
-    function setTab(which) {
-      const live = which === "live";
-      tabControl.classList.toggle("hidden", live);
-      tabLive.classList.toggle("hidden", !live);
-      btnTabControl.setAttribute("aria-selected", !live);
-      btnTabLive.setAttribute("aria-selected", live);
-      btnTabControl.className = live
-        ? "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
-        : "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 bg-slate-800 text-white ring-1 ring-indigo-500/50";
-      btnTabLive.className = !live
-        ? "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
-        : "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 bg-slate-800 text-white ring-1 ring-indigo-500/50";
-      const u = new URL(location.href);
-      u.searchParams.set("view", live ? "live" : "control");
-      history.replaceState(null, "", u.pathname + u.search);
-      if (live) window.liveUi && window.liveUi.ensureStarted();
+    const motorBanner = document.getElementById("lv-motor-banner");
+    function updateMotorButtons(on) {
+      var en = document.getElementById("btn-enable");
+      var dis = document.getElementById("btn-disable");
+      if (en) en.disabled = !!on;
+      if (dis) dis.disabled = !on;
     }
-    btnTabControl.onclick = () => setTab("control");
-    btnTabLive.onclick = () => setTab("live");
+
+    function applyRunVisual(on) {
+      var wrap = document.getElementById("run-badge");
+      var dot = document.getElementById("run-dot");
+      var lab = document.getElementById("run-label");
+      var hint = document.getElementById("lv-status-hint");
+      if (lab) lab.textContent = on ? "EN MARCHA" : "PARADO";
+      if (dot) {
+        dot.className =
+          "w-2.5 h-2.5 rounded-full shrink-0 " + (on ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.7)]" : "bg-slate-500");
+      }
+      if (wrap) {
+        wrap.className =
+          "shrink-0 inline-flex items-center gap-2 text-sm font-bold px-4 py-2.5 rounded-lg border " +
+          (on
+            ? "bg-emerald-950/50 text-emerald-100 border-emerald-600/60"
+            : "bg-slate-700/80 text-slate-300 border-slate-600");
+      }
+      if (hint) {
+        hint.textContent = on ? "Estrategia: EN MARCHA" : "Estrategia: PARADO";
+        hint.className =
+          "text-xs font-semibold px-2 py-1 rounded-md " +
+          (on ? "bg-emerald-900/40 text-emerald-200" : "bg-slate-700 text-slate-300");
+      }
+      updateMotorButtons(on);
+    }
+
+    async function pollSixcycleEnabled() {
+      try {
+        const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        if (!r.ok) return;
+        const st = await r.json();
+        const s = (st.strategies || []).find(function (x) {
+          return x.slug === SLUG;
+        });
+        const on = !!(s && s.enabled);
+        motorBanner.style.display = on ? "none" : "block";
+        applyRunVisual(on);
+      } catch (err) {
+        console.warn(err);
+      }
+    }
+    document.getElementById("lv-go-control").addEventListener("click", function (e) {
+      e.preventDefault();
+      var strip = document.getElementById("sixcycle-motor-strip");
+      if (strip) strip.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    pollSixcycleEnabled();
+    setInterval(pollSixcycleEnabled, 4000);
 
     /* ——— Control tab (CSV / enable) ——— */
     async function fetchStatus() {
@@ -254,9 +295,7 @@
         return d;
       };
       const on = !!s.enabled;
-      document.getElementById("run-badge").textContent = on ? "EN MARCHA" : "PARADO";
-      document.getElementById("run-badge").className =
-        "text-xs px-2 py-1 rounded-full " + (on ? "bg-emerald-900/50 text-emerald-200" : "bg-slate-700 text-slate-400");
+      applyRunVisual(on);
       box.appendChild(mk("Filas hoy (total)", String(s.total_today ?? "—")));
       box.appendChild(mk("Resueltos hoy", String(s.signals_today ?? "—")));
       box.appendChild(mk("Último", String(s.last_action || "—")));
@@ -301,22 +340,43 @@
         document.getElementById("tbl-msg").textContent = "Error: " + e;
       }
     }
-    document.getElementById("btn-enable").onclick = async () => {
-      const r = await fetch("/api/arb/strategy/" + SLUG + "/enable", { method: "POST" });
-      if (!r.ok && r.status !== 409) {
-        alert("No se pudo encender: HTTP " + r.status);
-        return;
+    document.getElementById("btn-enable").addEventListener("click", async function (e) {
+      e.preventDefault();
+      var en = document.getElementById("btn-enable");
+      var dis = document.getElementById("btn-disable");
+      if (en) en.disabled = true;
+      if (dis) dis.disabled = true;
+      try {
+        const r = await fetch("/api/arb/strategy/" + SLUG + "/enable", { method: "POST" });
+        if (!r.ok && r.status !== 409) {
+          const t = await r.text().catch(function () {
+            return "";
+          });
+          alert("Encender falló (HTTP " + r.status + ")" + (t ? "\n" + t.slice(0, 200) : ""));
+          return;
+        }
+        await refresh();
+      } finally {
+        await pollSixcycleEnabled();
       }
-      await refresh();
-    };
-    document.getElementById("btn-disable").onclick = async () => {
-      const r = await fetch("/api/arb/strategy/" + SLUG + "/disable", { method: "POST" });
-      if (!r.ok) {
-        alert("No se pudo apagar: HTTP " + r.status);
-        return;
+    });
+    document.getElementById("btn-disable").addEventListener("click", async function (e) {
+      e.preventDefault();
+      var en = document.getElementById("btn-enable");
+      var dis = document.getElementById("btn-disable");
+      if (en) en.disabled = true;
+      if (dis) dis.disabled = true;
+      try {
+        const r = await fetch("/api/arb/strategy/" + SLUG + "/disable", { method: "POST" });
+        if (!r.ok) {
+          alert("Parar falló (HTTP " + r.status + ")");
+          return;
+        }
+        await refresh();
+      } finally {
+        await pollSixcycleEnabled();
       }
-      await refresh();
-    };
+    });
     refresh();
     setInterval(refresh, 8000);
 
@@ -333,7 +393,12 @@
         if (Number.isNaN(v)) return String(n);
         return v.toFixed(d);
       }
+      function rowTs(row) {
+        return row.timestamp_utc || row.timestamp || "";
+      }
       function rowPhase(row) {
+        const ph0 = (row.phase || "").toUpperCase().trim();
+        if (ph0 === "SETTLED" || ph0 === "EJECUTANDO") return ph0;
         const res = (row.resolved || "").toLowerCase().trim();
         if (res === "win" || res === "loss") return "SETTLED";
         const filled = String(row.filled || "").toLowerCase();
@@ -345,6 +410,7 @@
         const res = (row.resolved || "").toLowerCase().trim();
         if (ph === "SETTLED") return res === "win" ? "bg-emerald-950/30" : "bg-red-950/25";
         if (ph === "EXECUTED") return "bg-orange-950/20";
+        if (ph === "EJECUTANDO") return "bg-slate-800/50";
         return "bg-slate-800/40";
       }
       function phaseBadgeClass(ph) {
@@ -352,6 +418,7 @@
         if (p === "PREPARANDO") return "bg-blue-900/40 text-blue-200 border border-blue-700/50";
         if (p === "EJECUTANDO") return "bg-orange-900/40 text-orange-200 border border-orange-700/50";
         if (p === "SETTLING") return "bg-purple-900/40 text-purple-200 border border-purple-700/50";
+        if (p === "SETTLED") return "bg-emerald-900/35 text-emerald-200 border border-emerald-700/40";
         if (p === "SKIPPED" || p === "OFFLINE") return "bg-slate-700 text-slate-300";
         return "bg-slate-700 text-slate-400";
       }
@@ -440,12 +507,23 @@
           sd.className = "text-xs " + (gap >= 0 ? "text-emerald-400" : "text-red-400");
         }
         const yes = state.clob_yes_price;
+        const ybar = document.getElementById("lv-yes-bar");
+        const ex = String(state.clob_extreme || "").toUpperCase();
         if (yes != null && !Number.isNaN(+yes)) {
-          const pct = Math.min(100, Math.max(0, +yes * 100));
-          document.getElementById("lv-yes-bar").style.width = pct + "%";
-          document.getElementById("lv-yes-lbl").textContent = (+yes).toFixed(4) + " (" + pct.toFixed(1) + "%)";
+          const y = +yes;
+          const pct = Math.min(100, Math.max(0, y * 100));
+          ybar.style.width = "100%";
+          if (ex === "UP" || y < 0.35) {
+            ybar.className = "h-full rounded transition-all duration-200 bg-emerald-500 shadow-[0_0_12px_rgba(52,211,153,0.45)]";
+          } else if (ex === "DOWN" || y > 0.65) {
+            ybar.className = "h-full rounded transition-all duration-200 bg-red-500 shadow-[0_0_12px_rgba(248,113,113,0.4)]";
+          } else {
+            ybar.className = "h-full rounded transition-all duration-200 bg-slate-500";
+          }
+          document.getElementById("lv-yes-lbl").textContent = y.toFixed(4) + " (" + pct.toFixed(1) + "%)";
         } else {
-          document.getElementById("lv-yes-bar").style.width = "0%";
+          ybar.style.width = "0%";
+          ybar.className = "h-full rounded transition-all duration-200 bg-slate-600";
           document.getElementById("lv-yes-lbl").textContent = "—";
         }
         document.getElementById("lv-liq").textContent =
@@ -476,8 +554,13 @@
       }
 
       function buildEquityChart(rows) {
-        const sorted = rows.slice().sort(function (a, b) {
-          return String(a.timestamp || "").localeCompare(String(b.timestamp || ""));
+        var settledPnL = rows.filter(function (r) {
+          var ph = (r.phase || "").toUpperCase();
+          var res = (r.resolved || "").toLowerCase();
+          return ph === "SETTLED" && (res === "win" || res === "loss");
+        });
+        const sorted = settledPnL.slice().sort(function (a, b) {
+          return String(rowTs(a)).localeCompare(String(rowTs(b)));
         });
         let cum = 0;
         const labels = [];
@@ -488,7 +571,7 @@
           const p = parseFloat(r.pnl_usdc);
           if (Number.isNaN(p)) return;
           cum += p;
-          labels.push((r.timestamp || "").slice(11, 19) || "");
+          labels.push((rowTs(r) || "").slice(11, 19) || "");
           data.push(cum);
           const w = (r.resolved || "").toLowerCase() === "win";
           ptBg.push(w ? "rgba(52,211,153,0.95)" : "rgba(248,113,113,0.95)");
@@ -537,7 +620,12 @@
       }
 
       function fillTradesTable(rows) {
-        const last = rows.slice(-20).reverse();
+        var settled = rows.filter(function (r) {
+          var ph = (r.phase || "").toUpperCase();
+          var res = (r.resolved || "").toLowerCase();
+          return ph === "SETTLED" && (res === "win" || res === "loss");
+        });
+        var last = settled.slice(-20).reverse();
         const tb = document.getElementById("lv-trades-body");
         tb.innerHTML = "";
         last.forEach(function (r) {
@@ -545,11 +633,17 @@
           const res = (r.resolved || "").toLowerCase();
           tr.className =
             res === "win" ? "bg-emerald-950/25" : res === "loss" ? "bg-red-950/20" : "hover:bg-slate-800/50";
-          const slug = r.slug || r.market_id || "";
-          const scoreDisp = r.score != null ? r.score : r.model_prob != null ? (+r.model_prob).toFixed(3) : "—";
+          const mercado = (r.market_slug && String(r.market_slug).trim()) || r.market_id || r.slug || "";
+          var scoreDisp = "—";
+          if (r.score != null && r.score !== "") {
+            var sv = parseFloat(r.score);
+            scoreDisp = Number.isFinite(sv) ? String(r.score) : "—";
+          } else if (r.model_prob != null && r.model_prob !== "") {
+            scoreDisp = (+r.model_prob).toFixed(3);
+          }
           const wl = res === "win" ? "W" : res === "loss" ? "L" : "…";
           const fill = r.fill_price != null && r.fill_price !== "" ? r.fill_price : r.clob_yes_price || "";
-          [r.timestamp || "", slug, r.direction || "", scoreDisp, r.edge || "", r.stake_usdc || "", fill, r.resolved || "", r.pnl_usdc || "", wl].forEach(function (cell) {
+          [rowTs(r), mercado, r.direction || "", scoreDisp, r.edge || "", r.stake_usdc || "", fill, r.resolved || "", r.pnl_usdc || "", wl].forEach(function (cell) {
             const td = document.createElement("td");
             td.className = "px-2 py-1 text-slate-300 whitespace-nowrap max-w-[10rem] truncate";
             td.textContent = cell;
@@ -567,8 +661,8 @@
           const tr = document.createElement("tr");
           tr.className = logRowClass(r);
           const ph = rowPhase(r);
-          const slug = r.slug || r.market_id || "";
-          [r.timestamp || "", ph, slug, r.direction || "", r.edge || "", r.stake_usdc || "", r.resolved || "", r.pnl_usdc || ""].forEach(function (cell) {
+          const mercado = (r.market_slug && String(r.market_slug).trim()) || r.market_id || r.slug || "";
+          [rowTs(r), ph, mercado, r.direction || "", r.edge || "", r.stake_usdc || "", r.resolved || "", r.pnl_usdc || ""].forEach(function (cell) {
             const td = document.createElement("td");
             td.className = "px-2 py-1 text-slate-300 whitespace-nowrap max-w-[9rem] truncate";
             td.textContent = cell;
@@ -617,8 +711,7 @@
     })();
 
     (function initView() {
-      const v = new URLSearchParams(location.search).get("view");
-      if (v === "live") setTab("live");
+      if (window.liveUi) window.liveUi.ensureStarted();
     })();
   </script>
 </body>

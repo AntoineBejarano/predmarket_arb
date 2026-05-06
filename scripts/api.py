@@ -1155,40 +1155,62 @@ def _csv_stats_today(path: Path) -> dict[str, Any]:
     }
 
 
+def _sixcycle_csv_ts(row: dict[str, Any]) -> Any:
+    """Fila sixcycle: timestamp ISO en ``timestamp_utc`` (nuevo) o ``timestamp`` (legacy)."""
+    return row.get("timestamp_utc") or row.get("timestamp")
+
+
 def _csv_stats_sixcycle(path: Path) -> dict[str, Any]:
     """Métricas diarias para ``crypto_5m_sixcycle.csv`` (columnas del sixcycle engine)."""
     today = pd.Timestamp.now(tz=_TZ_ES).strftime("%Y-%m-%d")
     rows = _read_arb_csv_tail(path, n=15000)
-    today_rows = [r for r in rows if _csv_ts_date_spain(r.get("timestamp")) == today]
-    wins = [r for r in today_rows if str(r.get("resolved", "")).lower() == "win"]
-    losses = [r for r in today_rows if str(r.get("resolved", "")).lower() == "loss"]
+    today_rows = [r for r in rows if _csv_ts_date_spain(_sixcycle_csv_ts(r)) == today]
+    settled = [
+        r
+        for r in today_rows
+        if str(r.get("phase", "")).upper() == "SETTLED"
+        or (
+            str(r.get("phase", "")).strip() == ""
+            and str(r.get("resolved", "")).lower() in ("win", "loss", "unknown", "error")
+        )
+    ]
+    wins = [r for r in settled if str(r.get("resolved", "")).lower() == "win"]
+    losses = [r for r in settled if str(r.get("resolved", "")).lower() == "loss"]
     pnl_vals: list[float] = []
-    for r in today_rows:
+    for r in settled:
         try:
             pnl_vals.append(float(r.get("pnl_usdc", 0) or 0))
         except (TypeError, ValueError):
             pass
     last = today_rows[-1] if today_rows else {}
     res = str(last.get("resolved") or "").strip()
+    last_ts = _sixcycle_csv_ts(last) or last.get("timestamp")
+    executed_fill = [
+        r
+        for r in today_rows
+        if str(r.get("filled", "")).lower() in ("true", "1")
+        or (
+            str(r.get("phase", "")).upper() == "SETTLED"
+            and str(r.get("resolved", "")).lower() in ("win", "loss")
+        )
+    ]
     return {
         "total_today": len(today_rows),
-        "signals_today": len([r for r in today_rows if str(r.get("resolved", "")).strip()]),
-        "executed_today": len(
-            [r for r in today_rows if str(r.get("filled", "")).lower() in ("true", "1")]
-        ),
+        "signals_today": len([r for r in settled if str(r.get("resolved", "")).strip()]),
+        "executed_today": len(executed_fill),
         "skips_today": 0,
         "skip_below_min_edge_today": 0,
         "errors_today": len(
-            [r for r in today_rows if str(r.get("resolved", "")).lower() in ("error", "unknown")]
+            [r for r in settled if str(r.get("resolved", "")).lower() in ("error", "unknown")]
         ),
         "skip_rate": 0.0,
         "avg_edge_today": None,
         "best_edge_today": None,
         "last_action": f"SETTLE:{res}" if res else None,
-        "last_ts": last.get("timestamp"),
+        "last_ts": last_ts,
         "last_reason": (
             f"wins={len(wins)} losses={len(losses)} pnl_day={sum(pnl_vals):.4f}"
-            if today_rows
+            if settled
             else None
         ),
     }
@@ -1554,6 +1576,114 @@ def _read_sixcycle_history_tail(limit: int) -> list[dict[str, Any]]:
     return rows[-limit:]
 
 
+def _sixcycle_kpis_from_engine_csv_tail(path: Path) -> Optional[dict[str, Any]]:
+    """
+    Lee la última fila con ``trades_total`` del CSV del engine (mismo fichero que ``/log``).
+    Así el SSE puede mostrar KPIs alineados con el CSV tras reinicio del API o motor fuera de proceso.
+    """
+    if not path.is_file():
+        return None
+    rows = _read_arb_csv_tail(path, n=300)
+    for r in reversed(rows):
+        raw = str(r.get("trades_total", "") or "").strip()
+        if not raw:
+            continue
+        try:
+            trades = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if trades <= 0:
+            continue
+        wr_s = str(r.get("win_rate_pct", "") or "0").replace("%", "").strip()
+        try:
+            win_rate = float(wr_s)
+        except (TypeError, ValueError):
+            win_rate = 0.0
+        try:
+            pnl = float(str(r.get("pnl_cumulative_usdc", "") or "0").strip() or "0")
+        except (TypeError, ValueError):
+            pnl = 0.0
+        try:
+            streak = int(float(str(r.get("win_streak", "") or "0").strip() or "0"))
+        except (TypeError, ValueError):
+            streak = 0
+        return {
+            "trades": trades,
+            "win_rate": round(win_rate, 2),
+            "pnl_usdc": round(pnl, 6),
+            "win_streak": streak,
+        }
+    return None
+
+
+def _sixcycle_kpis_from_signals_csv(path: Path) -> Optional[dict[str, Any]]:
+    """
+    ``sixcycle_signals.csv`` (schema legacy): muchas filas por mercado; agregamos un settle
+    por ``market_id`` (última fila con resolved win/loss por timestamp).
+    """
+    if not path.is_file():
+        return None
+    rows = _read_arb_csv_tail(path, n=50000)
+    by_market: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        mid = str(r.get("market_id") or "").strip()
+        if not mid:
+            continue
+        res = str(r.get("resolved") or "").lower().strip()
+        if res not in ("win", "loss"):
+            continue
+        ts = str(r.get("timestamp") or r.get("timestamp_utc") or "")
+        prev = by_market.get(mid)
+        if prev is None or str(prev.get("_ts") or "") <= ts:
+            nr = dict(r)
+            nr["_ts"] = ts
+            by_market[mid] = nr
+    if not by_market:
+        return None
+    settled = sorted(by_market.values(), key=lambda x: str(x.get("_ts") or ""))
+    trades = len(settled)
+    wins = sum(1 for r in settled if str(r.get("resolved") or "").lower() == "win")
+    wr = (100.0 * wins / trades) if trades else 0.0
+    pnl = 0.0
+    for r in settled:
+        try:
+            pnl += float(r.get("pnl_usdc") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    streak_end = 0
+    for r in reversed(settled):
+        if str(r.get("resolved") or "").lower() == "win":
+            streak_end += 1
+        else:
+            break
+    return {
+        "trades": trades,
+        "win_rate": round(wr, 2),
+        "pnl_usdc": round(pnl, 6),
+        "win_streak": streak_end,
+    }
+
+
+def _sixcycle_merge_csv_kpis_into_payload(payload: dict[str, Any]) -> None:
+    """Enriquece KPIs del panel sixcycle desde CSVs en disco si superan a la memoria del engine."""
+    mem_t = int(payload.get("trades") or 0)
+    path = ARB_CSV_PATHS.get(SIXCYCLE_SLUG)
+    best: Optional[dict[str, Any]] = None
+    best_t = mem_t
+    if path is not None:
+        eng = _sixcycle_kpis_from_engine_csv_tail(path)
+        if eng and int(eng["trades"]) > best_t:
+            best, best_t = eng, int(eng["trades"])
+    sig = _sixcycle_kpis_from_signals_csv(SIXCYCLE_SIGNALS_CSV)
+    if sig and int(sig["trades"]) > best_t:
+        best, best_t = sig, int(sig["trades"])
+    if best is not None:
+        payload["trades"] = best["trades"]
+        payload["win_rate"] = best["win_rate"]
+        payload["pnl_usdc"] = best["pnl_usdc"]
+        payload["win_streak"] = best["win_streak"]
+
+
 async def _sixcycle_live_sse_gen(request: Request) -> AsyncIterator[str]:
     from scripts import sixcycle_engine as six_mod
 
@@ -1562,6 +1692,7 @@ async def _sixcycle_live_sse_gen(request: Request) -> AsyncIterator[str]:
             break
         with six_mod.SIXCYCLE_STATE_LOCK:
             payload = dict(six_mod.SIXCYCLE_STATE)
+        await asyncio.to_thread(_sixcycle_merge_csv_kpis_into_payload, payload)
         yield f"data: {json.dumps(payload, default=str)}\n\n"
         await asyncio.sleep(1.0)
 
@@ -1590,7 +1721,9 @@ async def api_sixcycle_status() -> JSONResponse:
     from scripts import sixcycle_engine as six_mod
 
     with six_mod.SIXCYCLE_STATE_LOCK:
-        return JSONResponse(content=dict(six_mod.SIXCYCLE_STATE))
+        payload = dict(six_mod.SIXCYCLE_STATE)
+    await asyncio.to_thread(_sixcycle_merge_csv_kpis_into_payload, payload)
+    return JSONResponse(content=payload)
 
 
 @app.get("/sixcycle", response_model=None)
