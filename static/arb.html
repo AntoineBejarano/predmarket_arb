@@ -102,6 +102,12 @@
         experimental: true,
         detailHref: "/arb/strategy/latency_arb_sports",
       },
+      {
+        slug: "crypto_5m_sixcycle",
+        label: "BTC 5m Sixcycle (WS scorer)",
+        experimental: true,
+        detailHref: "/arb/strategy/crypto_5m_sixcycle",
+      },
     ];
 
     /** Timestamps CSV/API en UTC; UI en hora peninsular (servidor suele ir en UTC). */
@@ -174,6 +180,7 @@
           </p>
           ${def.detailHref ? '<a href="' + def.detailHref + '" class="text-xs text-indigo-400 hover:underline mt-1 inline-block">Ver detalle →</a>' : ""}
           ${def.slug === "latency_arb_sports" ? '<p class="text-[10px] text-slate-600 mt-1">Snapshots históricos: <code class="text-slate-500">logs/latency_arb_sports_snapshots.csv</code> (tabla en detalle).</p>' : ""}
+          ${def.slug === "crypto_5m_sixcycle" ? '<p class="text-[10px] text-slate-600 mt-1">Una sola página: control + CSV y pestaña «Vista en vivo» (SSE). Encender arranca el proceso en el API (no es <code class="text-slate-500">arb_engine</code>).</p>' : ""}
           <p class="text-[10px] text-slate-600 mt-1">Paper: PnL est. ≈ stake×edge por SIGNAL/EXECUTED; ROI = acum / capital (edita <code class="text-slate-500">data/strategy_state.json</code>).</p>
         </div>
         <button type="button"

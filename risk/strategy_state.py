@@ -20,6 +20,7 @@ _SLUGS = [
     "term_structure",
     "latency_arb",
     "latency_arb_sports",
+    "crypto_5m_sixcycle",
 ]
 
 # Columnas extra en CSV de arb (unidad «EUR» = notionale paper, mismo escala que USDC del CLOB)

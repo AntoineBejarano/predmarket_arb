@@ -104,6 +104,7 @@ def format_gamma_row_for_api(g: OpenPolymarketGame, *, now: datetime) -> dict[st
             "kickoff_es_label": None,
             "minutes_to_kickoff": None,
             "kickoff_delta_label": "sin kickoff estimado",
+            "kickoff_post_start": False,
             "polymarket_slug": g.sport_slug,
             "source": "polymarket_gamma",
         }
@@ -122,12 +123,16 @@ def format_gamma_row_for_api(g: OpenPolymarketGame, *, now: datetime) -> dict[st
         "polymarket_slug": g.sport_slug,
         "source": "polymarket_gamma",
     }
+    # mins < 0: kickoff estimado (Gamma) ya pasó → candidato a en juego; no implica feed de TV verificado.
     if mins < 0:
-        out["kickoff_delta_label"] = f"hace {abs(int(round(mins)))} min"
+        out["kickoff_delta_label"] = f"LIVE · hace {abs(int(round(mins)))} min"
+        out["kickoff_post_start"] = True
     elif mins == 0:
-        out["kickoff_delta_label"] = "ahora"
+        out["kickoff_delta_label"] = "LIVE · ahora"
+        out["kickoff_post_start"] = True
     else:
         out["kickoff_delta_label"] = f"en {int(round(mins))} min"
+        out["kickoff_post_start"] = False
     return out
 
 

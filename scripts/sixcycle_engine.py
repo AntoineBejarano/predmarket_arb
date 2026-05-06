@@ -1,0 +1,1270 @@
+"""Loop principal de 6 ciclos (Scan→Predict→Validate→Size→Fill→Settle) para BTC 5m Up/Down en Polymarket."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def _repo_root() -> Path:
+    """
+    Raíz del repo para imports (`clients`, `lab`, …).
+    Orden: PM_REPO_ROOT → padre de este script → ascendiendo desde cwd.
+    """
+    raw = os.environ.get("PM_REPO_ROOT", "").strip()
+    if raw:
+        p = Path(raw).expanduser().resolve()
+        if (p / "clients").is_dir():
+            return p
+    here = Path(__file__).resolve()
+    cand = here.parent.parent
+    if (cand / "clients").is_dir():
+        return cand
+    cur = Path.cwd().resolve()
+    for d in [cur, *cur.parents]:
+        if (d / "clients" / "poly_clob.py").is_file():
+            return d
+    return cand
+
+
+REPO_ROOT = _repo_root()
+_root_s = str(REPO_ROOT)
+if _root_s in sys.path:
+    try:
+        sys.path.remove(_root_s)
+    except ValueError:
+        pass
+sys.path.insert(0, _root_s)
+
+import asyncio
+import csv
+import json
+import logging
+import signal as sig_module
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any
+
+import aiohttp
+import numpy as np
+import pandas as pd
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from clients.poly_clob import PolyCLOBClient, _level_price, _level_size
+from clients.poly_parse import api_bool_true, extract_yes_token_id, parse_json_maybe
+
+from lab.market_scorer import MarketScorer  # noqa: E402
+from lab.paths import data_dir  # noqa: E402
+from scripts.clob_signal_filter import CLOBSignalFilter  # noqa: E402
+
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
+MIN_LIQUIDITY_USDC = float(os.getenv("MIN_LIQUIDITY_USDC", "50.0"))
+MAX_STAKE_USDC = float(os.getenv("MAX_STAKE_USDC", "10.0"))
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
+SCAN_INTERVAL_SECONDS = float(os.getenv("SCAN_INTERVAL_SECONDS", "30.0"))
+PREPARE_LAST_SECONDS = int(os.getenv("SIXCYCLE_PREPARE_LAST_SECONDS", "90"))
+GAMMA_API_URL = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com").rstrip("/")
+
+_CSV_FIELDS = [
+    "timestamp",
+    "market_id",
+    "direction",
+    "model_prob",
+    "clob_yes_price",
+    "edge",
+    "stake_usdc",
+    "filled",
+    "simulated",
+    "resolved",
+    "pnl_usdc",
+    "win_streak",
+    "cycle_ms_scan",
+    "cycle_ms_predict",
+    "cycle_ms_validate",
+    "cycle_ms_size",
+    "cycle_ms_fill",
+]
+
+_DEFAULT_HEADERS = {
+    "User-Agent": "predmarket-arb/sixcycle-engine (+https://github.com)",
+    "Accept": "application/json",
+}
+
+log = logging.getLogger("sixcycle_engine")
+
+SIXCYCLE_STATE_LOCK = threading.Lock()
+SIXCYCLE_STATE: dict[str, Any] = {
+    "timestamp_utc": "",
+    "phase": "OFFLINE",
+    "next_slug": "",
+    "secs_until_open": 0,
+    "price_to_beat": None,
+    "spot_price": None,
+    "ptb_gap": None,
+    "score": 0,
+    "direction": None,
+    "confidence": 0.0,
+    "ready": False,
+    "components": {},
+    "clob_yes_price": None,
+    "liquidity_usdc": None,
+    "signal": False,
+    "edge": 0.0,
+    "trades": 0,
+    "win_rate": 0.0,
+    "pnl_usdc": 0.0,
+    "win_streak": 0,
+    "best_streak": 0,
+    "dry_run": DRY_RUN,
+}
+
+
+def _floor_5m_window_ts_utc(now: datetime) -> int:
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    minute = (now.minute // 5) * 5
+    floored = now.replace(minute=minute, second=0, microsecond=0)
+    return int(floored.timestamp())
+
+
+def _slug_btc_5m(window_ts: int) -> str:
+    return f"btc-updown-5m-{window_ts}"
+
+
+def next_market_slug_ts_for_prepare(now: datetime | None = None) -> int:
+    """Inicio UTC de la ventana 5m siguiente (slug del mercado que está por abrir)."""
+    n = now or datetime.now(timezone.utc)
+    if n.tzinfo is None:
+        n = n.replace(tzinfo=timezone.utc)
+    else:
+        n = n.astimezone(timezone.utc)
+    t = int(n.timestamp())
+    win = (t // 300) * 300
+    return win + 300
+
+
+def _fmt_usd(v: float | None) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"${float(v):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _parse_gamma_end(m: dict[str, Any]) -> datetime | None:
+    raw = m.get("endDate") or m.get("end_date") or m.get("endDateIso")
+    if raw is None:
+        return None
+    try:
+        t = pd.Timestamp(raw)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        else:
+            t = t.tz_convert("UTC")
+        return t.to_pydatetime()
+    except (ValueError, TypeError):
+        return None
+
+
+def _gamma_no_token_id(m: dict[str, Any]) -> str | None:
+    raw_tok = m.get("clobTokenIds") or m.get("clob_token_ids")
+    outcomes = m.get("outcomes")
+    # Mismo criterio que cycle_scan (Up/Down → primer token = lado “YES/Up”).
+    yid, _, _ = extract_yes_token_id(outcomes, raw_tok, assume_first=True)
+    parsed = parse_json_maybe(raw_tok)
+    if not isinstance(parsed, (list, tuple)) or len(parsed) < 2:
+        return None
+    if yid:
+        for i, tid in enumerate(parsed):
+            if str(tid).strip() == str(yid).strip():
+                for j, t2 in enumerate(parsed):
+                    if j != i:
+                        s = str(t2).strip()
+                        if s:
+                            return s
+    return str(parsed[-1]).strip() if parsed else None
+
+
+def _sum_ask_notional_top_n(book: dict[str, Any], n: int = 5) -> float:
+    """Liquidez USDC aproximada: suma price*size en los n mejores asks (comprar YES/NO)."""
+    asks = book.get("asks") or []
+    if not isinstance(asks, list):
+        return 0.0
+    rows: list[tuple[float, float]] = []
+    for lvl in asks:
+        p = _level_price(lvl)
+        s = _level_size(lvl)
+        if p is not None and s is not None:
+            rows.append((float(p), float(s)))
+    rows.sort(key=lambda x: x[0])
+    total = 0.0
+    for p, s in rows[:n]:
+        total += p * s
+    return float(total)
+
+
+def _parse_outcome_prices(m: dict[str, Any]) -> list[float] | None:
+    raw = m.get("outcomePrices") or m.get("outcome_prices")
+    raw = parse_json_maybe(raw)
+    if not isinstance(raw, (list, tuple)) or len(raw) < 1:
+        return None
+    try:
+        return [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return None
+
+
+def _gamma_price_to_beat(data: dict[str, Any]) -> float | None:
+    for key in ("openPrice", "open_price", "startPrice", "start_price"):
+        if key not in data:
+            continue
+        v = data.get(key)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _model_prob_from_signal(signal: dict[str, Any]) -> float:
+    """Proxy P(UP) para CLOBSignalFilter a partir de dirección y confianza del scorer."""
+    d = signal.get("direction")
+    conf = float(signal.get("confidence") or 0.0)
+    if d == "UP":
+        return 0.5 + conf * 0.5
+    if d == "DOWN":
+        return 0.5 - conf * 0.5
+    return 0.5
+
+
+class SixCycleEngine:
+    """Loop principal 6 ciclos: Scan→Predict→Validate→Size→Fill→Settle."""
+
+    def __init__(self) -> None:
+        self.scorer = MarketScorer()
+        self._scorer_token: str | None = None
+        self._filter = CLOBSignalFilter()
+        self.trades = 0
+        self.wins = 0
+        self.losses = 0
+        self.pnl_usdc = 0.0
+        self.win_streak = 0
+        self.best_streak = 0
+        self._console = Console()
+        self._csv_path = data_dir() / "logs" / "crypto_5m_sixcycle.csv"
+        self._csv_lock = asyncio.Lock()
+        self._last_signal_line = "Sin señal — edge insuficiente o sin mercados activos"
+        self._settle_tasks: set[asyncio.Task[Any]] = set()
+        self._http_session: aiohttp.ClientSession | None = None
+        self._settle_payload_pending: dict[str, Any] | None = None
+        self._panel_extra_lines: list[str] = []
+        self._stop_run = asyncio.Event()
+        self._prepare_ptb: float | None = None
+        self._prepare_prev: float | None = None
+        self._prepare_next_ts: int = 0
+        self._prepare_slug: str = ""
+        self._pending_signal: dict[str, Any] = {}
+        self._last_val_snapshot: dict[str, Any] = {}
+        self._ensure_csv_header()
+
+    def _sync_sixcycle_state(
+        self,
+        phase: str,
+        *,
+        signal: dict[str, Any] | None = None,
+        markets: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Actualiza ``SIXCYCLE_STATE`` para SSE /api/sixcycle/live (API en otro proceso)."""
+        now = datetime.now(timezone.utc)
+        sig = dict(signal) if signal else {}
+        markets = markets or []
+        m0 = markets[0] if markets else {}
+        comp_raw = sig.get("components") or {}
+        comp: dict[str, float] = {}
+        if isinstance(comp_raw, dict):
+            for k, v in comp_raw.items():
+                try:
+                    comp[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    pass
+        ptb_gap = comp.get("ptb_gap")
+        if ptb_gap is None:
+            try:
+                sp = float(sig["spot_price"]) if sig.get("spot_price") is not None else None
+            except (TypeError, ValueError):
+                sp = None
+            ptb_e: float | None = None
+            if m0.get("price_to_beat") is not None:
+                try:
+                    ptb_e = float(m0["price_to_beat"])
+                except (TypeError, ValueError):
+                    ptb_e = None
+            if ptb_e is None and self._prepare_ptb is not None:
+                try:
+                    ptb_e = float(self._prepare_ptb)
+                except (TypeError, ValueError):
+                    ptb_e = None
+            if sp is not None and ptb_e is not None:
+                ptb_gap = float(sp) - float(ptb_e)
+
+        eff_phase = phase
+        if phase == "EJECUTANDO" and len(self._settle_tasks) > 0:
+            eff_phase = "SETTLING"
+        elif phase == "EJECUTANDO" and not markets:
+            eff_phase = "SKIPPED"
+
+        next_slug = ""
+        secs_open = 0
+        if phase == "PREPARANDO":
+            next_slug = self._prepare_slug or ""
+            secs_open = max(0, int(self._prepare_next_ts) - int(time.time()))
+        else:
+            next_slug = _slug_btc_5m(_floor_5m_window_ts_utc(now))
+            nxt = next_market_slug_ts_for_prepare(now)
+            secs_open = max(0, int(nxt) - int(time.time()))
+
+        ptb: float | None = None
+        if phase == "PREPARANDO":
+            if self._prepare_ptb is not None:
+                try:
+                    ptb = float(self._prepare_ptb)
+                except (TypeError, ValueError):
+                    ptb = None
+        elif m0.get("price_to_beat") is not None:
+            try:
+                ptb = float(m0["price_to_beat"])
+            except (TypeError, ValueError):
+                ptb = None
+        elif self._prepare_ptb is not None:
+            try:
+                ptb = float(self._prepare_ptb)
+            except (TypeError, ValueError):
+                ptb = None
+
+        clob_yes: float | None = None
+        if sig.get("clob_yes_price") is not None:
+            try:
+                clob_yes = float(sig["clob_yes_price"])
+            except (TypeError, ValueError):
+                clob_yes = None
+        elif m0.get("clob_yes_price") is not None:
+            try:
+                clob_yes = float(m0["clob_yes_price"])
+            except (TypeError, ValueError):
+                clob_yes = None
+
+        liq: float | None = None
+        if sig.get("liquidity_usdc") is not None:
+            try:
+                liq = float(sig["liquidity_usdc"])
+            except (TypeError, ValueError):
+                liq = None
+        elif m0.get("liquidity_usdc") is not None:
+            try:
+                liq = float(m0["liquidity_usdc"])
+            except (TypeError, ValueError):
+                liq = None
+
+        val = self._last_val_snapshot or {}
+        try:
+            edge_f = float(val.get("edge", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            edge_f = 0.0
+        sig_bool = bool(val.get("signal"))
+
+        try:
+            spot = float(sig["spot_price"]) if sig.get("spot_price") is not None else None
+        except (TypeError, ValueError):
+            spot = None
+
+        try:
+            score_i = int(sig.get("score", 0) or 0)
+        except (TypeError, ValueError):
+            score_i = 0
+        try:
+            conf_f = float(sig.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            conf_f = 0.0
+
+        direction = sig.get("direction")
+        if direction is not None:
+            direction = str(direction)
+
+        wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
+
+        payload: dict[str, Any] = {
+            "timestamp_utc": now.isoformat(),
+            "phase": eff_phase,
+            "next_slug": next_slug,
+            "secs_until_open": secs_open,
+            "price_to_beat": ptb,
+            "spot_price": spot,
+            "ptb_gap": float(ptb_gap) if ptb_gap is not None else None,
+            "score": score_i,
+            "direction": direction,
+            "confidence": conf_f,
+            "ready": bool(sig.get("ready")),
+            "components": comp,
+            "clob_yes_price": clob_yes,
+            "liquidity_usdc": liq,
+            "signal": sig_bool,
+            "edge": edge_f,
+            "trades": int(self.trades),
+            "win_rate": round(wr, 2),
+            "pnl_usdc": round(float(self.pnl_usdc), 6),
+            "win_streak": int(self.win_streak),
+            "best_streak": int(self.best_streak),
+            "dry_run": bool(DRY_RUN),
+        }
+        with SIXCYCLE_STATE_LOCK:
+            SIXCYCLE_STATE.clear()
+            SIXCYCLE_STATE.update(payload)
+
+    async def shutdown(self) -> None:
+        """Solicita salida del bucle principal; ``run()`` hace ``scorer.stop()`` en ``finally``."""
+        self._stop_run.set()
+
+    async def _sleep_scan_interval_or_stop(self) -> bool:
+        """Espera SCAN_INTERVAL o hasta stop. Devuelve True si hay que salir del bucle principal."""
+        sleep_t = asyncio.create_task(asyncio.sleep(float(SCAN_INTERVAL_SECONDS)))
+        stop_t = asyncio.create_task(self._stop_run.wait())
+        done, pending = await asyncio.wait(
+            {sleep_t, stop_t},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        return self._stop_run.is_set()
+
+    async def _sleep_prepare_tick_or_stop(self, seconds: float) -> bool:
+        """Igual que scan sleep pero con intervalos cortos (PREPARANDO)."""
+        sleep_t = asyncio.create_task(asyncio.sleep(float(seconds)))
+        stop_t = asyncio.create_task(self._stop_run.wait())
+        done, pending = await asyncio.wait(
+            {sleep_t, stop_t},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        return self._stop_run.is_set()
+
+    async def _fetch_prev_market_result(
+        self, http: aiohttp.ClientSession, next_ts: int
+    ) -> float | None:
+        """% UP del mercado anterior (slug con next_ts - 300)."""
+        prev_ts = int(next_ts) - 300
+        slug = _slug_btc_5m(prev_ts)
+        url = f"{GAMMA_API_URL}/markets/slug/{slug}"
+        try:
+            async with http.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                text = await resp.text()
+                data = json.loads(text)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            if not isinstance(data, dict):
+                return None
+            prices = _parse_outcome_prices(data)
+            if prices and len(prices) >= 1:
+                return float(prices[0])
+        except Exception as e:  # noqa: BLE001
+            log.debug("prev_market_result %s: %s", slug, e)
+        return None
+
+    async def _fetch_next_market_price_to_beat(
+        self, http: aiohttp.ClientSession, next_ts: int
+    ) -> float | None:
+        """openPrice / startPrice del mercado que abre en next_ts."""
+        slug = _slug_btc_5m(int(next_ts))
+        url = f"{GAMMA_API_URL}/markets/slug/{slug}"
+        try:
+            async with http.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                text = await resp.text()
+                data = json.loads(text)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            if not isinstance(data, dict):
+                return None
+            return _gamma_price_to_beat(data)
+        except Exception as e:  # noqa: BLE001
+            log.debug("next_market_ptb %s: %s", slug, e)
+        return None
+
+    async def _prepare_phase(self, http: aiohttp.ClientSession) -> None:
+        next_ts = next_market_slug_ts_for_prepare()
+        prev_result = await self._fetch_prev_market_result(http, next_ts)
+        tsec = int(time.time())
+        current_ts = (tsec // 300) * 300
+        price_to_beat = await self._fetch_next_market_price_to_beat(http, current_ts)
+        self._prepare_ptb = price_to_beat
+        self._prepare_prev = prev_result
+        self._prepare_next_ts = int(next_ts)
+        self._prepare_slug = _slug_btc_5m(int(next_ts))
+        self._pending_signal = self.cycle_predict(
+            price_to_beat=price_to_beat,
+            prev_market_up_pct=prev_result,
+        )
+
+    def _render_preparing_panel(self, mode: str) -> None:
+        sig = self._pending_signal or {}
+        now_ts = int(time.time())
+        sec_left = max(0, int(self._prepare_next_ts) - now_ts)
+        ptb = self._prepare_ptb
+        prev = self._prepare_prev
+        spot = sig.get("spot_price")
+        score = sig.get("score")
+        direction = sig.get("direction") or "—"
+        conf = float(sig.get("confidence") or 0.0)
+        ready = sig.get("ready")
+        cb = sig.get("candles_below_ptb", 0)
+        comp = sig.get("components") or {}
+        comp_parts = []
+        for k in sorted(comp.keys()):
+            v = comp[k]
+            try:
+                fv = float(v)
+                comp_parts.append(f"{k}={fv:+.2f}" if abs(fv) < 1000 else f"{k}={fv:.4g}")
+            except (TypeError, ValueError):
+                comp_parts.append(f"{k}={v}")
+        comp_s = " ".join(comp_parts) if comp_parts else "—"
+        prev_line = "Mercado anterior: —"
+        if prev is not None:
+            prev_line = f"Mercado anterior: {prev * 100:.0f}% UP"
+            if prev < 0.35:
+                prev_line += " (sesgo DOWN)"
+            elif prev > 0.65:
+                prev_line += " (sesgo UP)"
+        wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
+        body = (
+            f"Abre en: {sec_left}s  Price to Beat: {_fmt_usd(ptb)}\n"
+            f"{prev_line}\n"
+            f"Score: {score} → {direction} (conf={conf:.2f})\n"
+            f"{comp_s}\n"
+            f"Spot: {_fmt_usd(float(spot) if spot is not None else None)}  "
+            f"ready={ready}  ptb_below(5)={cb}\n"
+            f"trades={self.trades} win_rate={wr:.1f}% pnl_usdc={self.pnl_usdc:+.4f} "
+            f"streak={self.win_streak}"
+        )
+        title = f"{mode} PREPARANDO {self._prepare_slug}"
+        self._console.print(Panel.fit(body, title=title, border_style="yellow"))
+
+    def _ensure_csv_header(self) -> None:
+        self._csv_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._csv_path.is_file() or self._csv_path.stat().st_size == 0:
+            with self._csv_path.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+                w.writeheader()
+
+    async def _append_csv(self, row: dict[str, Any]) -> None:
+        async with self._csv_lock:
+            with self._csv_path.open("a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+                w.writerow({k: row.get(k, "") for k in _CSV_FIELDS})
+
+    async def run(self) -> None:
+        """Loop infinito con SCAN_INTERVAL_SECONDS entre iteraciones."""
+        mode = "[DRY_RUN]" if DRY_RUN else "[LIVE]"
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers=_DEFAULT_HEADERS,
+        ) as http:
+            self._http_session = http
+            async with PolyCLOBClient(
+                api_key=os.getenv("POLY_API_KEY", ""),
+                private_key=os.getenv("POLY_PRIVATE_KEY", ""),
+                dry_run=DRY_RUN,
+            ) as clob:
+                try:
+                    asyncio.create_task(self.scorer.start(token_id=None))
+                    await asyncio.sleep(5.0)
+                    while not self._stop_run.is_set():
+                        now = datetime.now(timezone.utc)
+                        tsec = int(now.timestamp())
+                        win = (tsec // 300) * 300
+                        phase_sec = tsec - win
+                        preparing = phase_sec >= (300 - PREPARE_LAST_SECONDS)
+
+                        if preparing:
+                            try:
+                                await self._prepare_phase(http)
+                            except Exception as e:  # noqa: BLE001
+                                log.warning("_prepare_phase error", extra={"error": str(e)})
+                            self._sync_sixcycle_state(
+                                "PREPARANDO",
+                                signal=self._pending_signal or {},
+                            )
+                            self._render_preparing_panel(mode)
+                            if await self._sleep_prepare_tick_or_stop(1.0):
+                                break
+                            continue
+
+                        t0 = time.perf_counter()
+                        self._panel_extra_lines = []
+                        self._last_val_snapshot = {}
+                        cycle_scan_ms = cycle_predict_ms = cycle_validate_ms = 0.0
+                        cycle_size_ms = cycle_fill_ms = 0.0
+                        model_prob = 0.5
+                        signal: dict[str, Any] = {}
+                        try:
+                            t_scan = time.perf_counter()
+                            markets, scan_rejections = await self.cycle_scan(http, clob)
+                            cycle_scan_ms = (time.perf_counter() - t_scan) * 1000.0
+                            log.debug(
+                                "scan: %s mercado(s) tras filtros 60-270s",
+                                len(markets),
+                            )
+                            for r in scan_rejections:
+                                log.debug("scan_reject %s", r)
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("cycle_scan error", extra={"error": str(e)})
+                            markets = []
+                            scan_rejections = []
+                            cycle_scan_ms = (time.perf_counter() - t0) * 1000.0
+
+                        if markets:
+                            tid = str(markets[0].get("token_yes_id") or "").strip()
+                            if tid and tid != self._scorer_token:
+                                await self.scorer.start(token_id=tid)
+                                self._scorer_token = tid
+
+                        if not markets:
+                            self._panel_extra_lines.append(
+                                "Scan: 0 mercados activos en ventana 60-270s"
+                            )
+                        else:
+                            self._panel_extra_lines.append(
+                                f"Scan: {len(markets)} mercado(s) en ventana 60-270s"
+                            )
+                            for m in markets:
+                                self._panel_extra_lines.append(
+                                    "  • "
+                                    f"id={m['market_id']} TTE={float(m['tte_sec']):.0f}s "
+                                    f"YES={float(m['clob_yes_price']):.4f} "
+                                    f"liq={float(m['liquidity_usdc']):.1f} USDC"
+                                )
+
+                        try:
+                            t_pred = time.perf_counter()
+                            ptb_exec: float | None = self._prepare_ptb
+                            if markets:
+                                raw_ptb = markets[0].get("price_to_beat")
+                                if raw_ptb is not None:
+                                    try:
+                                        ptb_exec = float(raw_ptb)
+                                    except (TypeError, ValueError):
+                                        pass
+                            signal = self.cycle_predict(
+                                price_to_beat=ptb_exec,
+                                prev_market_up_pct=self._prepare_prev,
+                            )
+                            model_prob = _model_prob_from_signal(signal)
+                            cycle_predict_ms = (time.perf_counter() - t_pred) * 1000.0
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("predict/scorer error", extra={"error": str(e)})
+                            self._sync_sixcycle_state(
+                                "EJECUTANDO",
+                                signal={},
+                                markets=markets,
+                            )
+                            self._render_dashboard(
+                                mode,
+                                cycle_scan_ms,
+                                cycle_predict_ms,
+                                cycle_validate_ms,
+                                cycle_size_ms,
+                                cycle_fill_ms,
+                            )
+                            if await self._sleep_scan_interval_or_stop():
+                                break
+                            continue
+
+                        if markets:
+                            comp = signal.get("components") or {}
+                            comp_s = " ".join(
+                                f"{k}={v:+.0f}"
+                                for k, v in sorted(comp.items())
+                                if float(v) != 0.0
+                            )
+                            self._panel_extra_lines.append(
+                                f"  Scorer: score={signal.get('score')} dir={signal.get('direction')} "
+                                f"conf={float(signal.get('confidence') or 0):.3f} "
+                                f"ready={signal.get('ready')} spot={signal.get('spot_price')} "
+                                f"ptb_below={signal.get('candles_below_ptb')}"
+                            )
+                            if comp_s:
+                                self._panel_extra_lines.append(f"    componentes: {comp_s}")
+                            self._panel_extra_lines.append(f"  P(up) proxy={model_prob:.4f}")
+
+                        signal_taken = False
+                        for m in markets:
+                            try:
+                                t_val = time.perf_counter()
+                                clob_px = signal.get("clob_yes_price")
+                                if clob_px is None:
+                                    clob_px = float(m["clob_yes_price"])
+                                else:
+                                    clob_px = float(clob_px)
+                                liq_ws = signal.get("liquidity_usdc")
+                                liq = (
+                                    float(liq_ws)
+                                    if liq_ws is not None
+                                    else float(m["liquidity_usdc"])
+                                )
+                                val = self.cycle_validate(signal, clob_px, liq)
+                                self._last_val_snapshot = dict(val)
+                                cycle_validate_ms = (time.perf_counter() - t_val) * 1000.0
+                            except Exception as e:  # noqa: BLE001
+                                log.warning("cycle_validate error", extra={"error": str(e)})
+                                continue
+
+                            log.debug(
+                                "mercado id=%s TTE=%.0fs YES=%.4f liq=%.1f model_prob=%.4f edge=%.4f signal=%s",
+                                m["market_id"],
+                                float(m["tte_sec"]),
+                                clob_px,
+                                liq,
+                                model_prob,
+                                float(val.get("edge", 0.0)),
+                                val.get("signal"),
+                            )
+
+                            self._panel_extra_lines.append(
+                                "  • "
+                                f"id={m['market_id']} model={model_prob:.4f} "
+                                f"edge={float(val.get('edge', 0.0)):.4f} "
+                                f"signal={val.get('signal')} — {val.get('reason', '')}"
+                            )
+
+                            if not val.get("signal"):
+                                self._last_signal_line = (
+                                    f"Sin señal — {val.get('reason', 'edge insuficiente o sin liquidez')}"
+                                )
+                                continue
+
+                            try:
+                                t_sz = time.perf_counter()
+                                stake = self.cycle_size(float(val["edge"]))
+                                cycle_size_ms = (time.perf_counter() - t_sz) * 1000.0
+                            except Exception as e:  # noqa: BLE001
+                                log.warning("cycle_size error", extra={"error": str(e)})
+                                continue
+
+                            if val.get("direction") == "NO":
+                                token_no = str(m.get("token_no_id") or "").strip()
+                                if not token_no:
+                                    log.warning(
+                                        "mercado %s: dirección NO sin token_no_id, se omite fill",
+                                        m.get("market_id"),
+                                    )
+                                    continue
+                                token_fill = token_no
+                            else:
+                                token_fill = str(m["token_yes_id"])
+                            fill_price = float(m["clob_yes_price"])
+                            if val.get("direction") == "NO":
+                                px_no = await clob.get_price(str(token_fill), side="buy")
+                                if px_no is not None:
+                                    fill_price = float(px_no)
+
+                            try:
+                                t_fill = time.perf_counter()
+                                fill_out = await self.cycle_fill(
+                                    str(m["market_id"]),
+                                    str(token_fill),
+                                    str(val.get("direction") or "YES"),
+                                    stake,
+                                    fill_price,
+                                    clob,
+                                )
+                                cycle_fill_ms = (time.perf_counter() - t_fill) * 1000.0
+                            except Exception as e:  # noqa: BLE001
+                                log.warning("cycle_fill error", extra={"error": str(e)})
+                                if not DRY_RUN:
+                                    log.critical(
+                                        "LIVE fill falló — no reintento automático",
+                                        extra={"error": str(e)},
+                                    )
+                                continue
+
+                            self._last_signal_line = (
+                                f"{val.get('direction')} edge={val.get('edge'):.4f} stake={stake:.2f} "
+                                f"filled={fill_out.get('filled')} sim={fill_out.get('simulated')}"
+                            )
+                            signal_taken = True
+
+                            settle_payload = {
+                                "market_id": str(m["market_id"]),
+                                "direction": str(val.get("direction") or "YES"),
+                                "stake_usdc": stake,
+                                "fill_price": float(fill_out.get("price", fill_price)),
+                                "model_prob": model_prob,
+                                "clob_yes_price": float(m["clob_yes_price"]),
+                                "edge": float(val["edge"]),
+                                "filled": bool(fill_out.get("filled")),
+                                "simulated": bool(fill_out.get("simulated", True)),
+                                "cycle_ms_scan": round(cycle_scan_ms, 2),
+                                "cycle_ms_predict": round(cycle_predict_ms, 2),
+                                "cycle_ms_validate": round(cycle_validate_ms, 2),
+                                "cycle_ms_size": round(cycle_size_ms, 2),
+                                "cycle_ms_fill": round(cycle_fill_ms, 2),
+                            }
+                            self._settle_payload_pending = settle_payload
+                            task = asyncio.create_task(
+                                self.cycle_settle(
+                                    str(m["market_id"]),
+                                    str(val.get("direction") or "YES"),
+                                    stake,
+                                ),
+                                name=f"settle-{m['market_id']}",
+                            )
+                            self._settle_tasks.add(task)
+                            task.add_done_callback(self._settle_tasks.discard)
+                            break
+
+                        if not signal_taken and markets:
+                            self._last_signal_line = (
+                                "Sin señal — edge insuficiente o sin liquidez para los mercados escaneados"
+                            )
+                        elif not markets:
+                            self._last_signal_line = (
+                                "Sin señal — edge insuficiente o sin mercados activos"
+                            )
+
+                        self._sync_sixcycle_state(
+                            "EJECUTANDO",
+                            signal=signal,
+                            markets=markets,
+                        )
+                        self._render_dashboard(
+                            mode,
+                            cycle_scan_ms,
+                            cycle_predict_ms,
+                            cycle_validate_ms,
+                            cycle_size_ms,
+                            cycle_fill_ms,
+                        )
+                        if await self._sleep_scan_interval_or_stop():
+                            break
+                finally:
+                    try:
+                        await self.scorer.stop()
+                    except Exception:  # noqa: BLE001
+                        log.warning("scorer.stop en salida de run()", exc_info=True)
+
+    def _render_dashboard(
+        self,
+        mode: str,
+        ms_scan: float,
+        ms_pred: float,
+        ms_val: float,
+        ms_sz: float,
+        ms_fill: float,
+    ) -> None:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
+        header = f"{mode} {ts}"
+        extra = ""
+        if self._panel_extra_lines:
+            extra = "\n" + "\n".join(self._panel_extra_lines)
+        body = (
+            f"trades={self.trades}  win_rate={wr:.1f}%  pnl_usdc={self.pnl_usdc:.4f}  "
+            f"win_streak={self.win_streak}  best_streak={self.best_streak}\n"
+            f"Última señal: {self._last_signal_line}{extra}\n"
+            f"cycle_ms: scan={ms_scan:.1f} predict={ms_pred:.1f} validate={ms_val:.1f} "
+            f"size={ms_sz:.1f} fill={ms_fill:.1f}"
+        )
+        self._console.print(Panel.fit(body, title=header, border_style="cyan"))
+
+    async def cycle_scan(
+        self, http: aiohttp.ClientSession, clob: PolyCLOBClient
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """
+        Busca mercados BTC 5m activos en Gamma API.
+        Retorna lista de mercados con: market_id, question,
+        token_yes_id, close_ts, clob_yes_price, liquidity_usdc.
+        Filtros: solo mercados con time_to_expiry > 60s y < 270s.
+        """
+        now = datetime.now(timezone.utc)
+        win_ts = _floor_5m_window_ts_utc(now)
+        out: list[dict[str, Any]] = []
+        rejections: list[str] = []
+        for delta in (0, -300, 300, -600, 600):
+            slug = _slug_btc_5m(win_ts + delta)
+            url = f"{GAMMA_API_URL}/markets/slug/{slug}"
+            max_attempts = 10 if delta == 0 else 1
+            data: dict[str, Any] | None = None
+            for attempt in range(max_attempts):
+                try:
+                    async with http.get(url) as resp:
+                        if resp.status == 404:
+                            msg = f"{slug}: HTTP 404 (sin mercado)"
+                            if attempt == max_attempts - 1:
+                                rejections.append(msg)
+                            log.debug(msg)
+                            if attempt < max_attempts - 1:
+                                await asyncio.sleep(1.0)
+                            continue
+                        text = await resp.text()
+                        if resp.status != 200:
+                            msg = f"{slug}: HTTP {resp.status}"
+                            rejections.append(msg)
+                            log.warning(
+                                "gamma slug http",
+                                extra={"status": resp.status, "slug": slug},
+                            )
+                            break
+                        parsed = json.loads(text)
+                except Exception as e:  # noqa: BLE001
+                    msg = f"{slug}: error {e!s}"
+                    rejections.append(msg)
+                    log.warning("gamma slug error", extra={"slug": slug, "error": str(e)})
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(1.0)
+                    continue
+                else:
+                    if not isinstance(parsed, dict):
+                        msg = f"{slug}: respuesta no es dict"
+                        rejections.append(msg)
+                        log.debug(msg)
+                        break
+                    data = parsed
+                    break
+            if data is None:
+                continue
+            end_dt = _parse_gamma_end(data)
+            if end_dt is None:
+                msg = f"{slug}: sin endDate"
+                rejections.append(msg)
+                log.debug(msg)
+                continue
+            tte = (end_dt - now).total_seconds()
+            mid_guess = str(
+                data.get("id") or data.get("conditionId") or data.get("condition_id") or slug
+            )
+            if not (60.0 < tte < 270.0):
+                msg = (
+                    f"id={mid_guess} TTE fuera de rango 60-270s "
+                    f"(tte={tte:.0f}s, slug={slug})"
+                )
+                rejections.append(msg)
+                log.debug(msg)
+                continue
+            yid, _, rej = extract_yes_token_id(
+                data.get("outcomes"),
+                data.get("clobTokenIds") or data.get("clob_token_ids"),
+                assume_first=True,
+            )
+            if not yid:
+                msg = f"id={mid_guess} sin token YES/Up ({rej})"
+                rejections.append(msg)
+                log.debug("scan: sin token YES/Up", extra={"reject": rej, "slug": slug})
+                continue
+            nid = _gamma_no_token_id(data)
+            mid = str(data.get("id") or data.get("conditionId") or data.get("condition_id") or "")
+            if not mid:
+                msg = f"{slug}: sin market_id"
+                rejections.append(msg)
+                log.debug(msg)
+                continue
+            book = await clob.get_orderbook(str(yid))
+            if book.get("error"):
+                msg = f"id={mid} CLOB book: {book.get('error')}"
+                rejections.append(msg)
+                log.warning("clob book yes", extra={"error": book.get("error")})
+                continue
+            px = await clob.get_price(str(yid), side="buy")
+            if px is None:
+                px = book.get("best_ask")
+            if px is None:
+                msg = f"id={mid} sin precio YES (buy/mid)"
+                rejections.append(msg)
+                log.debug(msg)
+                continue
+            liq = _sum_ask_notional_top_n(book, 5)
+            out.append(
+                {
+                    "market_id": mid,
+                    "question": str(data.get("question", "")),
+                    "token_yes_id": str(yid),
+                    "token_no_id": str(nid) if nid else "",
+                    "close_ts": end_dt,
+                    "tte_sec": float(tte),
+                    "clob_yes_price": float(px),
+                    "liquidity_usdc": float(liq),
+                    "price_to_beat": _gamma_price_to_beat(data),
+                }
+            )
+            break
+        return out, rejections
+
+    def cycle_predict(
+        self,
+        price_to_beat: float | None = None,
+        prev_market_up_pct: float | None = None,
+    ) -> dict[str, Any]:
+        """Señal de confluencia vía WebSockets (Binance 1m + CLOB)."""
+        return self.scorer.get_signal(
+            price_to_beat=price_to_beat,
+            prev_market_up_pct=prev_market_up_pct,
+            min_abs_score=5,
+        )
+
+    def cycle_validate(
+        self, signal: dict[str, Any], clob_yes_price: float, liquidity: float
+    ) -> dict[str, Any]:
+        """Llamar CLOBSignalFilter.evaluate() con P(up) derivada del scorer."""
+        if not signal.get("ready") or signal.get("direction") is None:
+            return {
+                "signal": False,
+                "edge": 0.0,
+                "direction": "YES",
+                "reason": "scorer sin dirección o datos insuficientes (buffer/CLOB)",
+            }
+        model_prob = _model_prob_from_signal(signal)
+        return self._filter.evaluate(
+            model_prob=model_prob,
+            clob_yes_price=clob_yes_price,
+            min_edge=MIN_EDGE,
+            min_liquidity_usdc=MIN_LIQUIDITY_USDC,
+            liquidity=liquidity,
+        )
+
+    def cycle_size(self, edge: float) -> float:
+        """
+        Kelly fraccionario: stake = KELLY_FRACTION * edge * capital_disponible.
+        Capital = MAX_STAKE_USDC. Clamp [1.0, MAX_STAKE_USDC].
+        """
+        cap = MAX_STAKE_USDC
+        stake = KELLY_FRACTION * float(edge) * cap
+        stake = max(1.0, min(float(MAX_STAKE_USDC), stake))
+        return float(stake)
+
+    async def cycle_fill(
+        self,
+        market_id: str,
+        token_id: str,
+        direction: str,
+        stake_usdc: float,
+        clob_yes_price: float,
+        clob: PolyCLOBClient,
+    ) -> dict[str, Any]:
+        """
+        DRY_RUN: simular fill. LIVE: POST /order (sin reintentos aquí).
+        """
+        _ = market_id
+        _ = direction
+        if DRY_RUN:
+            log.info(
+                "[DRY_RUN] fill simulado",
+                extra={"token": token_id[:16], "stake": stake_usdc, "price": clob_yes_price},
+            )
+            return {
+                "filled": True,
+                "price": float(clob_yes_price),
+                "order_id": "",
+                "simulated": True,
+            }
+        try:
+            out = await clob.place_order(
+                token_id=str(token_id),
+                side="BUY",
+                price=float(clob_yes_price),
+                size_usdc=float(stake_usdc),
+            )
+            oid = str(out.get("orderID") or out.get("order_id") or out.get("id") or "")
+            return {
+                "filled": True,
+                "price": float(clob_yes_price),
+                "order_id": oid,
+                "simulated": False,
+            }
+        except Exception as e:  # noqa: BLE001
+            log.critical("LIVE place_order falló", extra={"error": str(e)})
+            raise
+
+    async def cycle_settle(self, market_id: str, direction: str, stake_usdc: float) -> None:
+        """
+        Polling cada 30s hasta que el mercado cierre; resolución Gamma; PnL y CSV.
+        Usar vía asyncio.create_task (no bloquea el scan loop).
+        """
+        http = self._http_session
+        payload = self._settle_payload_pending
+        self._settle_payload_pending = None
+        if http is None or payload is None:
+            log.warning("cycle_settle sin sesión o payload")
+            return
+        if str(payload.get("market_id")) != str(market_id) or abs(
+            float(payload.get("stake_usdc", 0)) - float(stake_usdc)
+        ) > 1e-6:
+            log.warning("cycle_settle: payload no coincide con argumentos")
+        if str(payload.get("direction")) != str(direction):
+            log.warning("cycle_settle: dirección payload vs arg")
+        await self._settle_trade_loop(http, payload)
+
+    async def _settle_trade_loop(
+        self, http: aiohttp.ClientSession, payload: dict[str, Any]
+    ) -> None:
+        """Polling hasta resolución; actualiza métricas y escribe CSV."""
+        market_id = str(payload["market_id"])
+        direction = str(payload["direction"])
+        stake = float(payload["stake_usdc"])
+        fill_price = float(payload["fill_price"])
+        url = f"{GAMMA_API_URL}/markets/{market_id}"
+        resolved = ""
+        pnl = 0.0
+        try:
+            while True:
+                try:
+                    async with http.get(url) as resp:
+                        text = await resp.text()
+                        if resp.status != 200:
+                            await asyncio.sleep(30.0)
+                            continue
+                        m = json.loads(text)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("settle fetch", extra={"error": str(e)})
+                    await asyncio.sleep(30.0)
+                    continue
+                if not isinstance(m, dict):
+                    await asyncio.sleep(30.0)
+                    continue
+                end_dt = _parse_gamma_end(m)
+                now = datetime.now(timezone.utc)
+                if end_dt is not None and now < end_dt:
+                    await asyncio.sleep(30.0)
+                    continue
+                if not api_bool_true(m.get("closed")) and not api_bool_true(m.get("isClosed")):
+                    await asyncio.sleep(30.0)
+                    continue
+                prices = _parse_outcome_prices(m)
+                outcomes = parse_json_maybe(m.get("outcomes"))
+                up_won: bool | None = None
+                if prices and len(prices) >= 2:
+                    try:
+                        up_won = float(prices[0]) > float(prices[1]) and float(prices[0]) >= 0.95
+                    except (TypeError, ValueError):
+                        up_won = None
+                if up_won is None and prices and len(prices) >= 1:
+                    try:
+                        up_won = float(prices[0]) >= 0.99
+                    except (TypeError, ValueError):
+                        up_won = None
+                if up_won is None and isinstance(outcomes, list) and prices:
+                    try:
+                        n = min(len(outcomes), len(prices))
+                        j = int(np.argmax(np.array(prices[:n], dtype=float)))
+                        oj = outcomes[j]
+                        if isinstance(oj, dict):
+                            lab = str(oj.get("title", oj.get("name", ""))).lower()
+                        else:
+                            lab = str(oj).lower()
+                        up_won = "up" in lab or "yes" in lab
+                    except (ValueError, IndexError, TypeError):
+                        up_won = None
+                if up_won is None:
+                    log.warning("settle: no se pudo inferir ganador", extra={"market_id": market_id})
+                    resolved = "unknown"
+                    pnl = 0.0
+                    break
+                bet_up = direction == "YES"
+                won = (bet_up and up_won) or ((not bet_up) and (not up_won))
+                if won:
+                    pnl = stake * (1.0 / max(fill_price, 1e-9) - 1.0)
+                    resolved = "win"
+                    self.wins += 1
+                    self.win_streak += 1
+                    self.best_streak = max(self.best_streak, self.win_streak)
+                else:
+                    pnl = -stake
+                    resolved = "loss"
+                    self.losses += 1
+                    self.win_streak = 0
+                self.trades += 1
+                self.pnl_usdc += pnl
+                self._console.print(
+                    Panel.fit(
+                        f"[settle] {market_id} {resolved} pnl={pnl:.4f} USDC",
+                        title="Settle",
+                        border_style="green" if won else "red",
+                    )
+                )
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("settle loop error", extra={"market_id": market_id})
+            resolved = resolved or "error"
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "market_id": market_id,
+            "direction": direction,
+            "model_prob": payload.get("model_prob", ""),
+            "clob_yes_price": payload.get("clob_yes_price", ""),
+            "edge": payload.get("edge", ""),
+            "stake_usdc": stake,
+            "filled": str(payload.get("filled", False)).lower(),
+            "simulated": str(payload.get("simulated", True)).lower(),
+            "resolved": resolved,
+            "pnl_usdc": f"{pnl:.6f}",
+            "win_streak": self.win_streak,
+            "cycle_ms_scan": payload.get("cycle_ms_scan", ""),
+            "cycle_ms_predict": payload.get("cycle_ms_predict", ""),
+            "cycle_ms_validate": payload.get("cycle_ms_validate", ""),
+            "cycle_ms_size": payload.get("cycle_ms_size", ""),
+            "cycle_ms_fill": payload.get("cycle_ms_fill", ""),
+        }
+        await self._append_csv(row)
+
+
+async def _shutdown(engine: SixCycleEngine) -> None:
+    log.info("Shutdown — guardando estado...")
+    engine._stop_run.set()
+    try:
+        await engine.scorer.stop()
+    except Exception:  # noqa: BLE001
+        log.exception("scorer.stop durante shutdown")
+    # No sys.exit aquí: al salir la tarea, engine.run() termina y asyncio.run() acaba con código 0.
+
+
+async def main() -> None:
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=os.getenv("LOG_LEVEL", "INFO"),
+            format="%(message)s",
+        )
+    engine = SixCycleEngine()
+    loop = asyncio.get_running_loop()
+    try:
+        for s in (sig_module.SIGINT, sig_module.SIGTERM):
+            loop.add_signal_handler(
+                s,
+                lambda: asyncio.create_task(_shutdown(engine)),
+            )
+    except (NotImplementedError, RuntimeError):
+        pass
+    await engine.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

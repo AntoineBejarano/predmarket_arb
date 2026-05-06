@@ -216,8 +216,8 @@
           <h2 class="text-sm font-medium text-slate-200">Próximos eventos (Gamma / Polymarket)</h2>
           <p class="text-xs text-slate-500 mt-0.5">
             Hora estimada en <span class="text-slate-400">Europe/Madrid</span> desde metadata Gamma (sin llamadas a
-            odds-api.io).             Solo filas con <code class="text-slate-600">kickoff_utc</code> inferido; partidos con kickoff hace
-            &gt;45 min no se listan. “Hace N min” = ya empezó hace N minutos (no es cuenta atrás hacia el inicio).
+            odds-api.io). Solo filas con <code class="text-slate-600">kickoff_utc</code> inferido desde Gamma; partidos con kickoff hace
+            &gt;45 min no se listan. <strong>LIVE · hace N min</strong> = el inicio estimado ya pasó (posible partido en curso según metadata; no confirma retransmisión ni ausencia de retrasos).
           </p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
@@ -232,7 +232,7 @@
             <tr class="bg-slate-800 text-slate-400 uppercase">
               <th class="p-2">Inicio (España)</th>
               <th class="p-2">UTC</th>
-              <th class="p-2" title="Negativo = kickoff ya pasó (partido en curso si el kickoff es correcto). Se listan hasta ~45 min tras el inicio.">Respecto al inicio</th>
+              <th class="p-2" title="LIVE = kickoff estimado (Gamma) ya pasó; 'en N min' = aún no. Hasta ~45 min tras el inicio estimado.">Respecto al inicio</th>
               <th class="p-2">Estado</th>
               <th class="p-2">Liga</th>
               <th class="p-2">Partido</th>
@@ -284,7 +284,7 @@
         <div class="flex flex-wrap items-center gap-2">
           <a href="/api/arb/strategy/latency_arb_sports/csv-download" download="latency_arb_sports.csv"
             class="text-xs px-2 py-1 border border-emerald-800 text-emerald-300 rounded hover:bg-emerald-950/40"
-            title="Mismo archivo que escribe arb_engine bajo DATA_DIR/logs/latency_arb_sports.csv">Descargar CSV completo</a>
+            title="Mismo archivo que la tabla (API /log). Columna prob_pin en pantalla = prob_pinnacle en CSV. ts en ISO UTC; la tabla convierte a España. Si DATA_DIR en el servidor apunta a un volumen, el CSV está ahí.">Descargar CSV completo</a>
           <a href="/api/arb/strategy/latency_arb_sports/snapshots-csv-download" download="latency_arb_sports_snapshots.csv"
             class="text-xs px-2 py-1 border border-cyan-800 text-cyan-300 rounded hover:bg-cyan-950/40">Descargar snapshots CSV</a>
           <button type="button" onclick="loadLog()" class="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800">Refrescar</button>
@@ -447,12 +447,25 @@
               .map(function (r) {
                 const es = esc(r.kickoff_es_label || "—");
                 const utc = esc(formatKickoffUtc(r.kickoff_utc));
-                const dm =
+                const dmRaw =
                   r.kickoff_delta_label != null && r.kickoff_delta_label !== ""
-                    ? esc(r.kickoff_delta_label)
+                    ? String(r.kickoff_delta_label)
                     : r.minutes_to_kickoff != null
-                      ? esc(String(r.minutes_to_kickoff)) + " min"
+                      ? String(r.minutes_to_kickoff) + " min"
                       : "—";
+                const postStart =
+                  r.kickoff_post_start === true ||
+                  (typeof r.minutes_to_kickoff === "number" && r.minutes_to_kickoff < 0);
+                let dm;
+                if (postStart && dmRaw !== "—") {
+                  const rest = String(dmRaw).replace(/^LIVE\s*·\s*/, "");
+                  dm =
+                    "<span class='text-rose-300 font-semibold'>LIVE</span><span class='text-slate-300'> · " +
+                    esc(rest) +
+                    "</span>";
+                } else {
+                  dm = esc(dmRaw);
+                }
                 const st = esc(r.status || "—");
                 const lg = esc((r.league || "").slice(0, 48));
                 const pt = esc((r.home || "") + " vs " + (r.away || ""));
@@ -912,7 +925,13 @@
         const el = document.getElementById(id);
         if (el) el.textContent = txt;
       };
-      const fmtS = (v) => (v == null ? "—" : Number(v).toFixed(0) + "s");
+      const fmtS = (v) => {
+        if (v == null) return "—";
+        const n = Number(v);
+        if (!Number.isFinite(n)) return "—";
+        if (n < 1.0) return "<1s";
+        return n.toFixed(0) + "s";
+      };
       setText("capture-age-msg", fmtS(s.ws_age_last_msg_sec));
       setText("capture-age-tick", fmtS(s.ws_age_last_tick_sec));
       setText(

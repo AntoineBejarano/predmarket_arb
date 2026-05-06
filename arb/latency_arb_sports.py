@@ -23,11 +23,25 @@ from aiohttp import WSMsgType
 
 from arb.base import ArbStrategy
 from arb.latency_sports_manual_match import load_manual_matches
+from arb.latency_sports_moneyline_semantic import is_valid_polymarket_moneyline
+from arb.latency_sports_signal_sanity import (
+    map_reason_to_skip_action,
+    normalized_team_pair,
+    should_emit_signal,
+)
+from arb.latency_sports_signal_state import (
+    LegSignalState,
+    SignalKey,
+    get_signal_key,
+    should_emit_signal as leg_signal_should_emit,
+    update_signal_state as leg_signal_update_state,
+)
 from clients.odds_api import (
     TEAM_PAIR_MATCH_THRESHOLD,
     normalized_poly_odds_token_lists,
     normalize_team_for_match,
     odds_team_matches_gamma_blob,
+    single_side_match_score,
     team_pair_match_score,
     teams_match_odds_gamma,
 )
@@ -154,14 +168,12 @@ _DEFAULT_HEADERS = {
 }
 
 MIN_DISCOVERY_TTL_SEC = 300
-# Cooldown por partido+lado: solo reemitir si el mid cambia >0.5% o han pasado 30 s.
-_SIGNAL_COOLDOWN_PRICE_EPS = 0.005
-_SIGNAL_COOLDOWN_SEC = 30.0
 
 # Parámetros fijos de la estrategia (no se leen LATENCY_SPORTS_* ni ODDS_API_IO_SPORTS del entorno).
 # Rutas de datos: ``lab.paths.data_dir()`` (fijo ``<repo>/data``). Siguen por env: POLY_* (CLOB), claves Odds API en clients/odds_api_io.
-# Slugs ``sport`` nativos Gamma GET https://gamma-api.polymarket.com/sports (nba, epl, ucl, …).
-_HARDCODE_POLY_SLUGS = "atp,wta,wttmen,nba,epl,ucl"
+# Slugs ``sport`` nativos Gamma GET https://gamma-api.polymarket.com/sports (nba, atp, …).
+# Sin fútbol (epl/ucl): reduce ruido CSV/UI y cuota REST; ``POLY_SLUG_TO_ODDS_KEY`` sigue mapeando epl/ucl por si se reactivan.
+_HARDCODE_POLY_SLUGS = "atp,wta,wttmen,nba"
 _HARDCODE_MIN_EDGE = 0.005
 _HARDCODE_MIN_EDGE_EXEC = 0.005
 _HARDCODE_MAX_STAKE_USDC = 10.0
@@ -200,6 +212,42 @@ _HARDCODE_REF_DEAD_NO_TICKS_REPEAT_SEC = 300.0
 _WS_DEAD_LIVE_THRESHOLD_SEC = 60.0
 # Filtro temporal previo al name-match para evitar comparar candidatos de días muy distintos.
 _HARDCODE_ALIGNMENT_TIME_WINDOW_SEC = 36.0 * 3600.0
+# Token↔equipo IO: misma barra que el par Poly↔Odds (no es umbral de trading).
+_TOKEN_SIDE_MAP_MIN_SCORE = float(TEAM_PAIR_MATCH_THRESHOLD)
+# Por debajo de esto no emitir SIGNAL (sí SKIP:SUSPICIOUS_MAPPING); no confundir con min_edge_exec.
+_MAPPING_CONFIDENCE_MIN_FOR_SIGNAL = 0.55
+_SUSPICIOUS_EDGE_ABS = 0.10
+_SUSPICIOUS_EDGE_LOG_ABS = 0.20
+# Sanidad estructural previa a SIGNAL (alineado con arb/latency_sports_signal_sanity.py)
+_HARDCODE_IO_PAIR_SIGNAL_DEDUPE_SEC = 300.0
+
+
+def _suspicious_edge_flag_csv(edge_exec: Optional[float], edge_mid: Optional[float]) -> str:
+    if edge_exec is not None and abs(float(edge_exec)) > float(_SUSPICIOUS_EDGE_ABS):
+        return "true"
+    if edge_mid is not None and abs(float(edge_mid)) > float(_SUSPICIOUS_EDGE_ABS):
+        return "true"
+    return "false"
+
+
+def _suspicious_edge_should_log(edge_exec: Optional[float], edge_mid: Optional[float]) -> bool:
+    if edge_exec is not None and abs(float(edge_exec)) > float(_SUSPICIOUS_EDGE_LOG_ABS):
+        return True
+    return abs(float(edge_mid or 0.0)) > float(_SUSPICIOUS_EDGE_LOG_ABS)
+
+
+def _sides_opposing_for_dedupe(a: str, b: str) -> bool:
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b or a == b:
+        return False
+    f = frozenset({a, b})
+    return f in (
+        frozenset({"TEAM_HOME_YES", "TEAM_AWAY_YES"}),
+        frozenset({"OUTCOME_HOME", "OUTCOME_AWAY"}),
+        frozenset({"LITERAL_YES", "LITERAL_NO"}),
+        frozenset({"YES", "NO"}),
+    )
+
 
 # Gamma /events con ?sport= no filtra de forma fiable; usamos series_id del GET /sports nativo.
 GAMMA_SPORTS_META_TTL_SEC = 3600.0
@@ -368,6 +416,31 @@ def _gamma_event_doubles_signal(ev: dict[str, Any]) -> bool:
     return False
 
 
+def _gamma_market_sports_type(m: dict[str, Any]) -> str:
+    return str(
+        m.get("sportsMarketType")
+        or m.get("sports_market_type")
+        or m.get("sportsMarkettype")
+        or ""
+    ).strip()
+
+
+def _compact_raw_market_json(m: dict[str, Any]) -> str:
+    mini = {
+        "question": str(m.get("question") or "")[:800],
+        "slug": str(m.get("slug") or "")[:200],
+        "sportsMarketType": str(
+            m.get("sportsMarketType") or m.get("sports_market_type") or ""
+        )[:120],
+        "groupItemTitle": str(m.get("groupItemTitle") or "")[:120],
+        "conditionId": str(m.get("conditionId") or m.get("condition_id") or "")[:80],
+    }
+    raw = json.dumps(mini, ensure_ascii=False)
+    if len(raw) > 4000:
+        return raw[:3997] + "..."
+    return raw
+
+
 @dataclass
 class OpenPolymarketGame:
     sport_slug: str
@@ -381,6 +454,26 @@ class OpenPolymarketGame:
     outcome_tokens: list[tuple[str, str]]
     end_date_s: Optional[str]
     kickoff_utc: Optional[datetime] = None
+    market_question: str = ""
+    market_slug: str = ""
+    group_item_title: str = ""
+    sports_market_type: str = ""
+    raw_market_json: Optional[str] = None
+
+    @property
+    def game_slug(self) -> str:
+        return self.slug
+
+
+def _poly_audit_csv_fields(game: OpenPolymarketGame, moneyline_semantic_reason: str) -> dict[str, str]:
+    return {
+        "condition_id": (game.condition_id or "").strip(),
+        "market_slug": (game.market_slug or "").strip(),
+        "sports_market_type": (game.sports_market_type or "").strip(),
+        "question": (game.market_question or "").strip(),
+        "group_item_title": (game.group_item_title or "").strip(),
+        "moneyline_semantic_reason": (moneyline_semantic_reason or "")[:400],
+    }
 
 
 def _summarize_numeric_list_min_p50_max(values: list[float]) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -854,6 +947,11 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
         if not cid:
             return None
         token_yes = _yes_token_from_pairs(pairs) or pairs[0][1]
+        mq = str(two_team_m.get("question") or "").strip()
+        mslug = str(two_team_m.get("slug") or "").strip()
+        git = str(two_team_m.get("groupItemTitle") or "").strip()
+        smt = _gamma_market_sports_type(two_team_m)
+        rawj = _compact_raw_market_json(two_team_m)
         # Nombres desde el mercado CLOB (p. ej. "A / B"); el título a veces compacta y pierde el slash.
         return OpenPolymarketGame(
             sport_slug=sport_slug,
@@ -867,6 +965,11 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
             outcome_tokens=list(pairs),
             end_date_s=end_s,
             kickoff_utc=kfu,
+            market_question=mq,
+            market_slug=mslug,
+            group_item_title=git,
+            sports_market_type=smt,
+            raw_market_json=rawj,
         )
 
     home_yes: Optional[str] = None
@@ -914,6 +1017,30 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
             _doubles_hint_in_text(home_p) or _doubles_hint_in_text(away_p)
         ):
             return None
+        qh = str(mk_home.get("question") or "").strip()
+        qa = str(mk_away.get("question") or "").strip()
+        sh = str(mk_home.get("slug") or "").strip()
+        sa = str(mk_away.get("slug") or "").strip()
+        gh = str(mk_home.get("groupItemTitle") or "").strip()
+        ga_git = str(mk_away.get("groupItemTitle") or "").strip()
+        smh = _gamma_market_sports_type(mk_home)
+        sma = _gamma_market_sports_type(mk_away)
+        if smh and sma and smh.strip().lower() == sma.strip().lower():
+            smt_dual = smh
+        else:
+            smt_dual = ""
+        mq_dual = " | ".join(x for x in (qh, qa) if x)
+        mslug_dual = " | ".join(x for x in (sh, sa) if x)
+        if gh and gh == ga_git:
+            git_dual = gh
+        else:
+            git_dual = " | ".join(x for x in (gh, ga_git) if x)
+        rj_h = _compact_raw_market_json(mk_home)
+        rj_a = _compact_raw_market_json(mk_away)
+        rawj_dual = f"{rj_h}||{rj_a}"
+        if len(rawj_dual) > 4000:
+            rawj_dual = rawj_dual[:3997] + "..."
+        # condition_id: primer mercado (token_yes home); mismo criterio histórico para CLOB.
         return OpenPolymarketGame(
             sport_slug=sport_slug,
             home=home_p,
@@ -926,6 +1053,11 @@ def _poly_event_to_open_game(ev: dict[str, Any], sport_slug: str) -> Optional[Op
             outcome_tokens=outcome_tokens,
             end_date_s=end_s,
             kickoff_utc=kfu,
+            market_question=mq_dual,
+            market_slug=mslug_dual,
+            group_item_title=git_dual,
+            sports_market_type=smt_dual,
+            raw_market_json=rawj_dual,
         )
     return None
 
@@ -1010,6 +1142,10 @@ def _empty_match_counters() -> dict[str, int]:
         "drop_reference_lag": 0,
         "drop_alignment_none": 0,
         "drop_token_map": 0,
+        "token_side_resolved": 0,
+        "token_side_unresolved": 0,
+        "token_side_conflict": 0,
+        "drop_non_moneyline_semantic": 0,
     }
 
 
@@ -1375,6 +1511,7 @@ def _map_outcomes_to_tokens(
 
 
 def _open_game_to_gamma_row(game: OpenPolymarketGame, odds_sport_key: str) -> GammaSportMarket:
+    qm = (game.market_question or "").strip()
     return GammaSportMarket(
         condition_id=game.condition_id,
         slug=game.slug or game.condition_id[:16],
@@ -1383,10 +1520,210 @@ def _open_game_to_gamma_row(game: OpenPolymarketGame, odds_sport_key: str) -> Ga
         home_team=game.home,
         away_team=game.away,
         outcome_tokens=list(game.outcome_tokens),
-        question=game.raw_title,
+        question=qm or game.raw_title,
         end_date_s=game.end_date_s,
         start_date_s=None,
     )
+
+
+@dataclass
+class ResolvedPolyOddsLeg:
+    """Una pierna CLOB alineada a una cuota IO (fair prob) sin asumir YES=home / NO=away."""
+
+    token_id: str
+    poly_outcome_label: str
+    resolved_poly_side: str  # "home" | "away" — mismo convenio que tw: home = lado odds_home (Poly home alineado)
+    poly_team_display: str
+    odds_team: str
+    odds_prob: float
+    side: str  # TEAM_HOME_YES | TEAM_AWAY_YES | OUTCOME_HOME | OUTCOME_AWAY | LITERAL_YES | LITERAL_NO
+    mapping_confidence: float
+    mapping_reason: str
+
+
+def _outcome_labels_are_literal_yes_no(pairs: list[tuple[str, str]]) -> bool:
+    if len(pairs) != 2:
+        return False
+    a = str(pairs[0][0] or "").strip().lower()
+    b = str(pairs[1][0] or "").strip().lower()
+    return {a, b} == {"yes", "no"}
+
+
+def _is_dual_team_yes_moneyline(game: OpenPolymarketGame, sport_slug: Optional[str]) -> bool:
+    """Dos tokens YES de equipo (labels ≈ título home/away), no complementarios en un solo mercado."""
+    ot = game.outcome_tokens
+    if len(ot) != 2:
+        return False
+    if _outcome_labels_are_literal_yes_no(ot):
+        return False
+    sk = (sport_slug or (game.sport_slug or "").strip() or "").strip() or None
+    (l0, _), (l1, _) = ot
+    gh, ga = normalize_name_order(game.home), normalize_name_order(game.away)
+    n0, n1 = normalize_name_order(str(l0)), normalize_name_order(str(l1))
+    return (
+        teams_match_odds_gamma(n0, gh, sport_slug=sk) and teams_match_odds_gamma(n1, ga, sport_slug=sk)
+    ) or (
+        teams_match_odds_gamma(n0, ga, sport_slug=sk) and teams_match_odds_gamma(n1, gh, sport_slug=sk)
+    )
+
+
+def _infer_literal_yes_poly_side(game: OpenPolymarketGame, sport_slug: Optional[str]) -> Optional[str]:
+    """
+    Para mercados Yes/No: inferir si YES representa el lado Poly home o away (heurística título).
+    """
+    sk = (sport_slug or (game.sport_slug or "").strip() or "").strip() or None
+    q_src = (game.market_question or "").strip() or (game.raw_title or "").strip()
+    q = q_src.lower()
+    gh, ga = (game.home or "").strip().lower(), (game.away or "").strip().lower()
+    if not gh or not ga:
+        return None
+    if gh in q and ga not in q:
+        return "home"
+    if ga in q and gh not in q:
+        return "away"
+    q_title = normalize_name_order(q_src)
+    if teams_match_odds_gamma(normalize_name_order(game.home), q_title, sport_slug=sk):
+        return "home"
+    if teams_match_odds_gamma(normalize_name_order(game.away), q_title, sport_slug=sk):
+        return "away"
+    return None
+
+
+def resolve_poly_odds_legs(
+    game: OpenPolymarketGame,
+    odds_home: str,
+    odds_away: str,
+    p_h_fair: float,
+    p_a_fair: float,
+    *,
+    sport_slug: Optional[str] = None,
+) -> tuple[list[ResolvedPolyOddsLeg], str]:
+    """
+    Construye 2 piernas token↔probabilidad fair alineada a IO (tw ya alineó nombres a Poly home/away).
+    Devuelve ([], reason) si no hay biyección inequívoca.
+    """
+    sk = (sport_slug or (game.sport_slug or "").strip() or "").strip() or None
+    ot = list(game.outcome_tokens)
+    if len(ot) != 2:
+        return [], "need_two_outcomes"
+    oh, oa = (odds_home or "").strip(), (odds_away or "").strip()
+    if not oh or not oa:
+        return [], "missing_odds_names"
+    (l0, t0), (l1, t1) = ot
+    t0, t1 = str(t0).strip(), str(t1).strip()
+    if not t0 or not t1 or t0 == t1:
+        return [], "invalid_token_ids"
+
+    # Caso literal Yes/No en un solo mercado
+    if _outcome_labels_are_literal_yes_no(ot):
+        yes_side = _infer_literal_yes_poly_side(game, sk)
+        if yes_side is None:
+            return [], "literal_yes_no_unresolved"
+        if str(l0).strip().lower() == "yes":
+            yes_tid, no_tid = t0, t1
+        else:
+            yes_tid, no_tid = t1, t0
+        if yes_side == "home":
+            y_prob, n_prob, y_team, n_team = float(p_h_fair), float(p_a_fair), oh, oa
+            y_res, n_res = "home", "away"
+            y_disp = str(game.home or "").strip()
+            n_disp = str(game.away or "").strip()
+        else:
+            y_prob, n_prob, y_team, n_team = float(p_a_fair), float(p_h_fair), oa, oh
+            y_res, n_res = "away", "home"
+            y_disp = str(game.away or "").strip()
+            n_disp = str(game.home or "").strip()
+        conf_y = 0.82
+        legs = [
+            ResolvedPolyOddsLeg(
+                token_id=yes_tid,
+                poly_outcome_label="Yes",
+                resolved_poly_side=y_res,
+                poly_team_display=y_disp,
+                odds_team=y_team,
+                odds_prob=y_prob,
+                side="LITERAL_YES",
+                mapping_confidence=float(conf_y),
+                mapping_reason="literal_yes_no_title",
+            ),
+            ResolvedPolyOddsLeg(
+                token_id=no_tid,
+                poly_outcome_label="No",
+                resolved_poly_side=n_res,
+                poly_team_display=n_disp,
+                odds_team=n_team,
+                odds_prob=n_prob,
+                side="LITERAL_NO",
+                mapping_confidence=float(conf_y),
+                mapping_reason="literal_yes_no_title",
+            ),
+        ]
+        return legs, ""
+
+    s0h = single_side_match_score(l0, oh, sport_slug=sk)
+    s0a = single_side_match_score(l0, oa, sport_slug=sk)
+    s1h = single_side_match_score(l1, oh, sport_slug=sk)
+    s1a = single_side_match_score(l1, oa, sport_slug=sk)
+
+    min_t = float(_TOKEN_SIDE_MAP_MIN_SCORE)
+    perm_a_ok = s0h >= min_t and s1a >= min_t
+    perm_b_ok = s0a >= min_t and s1h >= min_t
+    if perm_a_ok and perm_b_ok:
+        min_a = min(s0h, s1a)
+        min_b = min(s0a, s1h)
+        if abs(min_a - min_b) < 0.03:
+            return [], "ambiguous_perm"
+        use_a = min_a >= min_b
+    elif perm_a_ok:
+        use_a = True
+    elif perm_b_ok:
+        use_a = False
+    else:
+        return [], "no_valid_perm"
+
+    dual_yes = _is_dual_team_yes_moneyline(game, sk)
+
+    def _build(
+        home_lab: str,
+        home_tid: str,
+        away_lab: str,
+        away_tid: str,
+        conf_h: float,
+        conf_a: float,
+        reason: str,
+    ) -> list[ResolvedPolyOddsLeg]:
+        if dual_yes:
+            side_h, side_a = "TEAM_HOME_YES", "TEAM_AWAY_YES"
+        else:
+            side_h, side_a = "OUTCOME_HOME", "OUTCOME_AWAY"
+        return [
+            ResolvedPolyOddsLeg(
+                token_id=home_tid,
+                poly_outcome_label=str(home_lab).strip(),
+                resolved_poly_side="home",
+                poly_team_display=str(game.home or "").strip(),
+                odds_team=oh,
+                odds_prob=float(p_h_fair),
+                side=side_h,
+                mapping_confidence=float(min(conf_h, conf_a)),
+                mapping_reason=reason,
+            ),
+            ResolvedPolyOddsLeg(
+                token_id=away_tid,
+                poly_outcome_label=str(away_lab).strip(),
+                resolved_poly_side="away",
+                poly_team_display=str(game.away or "").strip(),
+                odds_team=oa,
+                odds_prob=float(p_a_fair),
+                side=side_a,
+                mapping_confidence=float(min(conf_h, conf_a)),
+                mapping_reason=reason,
+            ),
+        ]
+
+    if use_a:
+        return _build(l0, t0, l1, t1, s0h, s1a, "perm_label0_io_home_label1_io_away"), ""
+    return _build(l1, t1, l0, t0, s1h, s0a, "perm_label1_io_home_label0_io_away"), ""
 
 
 def _poly_token_ids_from_open_games(games: list[OpenPolymarketGame]) -> list[str]:
@@ -1415,6 +1752,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "dry_run",
             "signal_id",
             "game_slug",
+            "odds_io_event_id",
             "league",
             "home_team",
             "away_team",
@@ -1448,6 +1786,19 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "match_score",
             "signal_anchor_ts",
             "trigger",
+            "poly_market_title",
+            "poly_outcome_label",
+            "resolved_team",
+            "odds_team_mapped",
+            "mapping_confidence",
+            "mapping_reason",
+            "suspicious_edge",
+            "condition_id",
+            "market_slug",
+            "sports_market_type",
+            "question",
+            "group_item_title",
+            "moneyline_semantic_reason",
         ]
 
     def __init__(self, config: dict[str, Any], dry_run: bool = True) -> None:
@@ -1492,9 +1843,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._snapshot_csv_enabled = _SNAPSHOT_CSV_ENABLED
         self._snapshot_csv_path = _latency_snapshots_csv_path()
         self._snapshot_csv_lock = threading.Lock()
-        # Cooldown SIGNAL por mercado+lado (clave estable: slug Gamma + YES/NO; no home/away por orden variable).
-        self._last_signal_price: dict[str, float] = {}
-        self._last_signal_mono: dict[str, float] = {}
+        # Cooldown SIGNAL por mercado+lado (clave estable: slug Gamma + side semántico TEAM_* / LITERAL_*).
+        # Estado por (event_id IO, par equipos, side, token): emisión event-driven (ver latency_sports_signal_state).
+        self._signal_leg_state: dict[SignalKey, LegSignalState] = {}
         # Betfair-first: resultado de public-search por event_id IO (TTL corto, independiente del discovery por series).
         self._betfair_gamma_search_cache: dict[str, tuple[float, Optional[OpenPolymarketGame]]] = {}
         self._betfair_gamma_search_ttl = float(_HARDCODE_BETFAIR_GAMMA_SEARCH_TTL)
@@ -1520,6 +1871,9 @@ class LatencyArbSportsStrategy(ArbStrategy):
         self._tick_to_signal_ms_recent: deque = deque(maxlen=200)
         # SKIP:REF_DEAD_NO_TICKS: último timestamp escrito (anti-spam).
         self._ref_dead_last_emit_mono: float = 0.0
+        # (canonical_team_pair, side_semantic) -> último monotonic al emitir SIGNAL (anti spam multi-tick).
+        # (odds_event_id, canonical_team_pair) -> (condition_id, mono) último SIGNAL cross-market.
+        self._io_pair_signal_last: dict[tuple[str, tuple[str, str]], tuple[str, float]] = {}
 
     def _ensure_csv(self) -> None:
         """Migra cabecera si hay columnas nuevas (base solo fusiona ficticio)."""
@@ -1690,10 +2044,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "size_usdc": "0",
                 "status": "INFO",
                 "latency_ms_ref_to_clob": snap.get("latency_ms_ref_to_clob", ""),
+                "latency_ms_tick_to_signal": snap.get("latency_ms_tick_to_signal", ""),
                 "order_attempted": "false",
                 "fill_price": "",
                 "fill_size": "",
                 "fee_est": "",
+                "odds_io_updated_at": snap.get("odds_io_updated_at", ""),
                 **empty_clob,
                 "poly_price_30s": _fmt_opt_float(p["p30"]),
                 "poly_price_60s": _fmt_opt_float(p["p60"]),
@@ -1702,6 +2058,20 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "betfair_depth_away": da,
                 "match_score": snap.get("match_score", ""),
                 "signal_anchor_ts": p["anchor_iso"],
+                "trigger": snap.get("trigger", ""),
+                "poly_market_title": snap.get("poly_market_title", ""),
+                "poly_outcome_label": snap.get("poly_outcome_label", ""),
+                "resolved_team": snap.get("resolved_team", ""),
+                "odds_team_mapped": snap.get("odds_team_mapped", ""),
+                "mapping_confidence": snap.get("mapping_confidence", ""),
+                "mapping_reason": snap.get("mapping_reason", ""),
+                "suspicious_edge": snap.get("suspicious_edge", "false"),
+                "condition_id": snap.get("condition_id", ""),
+                "market_slug": snap.get("market_slug", ""),
+                "sports_market_type": snap.get("sports_market_type", ""),
+                "question": snap.get("question", ""),
+                "group_item_title": snap.get("group_item_title", ""),
+                "moneyline_semantic_reason": snap.get("moneyline_semantic_reason", ""),
             }
             await self.log_signal_async(row)
 
@@ -1816,6 +2186,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
         catalog_hydrate_ok: int = 0,
         catalog_hydrate_fail: int = 0,
         catalog_hydrate_quota_blocked: int = 0,
+        token_side_resolved: int = 0,
+        token_side_unresolved: int = 0,
+        token_side_conflict: int = 0,
+        suspicious_edge_count: int = 0,
+        suspicious_edge_examples: Optional[list[Any]] = None,
+        drop_non_moneyline_semantic: int = 0,
     ) -> None:
         """Expone último ciclo a /api/arb/status (lee scripts/api.py) para dashboards sin parsear logs."""
         try:
@@ -1901,6 +2277,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "catalog_hydrate_ok": int(catalog_hydrate_ok),
                 "catalog_hydrate_fail": int(catalog_hydrate_fail),
                 "catalog_hydrate_quota_blocked": int(catalog_hydrate_quota_blocked),
+                "token_side_resolved": int(token_side_resolved),
+                "token_side_unresolved": int(token_side_unresolved),
+                "token_side_conflict": int(token_side_conflict),
+                "suspicious_edge_count": int(suspicious_edge_count),
+                "suspicious_edge_examples": list(suspicious_edge_examples or []),
+                "drop_non_moneyline_semantic_last_cycle": int(drop_non_moneyline_semantic),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -2092,7 +2474,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
         eid = (ev.event_id or "").strip()
         if not eid:
             return
-        if (ev.bookie or "").strip().casefold() != "betfair exchange":
+        if not self._odds_client.is_wanted_ws_bookie(ev.bookie or ""):
             return
         if not (ev.home or "").strip() or not (ev.away or "").strip() or not (ev.sport or "").strip():
             return
@@ -2625,6 +3007,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "examples": [],
             }
             stale_diag: dict[str, Any] = {"ages": [], "examples": []}
+            token_side_cycle: dict[str, Any] = {"suspicious_edge_count": 0, "suspicious_edge_examples": []}
 
             def _acc_cycle(src: dict[str, int]) -> None:
                 for k in cycle_counters:
@@ -2645,7 +3028,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
                             return _empty_match_counters()
                         processed_condition_ids.add(cid_bf)
                     st_bf = await self._process_matched_poly_odds(
-                        sess, clob, game_bf, odds_key_bf, odds_ev, stale_diag=stale_diag
+                        sess,
+                        clob,
+                        game_bf,
+                        odds_key_bf,
+                        odds_ev,
+                        stale_diag=stale_diag,
+                        cycle_token_diag=token_side_cycle,
+                        cycle_diag_lock=diag_lock,
                     )
                     out = _empty_match_counters()
                     out["pipeline_entered"] = 0 if int(st_bf.get("drop_pre_game", 0)) > 0 else 1
@@ -2798,6 +3188,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         odds_ev,
                         manual_tw=manual_tw,
                         stale_diag=stale_diag,
+                        cycle_token_diag=token_side_cycle,
+                        cycle_diag_lock=diag_lock,
                     )
                     out = _empty_match_counters()
                     out["pipeline_entered"] = 0 if int(st.get("drop_pre_game", 0)) > 0 else 1
@@ -2937,6 +3329,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 drop_reference_lag=cycle_counters["drop_reference_lag"],
                 drop_alignment_none=cycle_counters["drop_alignment_none"],
                 drop_token_map=cycle_counters["drop_token_map"],
+                token_side_resolved=cycle_counters.get("token_side_resolved", 0),
+                token_side_unresolved=cycle_counters.get("token_side_unresolved", 0),
+                token_side_conflict=cycle_counters.get("token_side_conflict", 0),
+                suspicious_edge_count=int(token_side_cycle.get("suspicious_edge_count", 0)),
+                suspicious_edge_examples=list(token_side_cycle.get("suspicious_edge_examples") or []),
+                drop_non_moneyline_semantic=int(
+                    cycle_counters.get("drop_non_moneyline_semantic", 0)
+                ),
                 ref_health_state=ref_health_state,
                 odds_events_total=odds_events_total,
                 odds_events_by_sport=odds_events_by_sport,
@@ -2989,10 +3389,21 @@ class LatencyArbSportsStrategy(ArbStrategy):
         fill_size: Optional[float] = None,
         fee_est: Optional[float] = None,
         trigger: str = "poll",
+        resolved_leg: Optional[ResolvedPolyOddsLeg] = None,
+        suspicious_edge: str = "",
+        poly_market_title: str = "",
     ) -> dict[str, str]:
         clob_t = await self._clob_trace_for_token(clob, token_id, float(mid))
         dh, da = self._betfair_depth_for_event(odds_event)
         anchor_iso = datetime.now(timezone.utc).isoformat()
+        if resolved_leg is not None:
+            pol_out = str(resolved_leg.poly_outcome_label or "")
+            rteam = str(resolved_leg.poly_team_display or "")
+            otm = str(resolved_leg.odds_team or "")
+            mconf = f"{float(resolved_leg.mapping_confidence):.4f}".rstrip("0").rstrip(".")
+            mreason = str(resolved_leg.mapping_reason or "")
+        else:
+            pol_out, rteam, otm, mconf, mreason = "", "", "", "", ""
         return {
             "signal_id": signal_id,
             "edge_mid": _fmt_opt_float(edge_mid),
@@ -3014,6 +3425,14 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "match_score": match_score_s,
             "signal_anchor_ts": anchor_iso,
             "trigger": str(trigger or "poll"),
+            "poly_market_title": poly_market_title or "",
+            "poly_outcome_label": pol_out,
+            "resolved_team": rteam,
+            "odds_team_mapped": otm,
+            "mapping_confidence": mconf,
+            "mapping_reason": mreason,
+            "suspicious_edge": suspicious_edge or "false",
+            "odds_io_event_id": str(getattr(odds_event, "event_id", "") or "").strip(),
         }
 
     def _followup_snap(
@@ -3032,9 +3451,26 @@ class LatencyArbSportsStrategy(ArbStrategy):
         signal_id: str,
         odds_event: OddsEvent,
         match_score_s: str,
+        *,
+        trigger: str = "poll",
+        latency_ms_tick_to_signal: Optional[float] = None,
+        resolved_leg: Optional[ResolvedPolyOddsLeg] = None,
+        suspicious_edge: str = "",
+        poly_audit: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         edge_use = edge_exec if edge_exec is not None else edge_mid
-        return {
+        pol = str(g.question or "").strip()
+        pol_out = rteam = otm = mconf = mreason = ""
+        if resolved_leg is not None:
+            pol_out = str(resolved_leg.poly_outcome_label or "")
+            rteam = str(resolved_leg.poly_team_display or "")
+            otm = str(resolved_leg.odds_team or "")
+            mconf = f"{float(resolved_leg.mapping_confidence):.4f}".rstrip("0").rstrip(".")
+            mreason = str(resolved_leg.mapping_reason or "")
+        s_edge = suspicious_edge.strip() or _suspicious_edge_flag_csv(
+            float(edge_exec) if edge_exec is not None else None, float(edge_mid)
+        )
+        out: dict[str, Any] = {
             "signal_id": signal_id,
             "game_slug": g.slug,
             "league": g.league,
@@ -3049,9 +3485,22 @@ class LatencyArbSportsStrategy(ArbStrategy):
             "edge": f"{edge_use:.6f}",
             "spread": _fmt_opt_float(spread),
             "latency_ms_ref_to_clob": _fmt_opt_float(latency_ms_ref_to_clob, nd=1),
+            "latency_ms_tick_to_signal": _fmt_opt_float(latency_ms_tick_to_signal, nd=1),
             "match_score": match_score_s,
+            "trigger": str(trigger or "poll"),
+            "poly_market_title": pol,
+            "poly_outcome_label": pol_out,
+            "resolved_team": rteam,
+            "odds_team_mapped": otm,
+            "mapping_confidence": mconf,
+            "mapping_reason": mreason,
+            "suspicious_edge": s_edge or "false",
+            "odds_io_updated_at": str(odds_event.updated_at or ""),
             "_odds_event": odds_event,
         }
+        if poly_audit:
+            out.update(poly_audit)
+        return out
 
     async def _process_matched_poly_odds(
         self,
@@ -3065,6 +3514,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
         tick_received_mono: Optional[float] = None,
         trigger: str = "poll",
         stale_diag: Optional[dict[str, Any]] = None,
+        cycle_token_diag: Optional[dict[str, Any]] = None,
+        cycle_diag_lock: Optional[asyncio.Lock] = None,
     ) -> dict[str, int]:
         acc: dict[str, int] = _empty_match_counters()
         acc["emitted_signal"] = 0
@@ -3129,6 +3580,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "match_score": mscr_e,
                     "signal_anchor_ts": datetime.now(timezone.utc).isoformat(),
                     "trigger": "tick",
+                    "odds_io_event_id": str(getattr(odds_event, "event_id", "") or "").strip(),
                 }
                 await self.log_signal_async(row)
                 acc["csv_rows"] += 1
@@ -3202,23 +3654,221 @@ class LatencyArbSportsStrategy(ArbStrategy):
             return acc
         odds_home, dec_h, odds_away, dec_a = tw
         ddraw = odds_event.draw_odds if odds_event.draw_odds and odds_event.draw_odds > 0 else None
-        p_h_fair, p_a_fair, _ = remove_vig_decimal(dec_h, dec_a, ddraw)
+        p_h_fair, p_a_fair, p_d_fair = remove_vig_decimal(dec_h, dec_a, ddraw)
         g = _open_game_to_gamma_row(game, odds_sport_key)
-        tok_h, tok_a = _map_outcomes_to_tokens(g, odds_home, odds_away)
-        if not tok_h or not tok_a:
-            acc["drop_token_map"] = 1
-            await _emit_drop_skip_row_if_tick(
-                "SKIP:TOKEN_MAP",
-                f"could_not_map_io_home={odds_home!r}_io_away={odds_away!r}_to_outcome_tokens",
+        _mset_snap, mscr_live = self._ws_snapshot_match_fields(game)
+        poly_title_s = (game.market_question or "").strip() or (game.raw_title or "").strip()
+        if not _is_ml_like_open_game(game):
+            acc["drop_non_ml_like"] = 1
+            tid0 = ""
+            if game.outcome_tokens:
+                tid0 = str(game.outcome_tokens[0][1] or "").strip()
+            sid_skip = str(uuid.uuid4())
+            ex_skip = await self._enrich_signal_csv_fields(
+                clob,
+                tid0 or "0",
+                0.5,
+                odds_event,
+                mscr_live,
+                signal_id=sid_skip,
+                latency_ms_ref_to_clob=(
+                    ref_age_s_early * 1000.0 if ref_age_s_early is not None else None
+                ),
+                latency_ms_tick_to_signal=_ms_tick_to_now(),
+                trigger=trigger,
+                poly_market_title=poly_title_s,
             )
+            await self.log_signal_async(
+                {
+                    "action": "SKIP:NON_ML_MARKET",
+                    "reason": "gamma_names_fail_ml_like_heuristic",
+                    "signal_id": sid_skip,
+                    "game_slug": g.slug,
+                    "league": g.league,
+                    "home_team": odds_home,
+                    "away_team": odds_away,
+                    "side": "",
+                    "token_id": tid0,
+                    "price_poly": "",
+                    "prob_pinnacle": "",
+                    "edge_mid": "",
+                    "edge_exec": "",
+                    "edge": "",
+                    "spread": "",
+                    "size_usdc": "0",
+                    "status": "SKIP",
+                    **ex_skip,
+                    **_poly_audit_csv_fields(game, ""),
+                }
+            )
+            acc["csv_rows"] += 1
+            return acc
+        ok_ml, ml_reason = is_valid_polymarket_moneyline(game)
+        if not ok_ml:
+            acc["drop_non_moneyline_semantic"] = 1
+            tid0 = ""
+            if game.outcome_tokens:
+                tid0 = str(game.outcome_tokens[0][1] or "").strip()
+            sid_skip = str(uuid.uuid4())
+            ex_skip = await self._enrich_signal_csv_fields(
+                clob,
+                tid0 or "0",
+                0.5,
+                odds_event,
+                mscr_live,
+                signal_id=sid_skip,
+                latency_ms_ref_to_clob=(
+                    ref_age_s_early * 1000.0 if ref_age_s_early is not None else None
+                ),
+                latency_ms_tick_to_signal=_ms_tick_to_now(),
+                trigger=trigger,
+                poly_market_title=poly_title_s,
+            )
+            await self.log_signal_async(
+                {
+                    "action": "SKIP:NON_MONEYLINE_SEMANTIC",
+                    "reason": str(ml_reason)[:380],
+                    "signal_id": sid_skip,
+                    "game_slug": g.slug,
+                    "league": g.league,
+                    "home_team": odds_home,
+                    "away_team": odds_away,
+                    "side": "",
+                    "token_id": tid0,
+                    "price_poly": "",
+                    "prob_pinnacle": "",
+                    "edge_mid": "",
+                    "edge_exec": "",
+                    "edge": "",
+                    "spread": "",
+                    "size_usdc": "0",
+                    "status": "SKIP",
+                    **ex_skip,
+                    **_poly_audit_csv_fields(game, str(ml_reason)[:380]),
+                }
+            )
+            acc["csv_rows"] += 1
+            return acc
+        poly_audit_ok = _poly_audit_csv_fields(game, "moneyline_semantic_ok")
+        ok_pr, r_pr = should_emit_signal(
+            {
+                "p_h_fair": float(p_h_fair),
+                "p_a_fair": float(p_a_fair),
+                "p_draw_fair": p_d_fair,
+                "skip_leg_edge_check": True,
+            }
+        )
+        if not ok_pr:
+            tid0 = ""
+            if game.outcome_tokens:
+                tid0 = str(game.outcome_tokens[0][1] or "").strip()
+            sid_skip = str(uuid.uuid4())
+            ex_skip = await self._enrich_signal_csv_fields(
+                clob,
+                tid0 or "0",
+                0.5,
+                odds_event,
+                mscr_live,
+                signal_id=sid_skip,
+                latency_ms_ref_to_clob=(
+                    ref_age_s_early * 1000.0 if ref_age_s_early is not None else None
+                ),
+                latency_ms_tick_to_signal=_ms_tick_to_now(),
+                trigger=trigger,
+                poly_market_title=poly_title_s,
+            )
+            await self.log_signal_async(
+                {
+                    "action": map_reason_to_skip_action(r_pr),
+                    "reason": f"signal_sanity_{r_pr}_ph={p_h_fair:.6f}_pa={p_a_fair:.6f}",
+                    "signal_id": sid_skip,
+                    "game_slug": g.slug,
+                    "league": g.league,
+                    "home_team": odds_home,
+                    "away_team": odds_away,
+                    "side": "",
+                    "token_id": tid0,
+                    "price_poly": "",
+                    "prob_pinnacle": f"{float(p_h_fair):.6f}",
+                    "edge_mid": "",
+                    "edge_exec": "",
+                    "edge": "",
+                    "spread": "",
+                    "size_usdc": "0",
+                    "status": "SKIP",
+                    **ex_skip,
+                    **poly_audit_ok,
+                }
+            )
+            acc["csv_rows"] += 1
+            return acc
+        resolved_legs, resolve_reason = resolve_poly_odds_legs(
+            game,
+            odds_home,
+            odds_away,
+            float(p_h_fair),
+            float(p_a_fair),
+            sport_slug=game.sport_slug,
+        )
+        if not resolved_legs:
+            acc["drop_token_map"] = 1
+            if resolve_reason == "ambiguous_perm":
+                acc["token_side_conflict"] = 1
+            else:
+                acc["token_side_unresolved"] = 1
+            await _emit_drop_skip_row_if_tick("SKIP:TOKEN_SIDE_UNRESOLVED", str(resolve_reason)[:380])
+            labs = "|".join(f"{str(a)[:28]}" for a, _ in (game.outcome_tokens or []))
+            rtxt = f"reason={resolve_reason}_labels={labs}"[:400]
+            tid0 = ""
+            if game.outcome_tokens:
+                tid0 = str(game.outcome_tokens[0][1] or "").strip()
+            sid_skip = str(uuid.uuid4())
+            ex_skip = await self._enrich_signal_csv_fields(
+                clob,
+                tid0 or "0",
+                0.5,
+                odds_event,
+                mscr_live,
+                signal_id=sid_skip,
+                latency_ms_ref_to_clob=(
+                    ref_age_s_early * 1000.0 if ref_age_s_early is not None else None
+                ),
+                latency_ms_tick_to_signal=_ms_tick_to_now(),
+                trigger=trigger,
+                poly_market_title=poly_title_s,
+            )
+            await self.log_signal_async(
+                {
+                    "action": "SKIP:TOKEN_SIDE_UNRESOLVED",
+                    "reason": rtxt,
+                    "signal_id": sid_skip,
+                    "game_slug": g.slug,
+                    "league": g.league,
+                    "home_team": odds_home,
+                    "away_team": odds_away,
+                    "side": "",
+                    "token_id": tid0,
+                    "price_poly": "",
+                    "prob_pinnacle": "",
+                    "edge_mid": "",
+                    "edge_exec": "",
+                    "edge": "",
+                    "spread": "",
+                    "size_usdc": "0",
+                    "status": "SKIP",
+                    **ex_skip,
+                    **poly_audit_ok,
+                }
+            )
+            acc["csv_rows"] += 1
             return acc
         acc["reference_aligned"] = 1
+        acc["token_side_resolved"] = 1
         # Sólo permitimos SIGNAL si la cuota Betfair llegó hace <=TICK_FRESH_FOR_SIGNAL_SEC.
         # 20-120s: SKIP:LOW_EDGE permitido (instructivo) pero nunca SIGNAL.
         tick_fresh_for_signal = (
             ref_age_s_early is not None and ref_age_s_early <= float(_HARDCODE_TICK_FRESH_FOR_SIGNAL_SEC)
         )
-        _mset_snap, mscr_live = self._ws_snapshot_match_fields(game)
 
         async def _resolve_mid(tid: str) -> Optional[float]:
             cm = clob.get_cached_mid(tid)
@@ -3233,11 +3883,82 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 return (float(bb) + float(ba)) / 2.0
             return None
 
-        mid_h_val = await _resolve_mid(tok_h)
-        mid_a_val = await _resolve_mid(tok_a)
-        if mid_h_val is not None and mid_a_val is not None:
-            edge_home = float(p_h_fair) - float(mid_h_val)
-            edge_away = float(p_a_fair) - float(mid_a_val)
+        mid_by_tid: dict[str, Optional[float]] = {}
+        for rl0 in resolved_legs:
+            tid0 = str(rl0.token_id).strip()
+            if tid0 and tid0 not in mid_by_tid:
+                mid_by_tid[tid0] = await _resolve_mid(tid0)
+        mid_home = next(
+            (mid_by_tid.get(str(rl.token_id).strip()) for rl in resolved_legs if rl.resolved_poly_side == "home"),
+            None,
+        )
+        mid_away = next(
+            (mid_by_tid.get(str(rl.token_id).strip()) for rl in resolved_legs if rl.resolved_poly_side == "away"),
+            None,
+        )
+        edge_home: Optional[float] = None
+        edge_away: Optional[float] = None
+        if mid_home is not None and mid_away is not None:
+            edge_home = float(p_h_fair) - float(mid_home)
+            edge_away = float(p_a_fair) - float(mid_away)
+            ok_pair, r_pair = should_emit_signal(
+                {
+                    "p_h_fair": float(p_h_fair),
+                    "p_a_fair": float(p_a_fair),
+                    "p_draw_fair": p_d_fair,
+                    "mids_both_present": True,
+                    "edge_home": edge_home,
+                    "edge_away": edge_away,
+                    "skip_leg_edge_check": True,
+                }
+            )
+            if not ok_pair:
+                tid_pair = ""
+                if resolved_legs:
+                    tid_pair = str(resolved_legs[0].token_id or "").strip()
+                sid_pair = str(uuid.uuid4())
+                ex_pair = await self._enrich_signal_csv_fields(
+                    clob,
+                    tid_pair or "0",
+                    0.5,
+                    odds_event,
+                    mscr_live,
+                    signal_id=sid_pair,
+                    latency_ms_ref_to_clob=(
+                        ref_age_s_early * 1000.0 if ref_age_s_early is not None else None
+                    ),
+                    latency_ms_tick_to_signal=_ms_tick_to_now(),
+                    trigger=trigger,
+                    poly_market_title=poly_title_s,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": map_reason_to_skip_action(r_pair),
+                        "reason": (
+                            f"pair_sanity_{r_pair}_eh={edge_home:.6f}_ea={edge_away:.6f}_"
+                            f"sum={edge_home + edge_away:.6f}"
+                        ),
+                        "signal_id": sid_pair,
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": "",
+                        "token_id": tid_pair,
+                        "price_poly": "",
+                        "prob_pinnacle": "",
+                        "edge_mid": "",
+                        "edge_exec": "",
+                        "edge": "",
+                        "spread": "",
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex_pair,
+                        **poly_audit_ok,
+                    }
+                )
+                acc["csv_rows"] += 1
+                return acc
             log.info(
                 "[MATCH_OK] poly='%s vs %s' odds_io='%s vs %s' edge_home=%.4f edge_away=%.4f",
                 game.home,
@@ -3248,7 +3969,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 edge_away,
             )
             snap_ts = datetime.now(timezone.utc).isoformat()
-            game_label = (game.raw_title or "").strip() or f"{game.home} vs {game.away}"
+            game_label = poly_title_s or f"{game.home} vs {game.away}"
             self._append_latency_snapshot_row(
                 {
                     "snapshot_at": snap_ts,
@@ -3259,8 +3980,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "sport": game.sport_slug,
                     "delta_home": f"{edge_home:.10f}".rstrip("0").rstrip("."),
                     "delta_away": f"{edge_away:.10f}".rstrip("0").rstrip("."),
-                    "poly_mid_home": f"{float(mid_h_val):.10f}".rstrip("0").rstrip("."),
-                    "poly_mid_away": f"{float(mid_a_val):.10f}".rstrip("0").rstrip("."),
+                    "poly_mid_home": f"{float(mid_home):.10f}".rstrip("0").rstrip("."),
+                    "poly_mid_away": f"{float(mid_away):.10f}".rstrip("0").rstrip("."),
                     "betfair_prob_home": f"{float(p_h_fair):.10f}".rstrip("0").rstrip("."),
                     "betfair_prob_away": f"{float(p_a_fair):.10f}".rstrip("0").rstrip("."),
                     "betfair_home_odds": f"{float(dec_h):.10f}".rstrip("0").rstrip("."),
@@ -3275,11 +3996,60 @@ class LatencyArbSportsStrategy(ArbStrategy):
         latency_ms_ref_to_clob = ref_age_s * 1000.0 if ref_age_s is not None else None
         latency_ms_tick_to_signal = _ms_tick_to_now()
         legs: list[dict[str, Any]] = []
-        for side_label, token_id, p_fair in (("YES", tok_h, p_h_fair), ("NO", tok_a, p_a_fair)):
-            mid_i: Optional[float] = mid_h_val if token_id == tok_h else mid_a_val
+        for rl in resolved_legs:
+            token_id = str(rl.token_id).strip()
+            p_fair = float(rl.odds_prob)
+            mid_i = mid_by_tid.get(token_id)
             if mid_i is None:
                 mid_i = await _resolve_mid(token_id)
+                mid_by_tid[token_id] = mid_i
             if mid_i is None:
+                continue
+            if float(rl.mapping_confidence) < float(_MAPPING_CONFIDENCE_MIN_FOR_SIGNAL):
+                sig_m = str(uuid.uuid4())
+                ex_m = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid_i),
+                    odds_event,
+                    mscr_live,
+                    signal_id=sig_m,
+                    edge_mid=None,
+                    spread=None,
+                    latency_ms_ref_to_clob=latency_ms_ref_to_clob,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge="false",
+                    poly_market_title=poly_title_s,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:SUSPICIOUS_MAPPING",
+                        "reason": (
+                            f"mapping_confidence={float(rl.mapping_confidence):.3f}"
+                            f"<min={_MAPPING_CONFIDENCE_MIN_FOR_SIGNAL:.3f}_reason={rl.mapping_reason}"
+                        ),
+                        "signal_id": sig_m,
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": rl.side,
+                        "token_id": token_id,
+                        "price_poly": f"{float(mid_i):.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": "",
+                        "edge_exec": "",
+                        "edge": "",
+                        "spread": "",
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex_m,
+                        **poly_audit_ok,
+                    }
+                )
+                acc["csv_rows"] += 1
                 continue
             ob = clob.get_cached_orderbook_snapshot(token_id)
             if ob is None:
@@ -3310,7 +4080,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
             edge_exec_i = float(p_fair) - float(best_ask) if best_ask is not None else None
             legs.append(
                 {
-                    "side_label": side_label,
+                    "side_label": rl.side,
                     "token_id": token_id,
                     "p_fair": float(p_fair),
                     "mid": float(mid_i),
@@ -3321,14 +4091,20 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "top_ask_notional": top_ask_notional,
                     "ask_band_notional": ask_band_notional,
                     "latency_ms_ref_to_clob": latency_ms_ref_to_clob,
+                    "resolved_leg": rl,
                 }
             )
 
         if not legs:
             sid0 = str(uuid.uuid4())
+            tok_x, tok_y = (
+                (str(resolved_legs[0].token_id), str(resolved_legs[1].token_id))
+                if len(resolved_legs) >= 2
+                else ("", "")
+            )
             ex0 = await self._enrich_signal_csv_fields(
                 clob,
-                tok_h,
+                tok_x or "0",
                 0.5,
                 odds_event,
                 mscr_live,
@@ -3338,6 +4114,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 latency_ms_ref_to_clob=latency_ms_ref_to_clob,
                 latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                 trigger=trigger,
+                poly_market_title=poly_title_s,
             )
             await self.log_signal_async(
                 {
@@ -3348,7 +4125,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "home_team": odds_home,
                     "away_team": odds_away,
                     "side": "",
-                    "token_id": f"{tok_h}|{tok_a}",
+                    "token_id": f"{tok_x}|{tok_y}",
                     "price_poly": "",
                     "prob_pinnacle": "",
                     "edge_mid": "",
@@ -3358,6 +4135,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "size_usdc": "0",
                     "status": "SKIP",
                     **ex0,
+                    **poly_audit_ok,
                 }
             )
             acc["csv_rows"] += 1
@@ -3373,9 +4151,41 @@ class LatencyArbSportsStrategy(ArbStrategy):
         if buy_candidates:
             signal_side = max(buy_candidates, key=lambda x: x[0])[1]
 
+        async def _bump_susp_csv(
+            exx: dict[str, str],
+            *,
+            side_l: str,
+            tok: str,
+            ee: Any,
+            em: float,
+            mreason: str,
+        ) -> None:
+            if exx.get("suspicious_edge") != "true":
+                return
+            if cycle_token_diag is None or cycle_diag_lock is None:
+                return
+            async with cycle_diag_lock:
+                cycle_token_diag["suspicious_edge_count"] = int(
+                    cycle_token_diag.get("suspicious_edge_count", 0)
+                ) + 1
+                exl = cycle_token_diag.setdefault("suspicious_edge_examples", [])
+                if len(exl) < 10:
+                    exl.append(
+                        {
+                            "game_slug": g.slug,
+                            "token_id": tok,
+                            "side": side_l,
+                            "edge_exec": ee,
+                            "edge_mid": em,
+                            "mapping_reason": mreason,
+                        }
+                    )
+
         for leg in legs:
             side_label = str(leg["side_label"])
             token_id = str(leg["token_id"])
+            rl_leg = leg.get("resolved_leg")
+            rl: Optional[ResolvedPolyOddsLeg] = rl_leg if isinstance(rl_leg, ResolvedPolyOddsLeg) else None
             p_fair = float(leg["p_fair"])
             mid = float(leg["mid"])
             edge_mid = float(leg["edge_mid"])
@@ -3387,6 +4197,31 @@ class LatencyArbSportsStrategy(ArbStrategy):
             latency_ms_ref = leg["latency_ms_ref_to_clob"]
             signal_id = str(uuid.uuid4())
             edge_for_log = float(edge_exec) if edge_exec is not None else float(edge_mid)
+            s_flag = _suspicious_edge_flag_csv(
+                float(edge_exec) if edge_exec is not None else None, float(edge_mid)
+            )
+            if _suspicious_edge_should_log(
+                float(edge_exec) if edge_exec is not None else None, float(edge_mid)
+            ):
+                log.warning(
+                    "[latency_arb_sports] SUSPICIOUS_EDGE %s",
+                    json.dumps(
+                        {
+                            "poly_market_title": poly_title_s,
+                            "poly_home": game.home,
+                            "poly_away": game.away,
+                            "odds_home": odds_home,
+                            "odds_away": odds_away,
+                            "token_id": token_id,
+                            "side": side_label,
+                            "edge_mid": edge_mid,
+                            "edge_exec": edge_exec,
+                            "mapping_confidence": float(rl.mapping_confidence) if rl else None,
+                            "mapping_reason": rl.mapping_reason if rl else "",
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
             clob_read_at = datetime.utcnow().isoformat()
             log.info(
                 "[latency_arb_sports] CLOB_READ game='%s vs %s' poly_mid=%s clob_read_at=%s",
@@ -3423,6 +4258,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 await self.log_signal_async(
                     {
@@ -3446,6 +4292,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 self._register_poly_followup(
@@ -3464,6 +4311,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         signal_id,
                         odds_event,
                         mscr_live,
+                        trigger=trigger,
+                        latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                        resolved_leg=rl,
+                        suspicious_edge=s_flag,
+                        poly_audit=poly_audit_ok,
                     ),
                     ex["signal_anchor_ts"],
                 )
@@ -3483,6 +4335,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 await self.log_signal_async(
                     {
@@ -3503,6 +4366,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 self._register_poly_followup(
@@ -3521,6 +4385,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         signal_id,
                         odds_event,
                         mscr_live,
+                        trigger=trigger,
+                        latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                        resolved_leg=rl,
+                        suspicious_edge=s_flag,
+                        poly_audit=poly_audit_ok,
                     ),
                     ex["signal_anchor_ts"],
                 )
@@ -3541,6 +4410,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 await self.log_signal_async(
                     {
@@ -3564,6 +4444,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 self._register_poly_followup(
@@ -3582,6 +4463,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         signal_id,
                         odds_event,
                         mscr_live,
+                        trigger=trigger,
+                        latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                        resolved_leg=rl,
+                        suspicious_edge=s_flag,
+                        poly_audit=poly_audit_ok,
                     ),
                     ex["signal_anchor_ts"],
                 )
@@ -3602,6 +4488,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 await self.log_signal_async(
                     {
@@ -3625,6 +4522,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 self._register_poly_followup(
@@ -3643,6 +4541,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         signal_id,
                         odds_event,
                         mscr_live,
+                        trigger=trigger,
+                        latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                        resolved_leg=rl,
+                        suspicious_edge=s_flag,
+                        poly_audit=poly_audit_ok,
                     ),
                     ex["signal_anchor_ts"],
                 )
@@ -3663,6 +4566,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 await self.log_signal_async(
                     {
@@ -3683,6 +4597,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 acc["csv_rows"] += 1
@@ -3702,6 +4617,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 await self.log_signal_async(
                     {
@@ -3725,6 +4651,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 acc["csv_rows"] += 1
@@ -3744,6 +4671,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 await self.log_signal_async(
                     {
@@ -3767,24 +4705,20 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 acc["csv_rows"] += 1
                 continue
 
-            base_key = (g.slug or game.slug or game.condition_id or "").strip()
-            if not base_key:
-                base_key = (token_id or "unknown")[:32]
-            sig_key = f"{base_key}_{side_label}"
             now_mono = time.monotonic()
             cid_live = (game.condition_id or "").strip()
             if cid_live:
                 prev_opp = self._condition_signal_recent.get(cid_live)
                 if prev_opp is not None:
                     prev_side, prev_mono = prev_opp
-                    if (
-                        prev_side != side_label
-                        and (now_mono - prev_mono) < float(_HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC)
+                    if _sides_opposing_for_dedupe(prev_side, side_label) and (
+                        (now_mono - prev_mono) < float(_HARDCODE_OPPOSITE_SIGNAL_DEDUPE_SEC)
                     ):
                         ex = await self._enrich_signal_csv_fields(
                             clob,
@@ -3799,6 +4733,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                             latency_ms_ref_to_clob=latency_ms_ref,
                             latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                             trigger=trigger,
+                            resolved_leg=rl,
+                            suspicious_edge=s_flag,
+                            poly_market_title=poly_title_s,
+                        )
+                        await _bump_susp_csv(
+                            ex,
+                            side_l=side_label,
+                            tok=token_id,
+                            ee=edge_exec,
+                            em=edge_mid,
+                            mreason=rl.mapping_reason if rl else "",
                         )
                         await self.log_signal_async(
                             {
@@ -3822,29 +4767,11 @@ class LatencyArbSportsStrategy(ArbStrategy):
                                 "size_usdc": "0",
                                 "status": "SKIP",
                                 **ex,
+                                **poly_audit_ok,
                             }
                         )
                         acc["csv_rows"] += 1
                         continue
-            prev_p = self._last_signal_price.get(sig_key)
-            prev_t = self._last_signal_mono.get(sig_key)
-            if prev_p is not None and prev_t is not None:
-                if (
-                    abs(float(mid) - float(prev_p)) <= _SIGNAL_COOLDOWN_PRICE_EPS
-                    and (now_mono - float(prev_t)) < _SIGNAL_COOLDOWN_SEC
-                ):
-                    log.debug(
-                        "[latency_arb_sports] COOLDOWN_SKIP game=%s vs %s side=%s slug=%s "
-                        "price_unchanged mid=%.6f prev_mid=%.6f dt_s=%.2f",
-                        game.home,
-                        game.away,
-                        side_label,
-                        g.slug,
-                        float(mid),
-                        float(prev_p),
-                        now_mono - float(prev_t),
-                    )
-                    continue
 
             # Gate de tick-fresh: aunque haya edge, no emitimos SIGNAL si la cuota Betfair ya está vieja
             # (>TICK_FRESH_FOR_SIGNAL_SEC). Para entonces Polymarket suele haber convergido y el edge no es real.
@@ -3862,6 +4789,17 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     latency_ms_ref_to_clob=latency_ms_ref,
                     latency_ms_tick_to_signal=latency_ms_tick_to_signal,
                     trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await _bump_susp_csv(
+                    ex,
+                    side_l=side_label,
+                    tok=token_id,
+                    ee=edge_exec,
+                    em=edge_mid,
+                    mreason=rl.mapping_reason if rl else "",
                 )
                 age_s_for_log = float(ref_age_s) if ref_age_s is not None else -1.0
                 await self.log_signal_async(
@@ -3886,17 +4824,170 @@ class LatencyArbSportsStrategy(ArbStrategy):
                         "size_usdc": "0",
                         "status": "SKIP",
                         **ex,
+                        **poly_audit_ok,
                     }
                 )
                 acc["csv_rows"] += 1
                 acc["emitted_low_edge"] += 1
                 continue
 
+            ok_leg, r_leg = should_emit_signal(
+                {
+                    "p_h_fair": float(p_h_fair),
+                    "p_a_fair": float(p_a_fair),
+                    "p_draw_fair": p_d_fair,
+                    "mids_both_present": mid_home is not None and mid_away is not None,
+                    "edge_home": edge_home,
+                    "edge_away": edge_away,
+                    "edge_exec": float(edge_exec) if edge_exec is not None else None,
+                    "edge_mid": float(edge_mid),
+                }
+            )
+            if not ok_leg:
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": map_reason_to_skip_action(r_leg),
+                        "reason": f"leg_sanity_{r_leg}_edge_exec={edge_exec}_edge_mid={edge_mid:.6f}",
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": _fmt_opt_float(edge_exec),
+                        "edge": f"{float(edge_exec) if edge_exec is not None else float(edge_mid):.6f}",
+                        "spread": _fmt_opt_float(spread),
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex,
+                        **poly_audit_ok,
+                    }
+                )
+                acc["csv_rows"] += 1
+                continue
+
+            io_eid = str(odds_event.event_id or "").strip()
+            canon_pair = normalized_team_pair(odds_home, odds_away)
+            dedupe_key = (io_eid, canon_pair)
+            cid_now = (game.condition_id or "").strip()
+            prev_io = self._io_pair_signal_last.get(dedupe_key)
+            if (
+                io_eid
+                and cid_now
+                and prev_io is not None
+                and prev_io[0] != cid_now
+                and (now_mono - prev_io[1]) < float(_HARDCODE_IO_PAIR_SIGNAL_DEDUPE_SEC)
+            ):
+                ex = await self._enrich_signal_csv_fields(
+                    clob,
+                    token_id,
+                    float(mid),
+                    odds_event,
+                    mscr_live,
+                    signal_id=signal_id,
+                    edge_mid=edge_mid,
+                    edge_exec=edge_exec,
+                    spread=spread,
+                    latency_ms_ref_to_clob=latency_ms_ref,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    trigger=trigger,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_market_title=poly_title_s,
+                )
+                await self.log_signal_async(
+                    {
+                        "action": "SKIP:DUPLICATE_IO_PAIR",
+                        "reason": (
+                            f"event_id={io_eid}_pair={canon_pair}_prev_cid={prev_io[0]}_this_cid={cid_now}_"
+                            f"window_s={_HARDCODE_IO_PAIR_SIGNAL_DEDUPE_SEC:.0f}"
+                        ),
+                        "game_slug": g.slug,
+                        "league": g.league,
+                        "home_team": odds_home,
+                        "away_team": odds_away,
+                        "side": side_label,
+                        "token_id": token_id,
+                        "price_poly": f"{mid:.6f}",
+                        "prob_pinnacle": f"{p_fair:.6f}",
+                        "edge_mid": f"{edge_mid:.6f}",
+                        "edge_exec": _fmt_opt_float(edge_exec),
+                        "edge": f"{float(edge_exec) if edge_exec is not None else float(edge_mid):.6f}",
+                        "spread": _fmt_opt_float(spread),
+                        "size_usdc": "0",
+                        "status": "SKIP",
+                        **ex,
+                        **poly_audit_ok,
+                    }
+                )
+                acc["csv_rows"] += 1
+                continue
+
+            state_key = get_signal_key(io_eid, canon_pair, side_label, token_id)
+            exec_px_signal = float(best_ask) if best_ask is not None else float(mid)
+            state_row = {
+                "edge_exec": float(edge_exec),
+                "price_poly": exec_px_signal,
+                "prob_pin": float(p_fair),
+                "available_size": float(top_ask_notional) if top_ask_notional is not None else None,
+                "min_liquidity_threshold": float(self.min_top_ask_notional),
+                "min_edge": float(self.min_edge_exec),
+            }
+            prev_leg_state = self._signal_leg_state.get(state_key)
+            ok_state, state_reason = leg_signal_should_emit(
+                prev_leg_state,
+                state_row,
+                min_edge=float(self.min_edge_exec),
+            )
+            if not ok_state:
+                log.debug(
+                    "[latency_arb_sports] SIGNAL_SUPPRESSED_STATE "
+                    "game=%s vs %s side=%s key=%s reason=%s edge_exec=%.4f price_poly=%.4f",
+                    game.home,
+                    game.away,
+                    side_label,
+                    state_key,
+                    state_reason,
+                    float(edge_exec),
+                    exec_px_signal,
+                )
+                leg_signal_update_state(
+                    self._signal_leg_state,
+                    state_key,
+                    state_row,
+                    emitted=False,
+                    now_ts=now_mono,
+                )
+                continue
+
             buy_side = "BUY"
             size = float(self.max_stake)
             status = "SIGNAL"
             action = "SIGNAL"
-            reason = f"{buy_side}_{side_label}_fair_minus_exec={edge_exec:.4f}_fair_minus_mid={edge_mid:.4f}"
+            reason = (
+                f"{buy_side}_{side_label}_fair_minus_exec={edge_exec:.4f}_fair_minus_mid={edge_mid:.4f}"
+                f"_emit_gate={state_reason}"
+            )
             order_attempted = False
             fill_price = float(best_ask) if best_ask is not None else float(mid)
             fill_size = size
@@ -3940,6 +5031,43 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 fill_price=fill_price,
                 fill_size=fill_size,
                 fee_est=fee_est,
+                resolved_leg=rl,
+                suspicious_edge=s_flag,
+                poly_market_title=poly_title_s,
+            )
+            await _bump_susp_csv(
+                ex,
+                side_l=side_label,
+                tok=token_id,
+                ee=edge_exec,
+                em=edge_mid,
+                mreason=rl.mapping_reason if rl else "",
+            )
+            log.info(
+                "[latency_arb_sports] SIGNAL_PAYLOAD %s",
+                json.dumps(
+                    {
+                        "poly_market_title": poly_title_s,
+                        "poly_home": game.home,
+                        "poly_away": game.away,
+                        "odds_home": odds_home,
+                        "odds_away": odds_away,
+                        "poly_outcome_label": rl.poly_outcome_label if rl else "",
+                        "token_id": token_id,
+                        "side": side_label,
+                        "resolved_team": rl.poly_team_display if rl else "",
+                        "odds_team": rl.odds_team if rl else "",
+                        "odds_prob": p_fair,
+                        "clob_best_bid": ex.get("clob_best_bid"),
+                        "clob_best_ask": ex.get("clob_best_ask"),
+                        "price_poly_mid": mid,
+                        "edge_mid": edge_mid,
+                        "edge_exec": edge_exec,
+                        "mapping_confidence": float(rl.mapping_confidence) if rl else None,
+                        "mapping_reason": rl.mapping_reason if rl else "",
+                    },
+                    ensure_ascii=False,
+                ),
             )
             await self.log_signal_async(
                 {
@@ -3961,6 +5089,7 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     "size_usdc": f"{size:.4f}",
                     "status": status,
                     **ex,
+                    **poly_audit_ok,
                 }
             )
             self._register_poly_followup(
@@ -3979,11 +5108,21 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     signal_id,
                     odds_event,
                     mscr_live,
+                    trigger=trigger,
+                    latency_ms_tick_to_signal=latency_ms_tick_to_signal,
+                    resolved_leg=rl,
+                    suspicious_edge=s_flag,
+                    poly_audit=poly_audit_ok,
                 ),
                 ex["signal_anchor_ts"],
             )
-            self._last_signal_price[sig_key] = float(mid)
-            self._last_signal_mono[sig_key] = now_mono
+            leg_signal_update_state(
+                self._signal_leg_state,
+                state_key,
+                state_row,
+                emitted=True,
+                now_ts=now_mono,
+            )
             if cid_live:
                 self._condition_signal_recent[cid_live] = (side_label, now_mono)
                 if len(self._condition_signal_recent) > 800:
@@ -3995,6 +5134,8 @@ class LatencyArbSportsStrategy(ArbStrategy):
                     }
             acc["csv_rows"] += 1
             acc["emitted_signal"] += 1
+            if io_eid and cid_live:
+                self._io_pair_signal_last[(io_eid, canon_pair)] = (cid_live, now_mono)
             if latency_ms_tick_to_signal is not None:
                 self._tick_to_signal_ms_recent.append(float(latency_ms_tick_to_signal))
             log.info(

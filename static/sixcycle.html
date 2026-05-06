@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC 5m Sixcycle — PredMarket Arb</title>
+  <link rel="icon" type="image/png" href="/static/logo.png" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js" crossorigin="anonymous"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { mono: ["ui-monospace", "Menlo", "monospace"] } } },
+    };
+  </script>
+</head>
+<body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
+  <div class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+    <header class="border-b border-slate-700 pb-5">
+      <div class="flex items-start gap-4 mb-4">
+        <img src="/static/logo.png" alt="" width="44" height="44" class="rounded-xl ring-1 ring-slate-600 shrink-0 bg-slate-800/50 mt-0.5" />
+        <div class="min-w-0 flex-1">
+          <nav class="flex flex-wrap gap-2 text-sm mb-3">
+            <a href="/ml" class="text-slate-400 hover:text-white">Catálogo ML</a>
+            <span class="text-slate-600">/</span>
+            <a href="/" class="text-slate-400 hover:text-white">Monitor validador</a>
+            <span class="text-slate-600">/</span>
+            <a href="/arb" class="text-indigo-400 hover:underline">Motor Arb (CLOB)</a>
+            <span class="text-slate-600">/</span>
+            <span class="text-white font-medium">Sixcycle BTC 5m</span>
+          </nav>
+          <h1 class="text-2xl font-bold text-white tracking-tight">BTC 5m Sixcycle</h1>
+          <p class="text-sm text-slate-400 mt-1 max-w-3xl">
+            Estrategia <strong class="text-slate-300">sin modelo ML</strong>: confluencia en vivo con
+            <code class="text-slate-500">MarketScorer</code> (WS Binance 1m + libro CLOB Polymarket), paper y CSV.
+            El <a href="/" class="text-indigo-400 hover:underline">monitor validador</a> y el catálogo ML son el pipeline
+            <strong class="text-slate-400">LightGBM</strong> sobre el mismo tipo de mercado 5m — concepto distinto en el lab.
+          </p>
+        </div>
+      </div>
+
+      <div class="rounded-lg border border-amber-800/60 bg-amber-950/25 px-4 py-3 text-sm text-amber-100/95 space-y-2">
+        <p class="font-medium text-amber-200">Cómo arrancar Sixcycle (solo esta pantalla)</p>
+        <ol class="list-decimal list-inside text-slate-300 space-y-1 text-xs sm:text-sm">
+          <li>Pulsa <strong class="text-white">Encender</strong> en la pestaña «Control y CSV». Eso lanza <code class="text-slate-500">SixCycleEngine</code> dentro de <strong class="text-white">este API</strong> (no hace falta pulsar Start del motor genérico en <code class="text-slate-500">/arb</code>).</li>
+          <li>El botón <strong class="text-white">Apagar</strong> detiene ese proceso y desactiva la estrategia en estado.</li>
+          <li>Abre la pestaña <strong class="text-white">Vista en vivo</strong> para SSE, gráfico y tablas alimentadas por el motor en marcha.</li>
+        </ol>
+        <p class="text-xs text-slate-500">CSV: <code class="text-slate-400">$DATA_DIR/logs/crypto_5m_sixcycle.csv</code>. Independiente de <code class="text-slate-400">arb_engine</code>.</p>
+      </div>
+
+      <div class="flex flex-wrap gap-2 mt-4" role="tablist">
+        <button type="button" id="tab-btn-control" role="tab" aria-selected="true"
+          class="px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 bg-slate-800 text-white ring-1 ring-indigo-500/50">
+          Control y CSV
+        </button>
+        <button type="button" id="tab-btn-live" role="tab" aria-selected="false"
+          class="px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 text-slate-400 hover:bg-slate-800 hover:text-slate-200">
+          Vista en vivo (SSE)
+        </button>
+      </div>
+    </header>
+
+    <!-- TAB: Control -->
+    <div id="tab-control" class="space-y-6">
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border border-slate-700 rounded-xl p-4 bg-slate-800/40">
+        <div class="flex flex-wrap items-center gap-2">
+          <span id="run-badge" class="text-xs px-2 py-1 rounded-full bg-slate-700 text-slate-400">—</span>
+          <button type="button" id="btn-enable"
+            class="text-xs px-3 py-1.5 rounded-md border border-emerald-700 text-emerald-300 hover:bg-emerald-950/40">
+            Encender
+          </button>
+          <button type="button" id="btn-disable"
+            class="text-xs px-3 py-1.5 rounded-md border border-red-800 text-red-400 hover:bg-red-950/40">
+            Apagar
+          </button>
+          <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
+            class="text-xs px-3 py-1.5 rounded-md border border-slate-600 text-slate-300 hover:bg-slate-800"
+            download>Descargar CSV</a>
+        </div>
+        <a href="/arb" class="text-xs text-indigo-400 hover:underline">← Volver al Motor Arb</a>
+      </div>
+
+      <section id="summary" class="grid sm:grid-cols-2 gap-3 text-sm"></section>
+
+      <section>
+        <h2 class="text-sm font-medium text-slate-300 mb-2">Últimas filas (settle / trades)</h2>
+        <div class="overflow-x-auto rounded-lg border border-slate-700">
+          <table class="min-w-full text-xs font-mono">
+            <thead class="bg-slate-800 text-slate-400 text-left">
+              <tr id="thead-row"></tr>
+            </thead>
+            <tbody id="tbody" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+        <p id="tbl-msg" class="text-xs text-slate-500 mt-2"></p>
+      </section>
+    </div>
+
+    <!-- TAB: Live -->
+    <div id="tab-live" class="hidden space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 border border-slate-700 rounded-xl px-4 py-3 bg-slate-800/40">
+        <div class="flex flex-wrap items-center gap-3 text-sm">
+          <span id="lv-mode-badge" class="text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-900/50 text-amber-200 border border-amber-700/50">DRY_RUN</span>
+          <span class="text-slate-500 font-mono text-xs" id="lv-utc">—</span>
+          <span class="text-slate-500 text-xs">SSE</span>
+          <span id="lv-sse-dot" class="inline-block w-2.5 h-2.5 rounded-full bg-red-500 ring-2 ring-red-500/30" title="conexión SSE"></span>
+        </div>
+        <a href="/arb" class="text-xs text-indigo-400 hover:underline">← Motor Arb</a>
+      </div>
+
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 text-center">
+          <p class="text-[10px] uppercase text-slate-500">Trades</p>
+          <p class="text-xl font-bold text-white font-mono mt-1" id="lv-mTrades">0</p>
+        </div>
+        <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 text-center">
+          <p class="text-[10px] uppercase text-slate-500">Win rate</p>
+          <p class="text-xl font-bold text-slate-200 font-mono mt-1" id="lv-mWinrate">0%</p>
+        </div>
+        <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 text-center">
+          <p class="text-[10px] uppercase text-slate-500">PnL USDC</p>
+          <p class="text-xl font-bold font-mono mt-1" id="lv-mPnl">$0</p>
+        </div>
+        <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 text-center">
+          <p class="text-[10px] uppercase text-slate-500">Win streak</p>
+          <p class="text-xl font-bold text-white font-mono mt-1" id="lv-mStreak">0</p>
+        </div>
+      </div>
+
+      <div class="grid md:grid-cols-2 gap-4">
+        <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+          <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wide mb-3">Scorer</h2>
+          <span id="lv-phase-badge" class="inline-block text-xs font-bold px-2 py-0.5 rounded-md bg-slate-700 text-slate-300 mb-2">OFFLINE</span>
+          <p class="text-xs font-mono text-slate-400 break-all" id="lv-next-slug">—</p>
+          <p class="text-xs text-slate-500 mt-1">Abre en <strong class="text-slate-200" id="lv-countdown">—</strong>s</p>
+          <p class="text-4xl font-black font-mono mt-2 text-slate-400" id="lv-big-score">0</p>
+          <p class="text-2xl font-bold mt-1 text-slate-500" id="lv-big-dir">—</p>
+          <p class="text-xs text-slate-500 mt-3">Confianza</p>
+          <div class="h-2 bg-slate-950 rounded overflow-hidden mt-1">
+            <div id="lv-conf-bar" class="h-full bg-indigo-500 rounded transition-all duration-200" style="width:0%"></div>
+          </div>
+          <p class="text-xs mt-2 text-slate-500">ready: <span id="lv-ready" class="text-red-400 font-mono">false</span></p>
+          <table class="w-full text-xs mt-2 border-t border-slate-700/80" id="lv-comp-table"><tbody></tbody></table>
+        </div>
+        <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-4">
+          <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wide mb-3">Mercado</h2>
+          <p class="text-[10px] text-slate-500">Price to Beat</p>
+          <p class="text-2xl font-bold text-white font-mono" id="lv-ptb">—</p>
+          <p class="text-sm mt-2 text-slate-300">Spot <span id="lv-spot" class="font-mono">—</span> <span id="lv-gap" class="text-xs"></span></p>
+          <p class="text-[10px] text-slate-500 mt-3">YES (CLOB)</p>
+          <div class="h-5 bg-slate-950 rounded overflow-hidden mt-1">
+            <div id="lv-yes-bar" class="h-full bg-emerald-600/80 rounded transition-all" style="width:0%"></div>
+          </div>
+          <p class="text-xs font-mono mt-1 text-slate-300" id="lv-yes-lbl">—</p>
+          <p class="text-[10px] text-slate-500 mt-2">Liquidez USDC</p>
+          <p class="text-lg font-mono text-indigo-200" id="lv-liq">—</p>
+          <p class="text-[10px] text-slate-500 mt-2">Señal filtro</p>
+          <p class="text-lg font-bold" id="lv-sig">—</p>
+          <p class="text-xs text-slate-500 mt-1">edge: <span id="lv-edge" class="font-mono text-slate-300">0</span></p>
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-slate-700 bg-slate-800/30 p-4 h-72">
+        <h2 class="text-xs font-medium text-slate-500 uppercase mb-2">Equity (PnL acumulado)</h2>
+        <canvas id="lv-chart" class="max-h-56"></canvas>
+      </div>
+
+      <div>
+        <h3 class="text-xs font-medium text-slate-500 uppercase mb-2">Últimos trades</h3>
+        <div class="overflow-x-auto max-h-64 overflow-y-auto rounded-lg border border-slate-700">
+          <table class="min-w-full text-[11px] font-mono">
+            <thead class="bg-slate-950 text-slate-400 sticky top-0 z-10">
+              <tr>
+                <th class="px-2 py-1.5 text-left">ts</th><th class="px-2 py-1.5">slug</th><th class="px-2 py-1.5">dir</th><th class="px-2 py-1.5">score</th>
+                <th class="px-2 py-1.5">edge</th><th class="px-2 py-1.5">stake</th><th class="px-2 py-1.5">fill</th><th class="px-2 py-1.5">res</th><th class="px-2 py-1.5">pnl</th><th class="px-2 py-1.5">W/L</th>
+              </tr>
+            </thead>
+            <tbody id="lv-trades-body" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <h3 class="text-xs font-medium text-slate-500 uppercase mb-2">Log CSV</h3>
+        <div class="overflow-x-auto max-h-64 overflow-y-auto rounded-lg border border-slate-700">
+          <table class="min-w-full text-[11px] font-mono">
+            <thead class="bg-slate-950 text-slate-400 sticky top-0 z-10">
+              <tr>
+                <th class="px-2 py-1.5 text-left">ts</th><th class="px-2 py-1.5">phase</th><th class="px-2 py-1.5">slug</th><th class="px-2 py-1.5">dir</th>
+                <th class="px-2 py-1.5">edge</th><th class="px-2 py-1.5">stake</th><th class="px-2 py-1.5">res</th><th class="px-2 py-1.5">pnl</th>
+              </tr>
+            </thead>
+            <tbody id="lv-log-body" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const SLUG = "crypto_5m_sixcycle";
+    const tabControl = document.getElementById("tab-control");
+    const tabLive = document.getElementById("tab-live");
+    const btnTabControl = document.getElementById("tab-btn-control");
+    const btnTabLive = document.getElementById("tab-btn-live");
+
+    function setTab(which) {
+      const live = which === "live";
+      tabControl.classList.toggle("hidden", live);
+      tabLive.classList.toggle("hidden", !live);
+      btnTabControl.setAttribute("aria-selected", !live);
+      btnTabLive.setAttribute("aria-selected", live);
+      btnTabControl.className = live
+        ? "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+        : "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 bg-slate-800 text-white ring-1 ring-indigo-500/50";
+      btnTabLive.className = !live
+        ? "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+        : "px-4 py-2 rounded-lg text-sm font-medium border border-slate-600 bg-slate-800 text-white ring-1 ring-indigo-500/50";
+      const u = new URL(location.href);
+      u.searchParams.set("view", live ? "live" : "control");
+      history.replaceState(null, "", u.pathname + u.search);
+      if (live) window.liveUi && window.liveUi.ensureStarted();
+    }
+    btnTabControl.onclick = () => setTab("control");
+    btnTabLive.onclick = () => setTab("live");
+
+    /* ——— Control tab (CSV / enable) ——— */
+    async function fetchStatus() {
+      const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+      if (!r.ok) throw new Error("status " + r.status);
+      return r.json();
+    }
+    async function fetchLog() {
+      const r = await fetch("/api/arb/strategy/" + SLUG + "/log?limit=80", {
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      if (!r.ok) throw new Error("log " + r.status);
+      return r.json();
+    }
+    function el(tag, cls, text) {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text != null) n.textContent = text;
+      return n;
+    }
+    function renderSummary(strategies) {
+      const s = (strategies || []).find((x) => x.slug === SLUG) || {};
+      const box = document.getElementById("summary");
+      box.innerHTML = "";
+      const mk = (label, val) => {
+        const d = el("div", "rounded-lg border border-slate-700 p-3 bg-slate-800/40");
+        d.appendChild(el("div", "text-[10px] uppercase text-slate-500", label));
+        d.appendChild(el("div", "text-white font-mono mt-1", val));
+        return d;
+      };
+      const on = !!s.enabled;
+      document.getElementById("run-badge").textContent = on ? "EN MARCHA" : "PARADO";
+      document.getElementById("run-badge").className =
+        "text-xs px-2 py-1 rounded-full " + (on ? "bg-emerald-900/50 text-emerald-200" : "bg-slate-700 text-slate-400");
+      box.appendChild(mk("Filas hoy (total)", String(s.total_today ?? "—")));
+      box.appendChild(mk("Resueltos hoy", String(s.signals_today ?? "—")));
+      box.appendChild(mk("Último", String(s.last_action || "—")));
+      box.appendChild(mk("Último ts", String(s.last_ts || "—")));
+      const reason = s.last_reason || "";
+      if (reason) {
+        const w = el("div", "sm:col-span-2 rounded-lg border border-slate-700 p-3 bg-slate-800/40");
+        w.appendChild(el("div", "text-[10px] uppercase text-slate-500", "Resumen día"));
+        w.appendChild(el("div", "text-slate-300 text-xs mt-1 font-mono", reason));
+        box.appendChild(w);
+      }
+    }
+    function renderTable(rows) {
+      const thead = document.getElementById("thead-row");
+      const tbody = document.getElementById("tbody");
+      const msg = document.getElementById("tbl-msg");
+      thead.innerHTML = "";
+      tbody.innerHTML = "";
+      if (!rows || !rows.length) {
+        msg.textContent = "Sin filas aún en el CSV.";
+        return;
+      }
+      msg.textContent = String(rows.length) + " filas (máx. 80 mostradas).";
+      const cols = Object.keys(rows[0]);
+      cols.forEach((c) => thead.appendChild(el("th", "px-2 py-2 font-normal", c)));
+      rows.slice().reverse().forEach((row) => {
+        const tr = document.createElement("tr");
+        tr.className = "hover:bg-slate-800/60";
+        cols.forEach((c) => {
+          tr.appendChild(el("td", "px-2 py-1.5 text-slate-300 whitespace-nowrap max-w-[14rem] truncate", String(row[c] ?? "")));
+        });
+        tbody.appendChild(tr);
+      });
+    }
+    async function refresh() {
+      try {
+        const st = await fetchStatus();
+        renderSummary(st.strategies);
+        const rows = await fetchLog();
+        renderTable(rows);
+      } catch (e) {
+        document.getElementById("tbl-msg").textContent = "Error: " + e;
+      }
+    }
+    document.getElementById("btn-enable").onclick = async () => {
+      const r = await fetch("/api/arb/strategy/" + SLUG + "/enable", { method: "POST" });
+      if (!r.ok && r.status !== 409) {
+        alert("No se pudo encender: HTTP " + r.status);
+        return;
+      }
+      await refresh();
+    };
+    document.getElementById("btn-disable").onclick = async () => {
+      const r = await fetch("/api/arb/strategy/" + SLUG + "/disable", { method: "POST" });
+      if (!r.ok) {
+        alert("No se pudo apagar: HTTP " + r.status);
+        return;
+      }
+      await refresh();
+    };
+    refresh();
+    setInterval(refresh, 8000);
+
+    /* ——— Live tab (SSE + Chart) ——— */
+    window.liveUi = (function () {
+      let secsUntilOpen = 0;
+      let eqChart = null;
+      let sse = null;
+      let started = false;
+
+      function fmtNum(n, d) {
+        if (n == null || n === "") return "—";
+        const v = +n;
+        if (Number.isNaN(v)) return String(n);
+        return v.toFixed(d);
+      }
+      function rowPhase(row) {
+        const res = (row.resolved || "").toLowerCase().trim();
+        if (res === "win" || res === "loss") return "SETTLED";
+        const filled = String(row.filled || "").toLowerCase();
+        if (filled === "true") return "EXECUTED";
+        return "SKIPPED";
+      }
+      function logRowClass(row) {
+        const ph = rowPhase(row);
+        const res = (row.resolved || "").toLowerCase().trim();
+        if (ph === "SETTLED") return res === "win" ? "bg-emerald-950/30" : "bg-red-950/25";
+        if (ph === "EXECUTED") return "bg-orange-950/20";
+        return "bg-slate-800/40";
+      }
+      function phaseBadgeClass(ph) {
+        const p = (ph || "").toUpperCase();
+        if (p === "PREPARANDO") return "bg-blue-900/40 text-blue-200 border border-blue-700/50";
+        if (p === "EJECUTANDO") return "bg-orange-900/40 text-orange-200 border border-orange-700/50";
+        if (p === "SETTLING") return "bg-purple-900/40 text-purple-200 border border-purple-700/50";
+        if (p === "SKIPPED" || p === "OFFLINE") return "bg-slate-700 text-slate-300";
+        return "bg-slate-700 text-slate-400";
+      }
+
+      function updateDashboard(state) {
+        document.getElementById("lv-sse-dot").className =
+          "inline-block w-2.5 h-2.5 rounded-full bg-emerald-500 ring-2 ring-emerald-500/40";
+        const dry = !!state.dry_run;
+        const mb = document.getElementById("lv-mode-badge");
+        mb.textContent = dry ? "DRY_RUN" : "LIVE";
+        mb.className =
+          "text-xs font-semibold px-2 py-0.5 rounded-full border " +
+          (dry ? "bg-amber-900/50 text-amber-200 border-amber-700/50" : "bg-emerald-900/50 text-emerald-200 border-emerald-600/50");
+
+        document.getElementById("lv-mTrades").textContent = state.trades ?? 0;
+        document.getElementById("lv-mWinrate").textContent = (state.win_rate ?? 0) + "%";
+        const pnl = state.pnl_usdc;
+        const pel = document.getElementById("lv-mPnl");
+        pel.textContent = (pnl >= 0 ? "+" : "") + "$" + Number(pnl || 0).toFixed(2);
+        pel.className = "text-xl font-bold font-mono mt-1 " + (pnl >= 0 ? "text-emerald-400" : "text-red-400");
+        document.getElementById("lv-mStreak").textContent = state.win_streak ?? 0;
+
+        const ph = (state.phase || "OFFLINE").toUpperCase();
+        const pb = document.getElementById("lv-phase-badge");
+        pb.textContent = ph;
+        pb.className = "inline-block text-xs font-bold px-2 py-0.5 rounded-md mb-2 " + phaseBadgeClass(ph);
+
+        document.getElementById("lv-next-slug").textContent = state.next_slug || "—";
+        secsUntilOpen = typeof state.secs_until_open === "number" ? state.secs_until_open : 0;
+        document.getElementById("lv-countdown").textContent = String(Math.max(0, secsUntilOpen));
+
+        const sc = state.score ?? 0;
+        const bs = document.getElementById("lv-big-score");
+        bs.textContent = sc;
+        bs.className =
+          "text-4xl font-black font-mono mt-2 " +
+          (sc > 0 ? "text-emerald-400" : sc < 0 ? "text-red-400" : "text-slate-500");
+        const bd = document.getElementById("lv-big-dir");
+        if (state.direction === "UP") {
+          bd.textContent = "▲ UP";
+          bd.className = "text-2xl font-bold mt-1 text-emerald-400";
+        } else if (state.direction === "DOWN") {
+          bd.textContent = "▼ DOWN";
+          bd.className = "text-2xl font-bold mt-1 text-red-400";
+        } else {
+          bd.textContent = "—";
+          bd.className = "text-2xl font-bold mt-1 text-slate-500";
+        }
+        const conf = Math.min(1, Math.max(0, +(state.confidence || 0)));
+        document.getElementById("lv-conf-bar").style.width = conf * 100 + "%";
+        const ok = !!state.ready;
+        const rdy = document.getElementById("lv-ready");
+        rdy.textContent = ok ? "true" : "false";
+        rdy.className = ok ? "text-emerald-400 font-mono" : "text-red-400 font-mono";
+
+        const tbody = document.querySelector("#lv-comp-table tbody");
+        tbody.innerHTML = "";
+        const comp = state.components || {};
+        Object.keys(comp)
+          .sort()
+          .forEach(function (k) {
+            const tr = document.createElement("tr");
+            const v = +comp[k];
+            const td0 = document.createElement("td");
+            td0.className = "py-0.5 text-slate-500";
+            td0.textContent = k;
+            const td1 = document.createElement("td");
+            td1.className = "py-0.5 text-right font-mono " + (v > 0 ? "text-emerald-400" : v < 0 ? "text-red-400" : "text-slate-400");
+            td1.textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
+            tr.appendChild(td0);
+            tr.appendChild(td1);
+            tbody.appendChild(tr);
+          });
+
+        const ptb = state.price_to_beat;
+        document.getElementById("lv-ptb").textContent =
+          ptb == null ? "—" : "$" + Number(ptb).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const spot = state.spot_price;
+        document.getElementById("lv-spot").textContent =
+          spot == null ? "—" : "$" + Number(spot).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const gap = state.ptb_gap;
+        const sd = document.getElementById("lv-gap");
+        if (gap == null || spot == null || ptb == null) sd.textContent = "";
+        else {
+          sd.textContent = "(" + (gap >= 0 ? "+" : "") + Number(gap).toFixed(2) + " vs PTB)";
+          sd.className = "text-xs " + (gap >= 0 ? "text-emerald-400" : "text-red-400");
+        }
+        const yes = state.clob_yes_price;
+        if (yes != null && !Number.isNaN(+yes)) {
+          const pct = Math.min(100, Math.max(0, +yes * 100));
+          document.getElementById("lv-yes-bar").style.width = pct + "%";
+          document.getElementById("lv-yes-lbl").textContent = (+yes).toFixed(4) + " (" + pct.toFixed(1) + "%)";
+        } else {
+          document.getElementById("lv-yes-bar").style.width = "0%";
+          document.getElementById("lv-yes-lbl").textContent = "—";
+        }
+        document.getElementById("lv-liq").textContent =
+          state.liquidity_usdc == null ? "—" : Number(state.liquidity_usdc).toFixed(1);
+        const sig = !!state.signal;
+        const se = document.getElementById("lv-sig");
+        if ((state.phase || "").toUpperCase() === "SKIPPED") {
+          se.textContent = "SKIP";
+          se.className = "text-lg font-bold text-slate-500";
+        } else if (sig) {
+          se.textContent = "YES";
+          se.className = "text-lg font-bold text-emerald-400";
+        } else {
+          se.textContent = "NO";
+          se.className = "text-lg font-bold text-red-400";
+        }
+        document.getElementById("lv-edge").textContent = fmtNum(state.edge, 4);
+      }
+
+      function tickUtc() {
+        const d = new Date();
+        document.getElementById("lv-utc").textContent =
+          d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+      }
+      function tickCountdown() {
+        if (secsUntilOpen > 0) secsUntilOpen--;
+        document.getElementById("lv-countdown").textContent = String(Math.max(0, secsUntilOpen));
+      }
+
+      function buildEquityChart(rows) {
+        const sorted = rows.slice().sort(function (a, b) {
+          return String(a.timestamp || "").localeCompare(String(b.timestamp || ""));
+        });
+        let cum = 0;
+        const labels = [];
+        const data = [];
+        const ptBg = [];
+        const ptR = [];
+        sorted.forEach(function (r) {
+          const p = parseFloat(r.pnl_usdc);
+          if (Number.isNaN(p)) return;
+          cum += p;
+          labels.push((r.timestamp || "").slice(11, 19) || "");
+          data.push(cum);
+          const w = (r.resolved || "").toLowerCase() === "win";
+          ptBg.push(w ? "rgba(52,211,153,0.95)" : "rgba(248,113,113,0.95)");
+          ptR.push(4);
+        });
+        const canvas = document.getElementById("lv-chart");
+        if (!canvas || typeof Chart === "undefined") return;
+        const ctx = canvas.getContext("2d");
+        if (eqChart) eqChart.destroy();
+        if (!data.length) {
+          eqChart = new Chart(ctx, {
+            type: "line",
+            data: { labels: [], datasets: [{ data: [], borderColor: "#64748b" }] },
+            options: { responsive: true, maintainAspectRatio: false },
+          });
+          return;
+        }
+        const col = data[data.length - 1] >= 0 ? "rgb(52,211,153)" : "rgb(248,113,113)";
+        eqChart = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: labels,
+            datasets: [
+              {
+                label: "PnL acum.",
+                data: data,
+                borderColor: col,
+                backgroundColor: "transparent",
+                tension: 0.2,
+                pointRadius: ptR,
+                pointBackgroundColor: ptBg,
+                pointBorderWidth: 0,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+              x: { ticks: { color: "#64748b", maxTicksLimit: 8 }, grid: { color: "#1e293b" } },
+              y: { ticks: { color: "#64748b" }, grid: { color: "#1e293b" } },
+            },
+          },
+        });
+      }
+
+      function fillTradesTable(rows) {
+        const last = rows.slice(-20).reverse();
+        const tb = document.getElementById("lv-trades-body");
+        tb.innerHTML = "";
+        last.forEach(function (r) {
+          const tr = document.createElement("tr");
+          const res = (r.resolved || "").toLowerCase();
+          tr.className =
+            res === "win" ? "bg-emerald-950/25" : res === "loss" ? "bg-red-950/20" : "hover:bg-slate-800/50";
+          const slug = r.slug || r.market_id || "";
+          const scoreDisp = r.score != null ? r.score : r.model_prob != null ? (+r.model_prob).toFixed(3) : "—";
+          const wl = res === "win" ? "W" : res === "loss" ? "L" : "…";
+          const fill = r.fill_price != null && r.fill_price !== "" ? r.fill_price : r.clob_yes_price || "";
+          [r.timestamp || "", slug, r.direction || "", scoreDisp, r.edge || "", r.stake_usdc || "", fill, r.resolved || "", r.pnl_usdc || "", wl].forEach(function (cell) {
+            const td = document.createElement("td");
+            td.className = "px-2 py-1 text-slate-300 whitespace-nowrap max-w-[10rem] truncate";
+            td.textContent = cell;
+            tr.appendChild(td);
+          });
+          tb.appendChild(tr);
+        });
+      }
+
+      function fillLogTable(rows) {
+        const last = rows.slice(-50).reverse();
+        const tb = document.getElementById("lv-log-body");
+        tb.innerHTML = "";
+        last.forEach(function (r) {
+          const tr = document.createElement("tr");
+          tr.className = logRowClass(r);
+          const ph = rowPhase(r);
+          const slug = r.slug || r.market_id || "";
+          [r.timestamp || "", ph, slug, r.direction || "", r.edge || "", r.stake_usdc || "", r.resolved || "", r.pnl_usdc || ""].forEach(function (cell) {
+            const td = document.createElement("td");
+            td.className = "px-2 py-1 text-slate-300 whitespace-nowrap max-w-[9rem] truncate";
+            td.textContent = cell;
+            tr.appendChild(td);
+          });
+          tb.appendChild(tr);
+        });
+      }
+
+      async function loadHistory() {
+        try {
+          const r = await fetch("/api/sixcycle/history?limit=100");
+          const rows = await r.json();
+          if (!Array.isArray(rows)) return;
+          fillTradesTable(rows);
+          fillLogTable(rows);
+          buildEquityChart(rows);
+        } catch (e) {
+          console.warn("history", e);
+        }
+      }
+
+      function ensureStarted() {
+        if (started) return;
+        started = true;
+        sse = new EventSource("/api/sixcycle/live");
+        sse.onmessage = function (e) {
+          try {
+            updateDashboard(JSON.parse(e.data));
+          } catch (err) {
+            console.warn(err);
+          }
+        };
+        sse.onerror = function () {
+          const dot = document.getElementById("lv-sse-dot");
+          if (dot) dot.className = "inline-block w-2.5 h-2.5 rounded-full bg-red-500 ring-2 ring-red-500/30";
+        };
+        setInterval(tickUtc, 1000);
+        tickUtc();
+        setInterval(tickCountdown, 1000);
+        setInterval(loadHistory, 30000);
+        loadHistory();
+      }
+
+      return { ensureStarted };
+    })();
+
+    (function initView() {
+      const v = new URLSearchParams(location.search).get("view");
+      if (v === "live") setTab("live");
+    })();
+  </script>
+</body>
+</html>

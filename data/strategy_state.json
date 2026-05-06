@@ -2,7 +2,7 @@
   "bundle_arb": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-05-01T14:47:48.966282+00:00",
+    "disabled_at": "2026-05-03T19:06:37.370552+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -12,7 +12,7 @@
   "cross_exchange": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-05-01T14:47:48.966282+00:00",
+    "disabled_at": "2026-05-03T19:06:37.370552+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -22,7 +22,7 @@
   "market_maker": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-05-01T14:47:48.966282+00:00",
+    "disabled_at": "2026-05-03T19:06:37.370552+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -32,7 +32,7 @@
   "combinatorial_arb": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-05-01T14:47:48.966282+00:00",
+    "disabled_at": "2026-05-03T19:06:37.370552+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -42,7 +42,7 @@
   "term_structure": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-05-01T14:47:48.966282+00:00",
+    "disabled_at": "2026-05-03T19:06:37.370552+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -52,7 +52,7 @@
   "latency_arb": {
     "enabled": false,
     "enabled_at": null,
-    "disabled_at": "2026-05-01T14:47:48.966282+00:00",
+    "disabled_at": "2026-05-03T19:06:37.370552+00:00",
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
     "fict_trades": 0,
@@ -60,13 +60,23 @@
     "fict_last_pnl_est_eur": null
   },
   "latency_arb_sports": {
-    "enabled": true,
-    "enabled_at": "2026-05-01T14:48:34.226489+00:00",
-    "disabled_at": "2026-05-01T14:47:48.966282+00:00",
+    "enabled": false,
+    "enabled_at": "2026-05-03T19:07:21.717769+00:00",
+    "disabled_at": "2026-05-06T13:15:56.055582+00:00",
     "fict_capital_eur": 1000.0,
-    "fict_pnl_cumulative_eur": 0.15752,
-    "fict_trades": 1,
-    "fict_last_stake_eur": 10.0,
-    "fict_last_pnl_est_eur": 0.15752
+    "fict_pnl_cumulative_eur": 0.0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
+  },
+  "crypto_5m_sixcycle": {
+    "enabled": false,
+    "enabled_at": null,
+    "disabled_at": null,
+    "fict_capital_eur": 1000.0,
+    "fict_pnl_cumulative_eur": 0.0,
+    "fict_trades": 0,
+    "fict_last_stake_eur": null,
+    "fict_last_pnl_est_eur": null
   }
 }

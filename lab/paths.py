@@ -12,11 +12,17 @@ def data_dir() -> Path:
     """
     Datos runtime (CSV arb/validador, logs, cachés bajo ``…/data/logs``).
 
-    - **Railway / imagen Docker** (`WORKDIR=/app`): ruta fija ``/app/data`` — montar el volumen
-      del servicio exactamente en ``/app/data`` (Mount path en el dashboard).
-    - **Local** (código fuera de ``/app``): ``<repo>/data`` — misma jerarquía ``data/logs/…``.
+    - Si existe la variable de entorno ``DATA_DIR`` (ruta absoluta o relativa al repo), se usa
+      tal cual en documentación (.env.example / Railway con volumen).
+    - **Railway / imagen Docker** (`WORKDIR=/app`) sin ``DATA_DIR``: ``/app/data`` (montar volumen ahí).
+    - **Local** sin ``DATA_DIR``: ``<repo>/data``.
     """
-    if str(REPO_ROOT) == "/app":
+    override = os.environ.get("DATA_DIR", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        if not p.is_absolute():
+            p = (REPO_ROOT / p).resolve()
+    elif str(REPO_ROOT) == "/app":
         p = Path("/app/data")
     else:
         p = REPO_ROOT / "data"

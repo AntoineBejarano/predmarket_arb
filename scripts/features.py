@@ -113,7 +113,7 @@ def load_df5(asset: str) -> pd.DataFrame:
         raise FileNotFoundError(f"No existe {path} — ejecuta download_datasets.py")
     df = pd.read_parquet(path).set_index("timestamp").sort_index()
     df = df[df.index >= START]
-    df5 = df.resample("5T").agg(
+    df5 = df.resample("5min").agg(
         {
             "open": "first",
             "high": "max",

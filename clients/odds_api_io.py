@@ -30,7 +30,7 @@ log = logging.getLogger("odds_api_io")
 BetfairTickCallback = Callable[["OddsEvent"], Awaitable[None]]
 
 # Valores embebidos (p. ej. Railway sin env). `os.getenv("ODDS_API_IO_*")` sigue pudiendo sobreescribir en local.
-ODDS_API_IO_KEY_EMBEDDED = "647c2e8972c62f827b54f98b759982ea2b6d891be25b49c2a746a6f1ed4dd360"
+ODDS_API_IO_KEY_EMBEDDED = "f3b8bbf8f3427b742d008ef3e81de075bb6b437f52630029bc2081d8206d3d6d"
 ODDS_API_IO_WS_EMBEDDED = True
 ODDS_API_IO_CACHE_TTL_EMBEDDED = 900
 # Default hardcodeado para reducir ruido WS sin metadata durante validación: solo Betfair.
@@ -483,6 +483,10 @@ class OddsApiIo:
     def set_betfair_tick_callback(self, cb: Optional[BetfairTickCallback]) -> None:
         """latency_arb_sports lo conecta para reaccionar al instante a cada tick Betfair válido."""
         self._betfair_tick_callback = cb
+
+    def is_wanted_ws_bookie(self, bookie: str) -> bool:
+        """True si el bookie del mensaje WS está en la lista configurada (p. ej. Betfair Exchange)."""
+        return _bookie_matches_wanted(bookie, self._wanted_bookmaker_names)
 
     def start_ws_stream(self, sports: list[str]) -> None:
         if not self.ws_enabled:
@@ -1454,7 +1458,9 @@ class OddsApiIo:
         from_rest = self._get_event_sport(eid)
         query_slugs = [s.strip().lower() for s in (bound_sport_csv or "").split(",") if s.strip()]
         sport_resolved = incoming_sport or from_rest or ""
-        if not sport_resolved and len(query_slugs) == 1:
+        # WS multi-deporte: `sport=a,b,c` en una sola conexión; a veces el payload no trae `sport` y REST
+        # aún no tiene eid en meta → sin fallback el callback de ticks no corre (tick_dispatch queda en 0).
+        if not sport_resolved and query_slugs:
             sport_resolved = query_slugs[0]
         if incoming_sport:
             self._remember_event_sport(eid, incoming_sport)

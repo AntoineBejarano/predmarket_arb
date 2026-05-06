@@ -42,7 +42,7 @@ DATA_DIR = REPO_ROOT / "data" / "raw"
 OUTPUT_DIR = REPO_ROOT / "models" / "saved"
 REPORTS_DIR = REPO_ROOT / "reports"
 
-ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
+ASSETS = ["BTCUSDT"]
 
 FEATURES = [
     "ret_1",
@@ -61,8 +61,8 @@ FEATURES = [
     "is_ny_open",
 ]
 
-START_DATE = "2021-01-01"
-RESAMPLE = "5T"
+START_DATE = "2023-01-01"
+RESAMPLE = "5min"
 
 MODEL_PARAMS: dict[str, Any] = {
     "n_estimators": 500,
@@ -81,11 +81,11 @@ MODEL_PARAMS: dict[str, Any] = {
 
 # Walk-forward: intervalos [train_start, train_end), [val_start, val_end) en índice UTC
 WF_FOLDS: list[tuple[str, str, str, str, str]] = [
-    ("1", "2021-01-01", "2022-01-01", "2022-01-01", "2022-07-01"),
-    ("2", "2021-01-01", "2022-07-01", "2022-07-01", "2023-01-01"),
-    ("3", "2021-01-01", "2023-01-01", "2023-01-01", "2024-01-01"),
-    ("4", "2021-01-01", "2024-01-01", "2024-01-01", "2024-07-01"),
-    ("5", "2021-01-01", "2024-07-01", "2024-07-01", "2025-01-01"),
+    ("1", "2023-01-01", "2023-07-01", "2023-07-01", "2024-01-01"),
+    ("2", "2023-01-01", "2024-01-01", "2024-01-01", "2024-07-01"),
+    ("3", "2023-01-01", "2024-07-01", "2024-07-01", "2025-01-01"),
+    ("4", "2023-01-01", "2025-01-01", "2025-01-01", "2025-07-01"),
+    ("5", "2023-01-01", "2025-07-01", "2025-07-01", "2026-01-01"),
 ]
 
 console = Console()
@@ -124,6 +124,11 @@ def _ts(s: str) -> pd.Timestamp:
 
 def load_and_featurize(asset: str) -> pd.DataFrame:
     path = DATA_DIR / f"{asset}_1min.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"No existe {rel_repo(path)}. Genera datos 1m Binance con: "
+            f"python download_datasets.py (símbolo {asset})."
+        )
     cols = ["timestamp", "open", "high", "low", "close", "volume"]
     df = pd.read_parquet(path, columns=cols).set_index("timestamp").sort_index()
     df = df[df.index >= _ts(START_DATE)]
@@ -162,13 +167,27 @@ def load_and_featurize(asset: str) -> pd.DataFrame:
         df5["vol_20"] > df5["vol_20"].rolling(100, min_periods=50).mean()
     ).map({True: "high", False: "low"})
 
-    # Features en fila t incluyen close[t] — predecir la misma vela crearía leakage.
-    # En producción observamos la vela t completa (minuto 0-2 del mercado activo)
-    # y predecimos si la vela activa t+1 cerrará >= su open: mismo horizonte que Polymarket.
+    # Target Binance: siguiente vela 5m cierra >= su open (sin join Polymarket).
     df5["target"] = (df5["close"].shift(-1) >= df5["open"].shift(-1)).astype(int)
 
     df5 = df5.dropna(subset=FEATURES + ["target", "vol_regime"])
     return df5
+
+
+def walk_forward_empty_reason(df5: pd.DataFrame) -> str:
+    """Explica por qué WF_FOLDS no produjo ningún fold (p. ej. parquet demasiado corto)."""
+    idx = df5.index
+    n = len(df5)
+    t0, t1 = idx.min(), idx.max()
+    first_va_s = WF_FOLDS[0][3]
+    last_va_e = WF_FOLDS[-1][4]
+    return (
+        f"sin datos suficientes para walk-forward: ningún fold tiene val≥100 filas "
+        f"con train≥500 (ventanas desde 2023). "
+        f"Dataset 5m: n={n}, UTC {t0} … {t1}; las validaciones WF esperan solapar "
+        f"[{first_va_s}, {last_va_e}). "
+        f"Amplía el parquet (p. ej. python download_datasets.py) hasta cubrir esas fechas."
+    )
 
 
 def mask_interval(idx: pd.DatetimeIndex, start: str, end: str) -> np.ndarray:
@@ -356,19 +375,10 @@ def train_final_and_calibrate(
     m_va = mask_interval(idx, va_s, va_e)
     X_tr, y_tr = df5.loc[m_tr, FEATURES], df5.loc[m_tr, "target"].astype(int)
     X_va, y_va = df5.loc[m_va, FEATURES], df5.loc[m_va, "target"].astype(int)
-    print(
-        "DEBUG train_final ranges: "
-        f"tr={X_tr.index.min()}..{X_tr.index.max()} "
-        f"va={X_va.index.min()}..{X_va.index.max()}"
-    )
 
     final_clf = make_lgbm()
     final_clf.fit(X_tr, y_tr)
     raw_val = final_clf.predict_proba(X_va)[:, 1]
-    print(f"DEBUG train_final: X_tr={X_tr.shape} X_va={X_va.shape}")
-    print(f"DEBUG raw_val unique: {len(np.unique(raw_val.round(4)))}")
-    print(f"DEBUG raw_val range: {raw_val.min():.4f} - {raw_val.max():.4f}")
-    print(f"DEBUG y_va distribution: {y_va.mean():.4f}")
 
     # Evitar ECE optimista: calibrar en primer tramo de val y medir en segundo tramo (temporal).
     split = len(X_va) // 2
@@ -494,7 +504,8 @@ def train_one_asset(
     progress.remove_task(fold_task)
 
     if not folds:
-        rp.error = "sin datos suficientes para walk-forward"
+        rp.error = walk_forward_empty_reason(df5)
+        console.print(Panel.fit(f"[red]{rp.error}[/red]", title=asset, border_style="red"))
         progress.update(parent_task, advance=1)
         return rp
 
@@ -558,7 +569,14 @@ def build_summary_json(reports: list[AssetReport]) -> dict[str, Any]:
         "assets": {},
     }
     for r in reports:
-        if r.error in ("skipped_existing",) or not r.folds:
+        if r.error == "skipped_existing":
+            out["assets"][r.asset] = {"skipped": True, "reason": r.error}
+            continue
+        if r.error:
+            out["assets"][r.asset] = {"error": r.error}
+            continue
+        if not r.folds:
+            out["assets"][r.asset] = {"error": "sin folds (estado inesperado)"}
             continue
         out["assets"][r.asset] = {
             "wf_accuracy_mean": r.wf_acc_mean,
@@ -567,6 +585,7 @@ def build_summary_json(reports: list[AssetReport]) -> dict[str, Any]:
             "brier_score": r.brier_final,
             "ece": r.ece,
             "best_features": r.best_features,
+            "target_source": "binance",
         }
     return out
 
@@ -579,7 +598,7 @@ def print_final_summary(reports: list[AssetReport]) -> None:
     t.add_column("Brier", justify="right")
     t.add_column("ECE", justify="right")
     t.add_column("Regime", justify="center")
-    t.add_column("Status", justify="center")
+    t.add_column("Status", justify="left", overflow="ellipsis", max_width=56)
     best_edge = -1.0
     best_a = ""
     for r in reports:
@@ -587,7 +606,8 @@ def print_final_summary(reports: list[AssetReport]) -> None:
             t.add_row(r.asset, "—", "—", "—", "—", "—", "omitido")
             continue
         if r.error:
-            t.add_row(r.asset, "—", "—", "—", "—", "—", "error")
+            detail = r.error.replace("\n", " ").strip()
+            t.add_row(r.asset, "—", "—", "—", "—", "—", detail)
             continue
         reg = (
             "2 mdls"

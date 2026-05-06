@@ -28,7 +28,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -74,8 +74,13 @@ STRATEGY_SLUGS = [
     "term_structure",
     "latency_arb",
     "latency_arb_sports",
+    "crypto_5m_sixcycle",
 ]
+SIXCYCLE_SLUG = "crypto_5m_sixcycle"
 ARB_CSV_PATHS = {slug: DATA_DIR / "logs" / f"{slug}.csv" for slug in STRATEGY_SLUGS}
+SIXCYCLE_HTML = STATIC_DIR / "sixcycle.html"
+SIXCYCLE_SIGNALS_CSV = DATA_DIR / "sixcycle_signals.csv"
+SIXCYCLE_ENGINE_CSV_FALLBACK = DATA_DIR / "logs" / "crypto_5m_sixcycle.csv"
 BUNDLE_ARB_SCAN_JSON = DATA_DIR / "logs" / "bundle_arb_scan.json"
 LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snapshots.csv"
 LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
@@ -439,6 +444,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("Apagado API: deteniendo validate_edge…")
         supervisor.stop()
         log.info("validate_edge detenido")
+    try:
+        await _sixcycle_stop()
+    except Exception as e:
+        log.warning("Apagado API: sixcycle stop: %s", e)
     ok_arb, err_arb = _arb_engine_stop()
     if ok_arb:
         log.info("arb_engine detenido")
@@ -772,6 +781,10 @@ async def arb_strategy_detail_page(slug: str) -> Union[FileResponse, JSONRespons
     if slug not in STRATEGY_SLUGS:
         return JSONResponse({"detail": "unknown strategy slug"}, status_code=404)
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    if slug == SIXCYCLE_SLUG:
+        if not SIXCYCLE_HTML.is_file():
+            return JSONResponse({"detail": "static/sixcycle.html not found"}, status_code=404)
+        return FileResponse(path=str(SIXCYCLE_HTML), media_type="text/html; charset=utf-8")
     if not ARB_STRATEGY_DETAIL_HTML.is_file():
         return JSONResponse({"detail": "static/arb_strategy_detail.html not found"}, status_code=404)
     return FileResponse(path=str(ARB_STRATEGY_DETAIL_HTML), media_type="text/html; charset=utf-8")
@@ -836,6 +849,14 @@ async def api_signals_download() -> Union[FileResponse, JSONResponse]:
     )
 
 
+def _csv_download_no_cache_headers() -> dict[str, str]:
+    """Evita que proxies o el navegador sirvan un CSV viejo mientras la UI lee filas nuevas."""
+    return {
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+    }
+
+
 @app.get("/api/arb/strategy/{slug}/csv-download", response_model=None)
 async def arb_strategy_csv_download(slug: str) -> Union[FileResponse, JSONResponse]:
     """Descarga el CSV completo de señales paper de la estrategia (``DATA_DIR/logs/{slug}.csv``)."""
@@ -848,6 +869,7 @@ async def arb_strategy_csv_download(slug: str) -> Union[FileResponse, JSONRespon
         path=str(path),
         media_type="text/csv; charset=utf-8",
         filename=f"{slug}.csv",
+        headers=_csv_download_no_cache_headers(),
     )
 
 
@@ -863,6 +885,7 @@ async def arb_strategy_snapshots_csv_download(slug: str) -> Union[FileResponse, 
         path=str(p),
         media_type="text/csv; charset=utf-8",
         filename="latency_arb_sports_snapshots.csv",
+        headers=_csv_download_no_cache_headers(),
     )
 
 
@@ -959,6 +982,61 @@ from risk.strategy_state import StrategyStateManager
 _arb_proc: Optional[subprocess.Popen[Any]] = None
 _arb_lock = threading.Lock()
 _state_manager = StrategyStateManager()
+
+_sixcycle_lock = asyncio.Lock()
+_sixcycle_task: Optional[asyncio.Task[Any]] = None
+_sixcycle_engine: Any = None
+
+
+def _sixcycle_running() -> bool:
+    return _sixcycle_task is not None and not _sixcycle_task.done()
+
+
+async def _sixcycle_start() -> tuple[bool, Optional[str]]:
+    """Arranca ``SixCycleEngine.run()`` en segundo plano (independiente de arb_engine)."""
+    global _sixcycle_task, _sixcycle_engine
+    async with _sixcycle_lock:
+        if _sixcycle_task is not None and not _sixcycle_task.done():
+            return False, "already_running"
+        from scripts import sixcycle_engine as six_mod
+
+        eng = six_mod.SixCycleEngine()
+        _sixcycle_engine = eng
+        _sixcycle_task = asyncio.create_task(eng.run(), name="sixcycle_engine")
+        log.info("sixcycle_engine: tarea asyncio creada")
+        return True, None
+
+
+async def _sixcycle_stop() -> tuple[bool, Optional[str]]:
+    """Señala parada al motor y espera a la tarea (o cancela)."""
+    global _sixcycle_task, _sixcycle_engine
+    async with _sixcycle_lock:
+        eng = _sixcycle_engine
+        t = _sixcycle_task
+        _sixcycle_engine = None
+        _sixcycle_task = None
+        if eng is not None:
+            await eng.shutdown()
+        if t is None:
+            return False, "not_running"
+        try:
+            if not t.done():
+                await asyncio.wait_for(t, timeout=45.0)
+            else:
+                await t
+        except asyncio.TimeoutError:
+            log.warning("sixcycle_engine: timeout esperando tarea, cancelando")
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("sixcycle_engine task: %s", e)
+        log.info("sixcycle_engine: detenido")
+        return True, None
 
 _latency_schedule_lock = asyncio.Lock()
 _latency_schedule_cache: dict[str, Any] = {}
@@ -1077,6 +1155,45 @@ def _csv_stats_today(path: Path) -> dict[str, Any]:
     }
 
 
+def _csv_stats_sixcycle(path: Path) -> dict[str, Any]:
+    """Métricas diarias para ``crypto_5m_sixcycle.csv`` (columnas del sixcycle engine)."""
+    today = pd.Timestamp.now(tz=_TZ_ES).strftime("%Y-%m-%d")
+    rows = _read_arb_csv_tail(path, n=15000)
+    today_rows = [r for r in rows if _csv_ts_date_spain(r.get("timestamp")) == today]
+    wins = [r for r in today_rows if str(r.get("resolved", "")).lower() == "win"]
+    losses = [r for r in today_rows if str(r.get("resolved", "")).lower() == "loss"]
+    pnl_vals: list[float] = []
+    for r in today_rows:
+        try:
+            pnl_vals.append(float(r.get("pnl_usdc", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+    last = today_rows[-1] if today_rows else {}
+    res = str(last.get("resolved") or "").strip()
+    return {
+        "total_today": len(today_rows),
+        "signals_today": len([r for r in today_rows if str(r.get("resolved", "")).strip()]),
+        "executed_today": len(
+            [r for r in today_rows if str(r.get("filled", "")).lower() in ("true", "1")]
+        ),
+        "skips_today": 0,
+        "skip_below_min_edge_today": 0,
+        "errors_today": len(
+            [r for r in today_rows if str(r.get("resolved", "")).lower() in ("error", "unknown")]
+        ),
+        "skip_rate": 0.0,
+        "avg_edge_today": None,
+        "best_edge_today": None,
+        "last_action": f"SETTLE:{res}" if res else None,
+        "last_ts": last.get("timestamp"),
+        "last_reason": (
+            f"wins={len(wins)} losses={len(losses)} pnl_day={sum(pnl_vals):.4f}"
+            if today_rows
+            else None
+        ),
+    }
+
+
 def _arb_engine_start() -> tuple[bool, Optional[int], Optional[str]]:
     global _arb_proc
     with _arb_lock:
@@ -1156,14 +1273,20 @@ async def arb_status() -> JSONResponse:
     state = await _state_manager.get_all()
     strategies: list[dict[str, Any]] = []
     for slug in STRATEGY_SLUGS:
-        stats = _csv_stats_today(ARB_CSV_PATHS[slug])
+        if slug == SIXCYCLE_SLUG:
+            stats = _csv_stats_sixcycle(ARB_CSV_PATHS[slug])
+        else:
+            stats = _csv_stats_today(ARB_CSV_PATHS[slug])
         st = state.get(slug, {}) or {}
         cap = float(st.get("fict_capital_eur") or 1000)
         cum = float(st.get("fict_pnl_cumulative_eur") or 0)
         roi = cum / cap if cap > 0 else 0.0
+        enabled_val = bool(st.get("enabled", False))
+        if slug == SIXCYCLE_SLUG:
+            enabled_val = _sixcycle_running()
         row: dict[str, Any] = {
             "slug": slug,
-            "enabled": st.get("enabled", False),
+            "enabled": enabled_val,
             "fict_capital_eur": cap,
             "fict_pnl_cumulative_eur": round(cum, 6),
             "fict_trades": int(st.get("fict_trades") or 0),
@@ -1212,6 +1335,9 @@ async def arb_status() -> JSONResponse:
                 row["drop_reference_lag"] = m.get("drop_reference_lag")
                 row["drop_alignment_none"] = m.get("drop_alignment_none")
                 row["drop_token_map"] = m.get("drop_token_map")
+                row["drop_non_moneyline_semantic_last_cycle"] = m.get(
+                    "drop_non_moneyline_semantic_last_cycle"
+                )
                 row["ref_health_state"] = m.get("ref_health_state")
         strategies.append(row)
     running = False
@@ -1264,6 +1390,7 @@ async def arb_reset_data(
     resetea contadores paper y desactiva todas las estrategias (no arranca el motor).
     """
     try:
+        await _sixcycle_stop()
         engine_stopped_here, _ = await asyncio.to_thread(_arb_engine_stop)
         file_result = await asyncio.to_thread(_arb_delete_data_files, include_validator)
         await _state_manager.reset_fictional_paper()
@@ -1293,6 +1420,20 @@ async def arb_reset_data(
 async def arb_strategy_enable(slug: str) -> dict[str, Any]:
     if slug not in STRATEGY_SLUGS:
         raise HTTPException(status_code=404, detail=f"Unknown strategy: {slug}")
+    if slug == SIXCYCLE_SLUG:
+        started, err = await _sixcycle_start()
+        if not started:
+            if err == "already_running":
+                return JSONResponse(
+                    {"slug": slug, "enabled": True, "note": "already_running"},
+                    status_code=409,
+                )
+            return JSONResponse(
+                {"slug": slug, "enabled": False, "error": err or "start_failed"},
+                status_code=500,
+            )
+        await _state_manager.enable(slug)
+        return {"slug": slug, "enabled": True}
     await _state_manager.enable(slug)
     return {"slug": slug, "enabled": True}
 
@@ -1301,6 +1442,10 @@ async def arb_strategy_enable(slug: str) -> dict[str, Any]:
 async def arb_strategy_disable(slug: str) -> dict[str, Any]:
     if slug not in STRATEGY_SLUGS:
         raise HTTPException(status_code=404, detail=f"Unknown strategy: {slug}")
+    if slug == SIXCYCLE_SLUG:
+        await _sixcycle_stop()
+        await _state_manager.disable(slug)
+        return {"slug": slug, "enabled": False}
     await _state_manager.disable(slug)
     return {"slug": slug, "enabled": False}
 
@@ -1384,6 +1529,76 @@ async def arb_signals_live(request: Request) -> StreamingResponse:
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+def _sixcycle_history_csv_path() -> Optional[Path]:
+    if SIXCYCLE_SIGNALS_CSV.is_file():
+        return SIXCYCLE_SIGNALS_CSV
+    if SIXCYCLE_ENGINE_CSV_FALLBACK.is_file():
+        return SIXCYCLE_ENGINE_CSV_FALLBACK
+    return None
+
+
+def _read_sixcycle_history_tail(limit: int) -> list[dict[str, Any]]:
+    p = _sixcycle_history_csv_path()
+    if p is None or limit <= 0:
+        return []
+    try:
+        with p.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        return []
+    if not rows:
+        return []
+    return rows[-limit:]
+
+
+async def _sixcycle_live_sse_gen(request: Request) -> AsyncIterator[str]:
+    from scripts import sixcycle_engine as six_mod
+
+    while True:
+        if await request.is_disconnected():
+            break
+        with six_mod.SIXCYCLE_STATE_LOCK:
+            payload = dict(six_mod.SIXCYCLE_STATE)
+        yield f"data: {json.dumps(payload, default=str)}\n\n"
+        await asyncio.sleep(1.0)
+
+
+@app.get("/api/sixcycle/live")
+async def api_sixcycle_live(request: Request) -> StreamingResponse:
+    return StreamingResponse(
+        _sixcycle_live_sse_gen(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/sixcycle/history")
+async def api_sixcycle_history(limit: int = Query(100, ge=1, le=5000)) -> JSONResponse:
+    rows = await asyncio.to_thread(_read_sixcycle_history_tail, limit)
+    return JSONResponse(content=rows)
+
+
+@app.get("/api/sixcycle/status")
+async def api_sixcycle_status() -> JSONResponse:
+    from scripts import sixcycle_engine as six_mod
+
+    with six_mod.SIXCYCLE_STATE_LOCK:
+        return JSONResponse(content=dict(six_mod.SIXCYCLE_STATE))
+
+
+@app.get("/sixcycle", response_model=None)
+async def sixcycle_legacy_redirect() -> RedirectResponse:
+    """Ruta antigua: una sola UX bajo /arb/strategy/crypto_5m_sixcycle (pestaña vista en vivo)."""
+    return RedirectResponse(
+        url="/arb/strategy/crypto_5m_sixcycle?view=live",
+        status_code=307,
     )
 
 

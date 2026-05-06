@@ -67,6 +67,8 @@ class ArbStrategy(ABC):
             out["reason"] = "missing_reason"
         for k in FICTIONAL_CSV_FIELDS:
             out.setdefault(k, "")
+        for k in self.all_csv_columns:
+            out.setdefault(k, "")
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.all_csv_columns, extrasaction="ignore").writerow(out)
 
