@@ -44,7 +44,7 @@ import logging
 import signal as sig_module
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 import aiohttp
@@ -137,6 +137,41 @@ SIXCYCLE_STATE: dict[str, Any] = {
     "clob_no_price": None,
     "clob_bar": "",
 }
+
+
+def reset_sixcycle_live_state() -> None:
+    """Restablece ``SIXCYCLE_STATE`` (p. ej. tras borrar CSV desde el API)."""
+    with SIXCYCLE_STATE_LOCK:
+        SIXCYCLE_STATE.clear()
+        SIXCYCLE_STATE.update(
+            {
+                "timestamp_utc": "",
+                "phase": "OFFLINE",
+                "next_slug": "",
+                "secs_until_open": 0,
+                "price_to_beat": None,
+                "spot_price": None,
+                "ptb_gap": None,
+                "score": 0,
+                "direction": None,
+                "confidence": 0.0,
+                "ready": False,
+                "components": {},
+                "clob_yes_price": None,
+                "liquidity_usdc": None,
+                "signal": False,
+                "edge": 0.0,
+                "trades": 0,
+                "win_rate": 0.0,
+                "pnl_usdc": 0.0,
+                "win_streak": 0,
+                "best_streak": 0,
+                "dry_run": DRY_RUN,
+                "clob_extreme": "NEUTRAL",
+                "clob_no_price": None,
+                "clob_bar": "",
+            }
+        )
 
 
 def _floor_5m_window_ts_utc(now: datetime) -> int:
@@ -245,6 +280,67 @@ def _parse_outcome_prices(m: dict[str, Any]) -> list[float] | None:
     try:
         return [float(x) for x in raw]
     except (TypeError, ValueError):
+        return None
+
+
+def _settle_parse_up_won(data: dict[str, Any]) -> bool | None:
+    """
+    True = ganó UP/Yes, False = ganó DOWN/No, None = aún no hay resolución clara (seguir polling).
+    Orden: outcomePrices → winningOutcome → resolution → resolutionSource (mercado cerrado).
+    """
+    prices_raw = data.get("outcomePrices") or data.get("outcome_prices")
+    prices = parse_json_maybe(prices_raw)
+    if isinstance(prices, (list, tuple)) and len(prices) >= 2:
+        try:
+            p_up = float(prices[0])
+            p_dn = float(prices[1])
+        except (TypeError, ValueError):
+            pass
+        else:
+            mx = max(p_up, p_dn)
+            if mx >= 0.95:
+                return bool(p_up > 0.5)
+    wo = data.get("winningOutcome") or data.get("winning_outcome")
+    if wo is not None and str(wo).strip():
+        s = str(wo).strip().lower()
+        if s in ("up", "yes", "y"):
+            return True
+        if s in ("down", "no", "n"):
+            return False
+    res = data.get("resolution")
+    if res is not None and str(res).strip():
+        s = str(res).strip().lower()
+        if s in ("yes", "y", "up"):
+            return True
+        if s in ("no", "n", "down"):
+            return False
+    if api_bool_true(data.get("closed")) or api_bool_true(data.get("isClosed")):
+        src = str(data.get("resolutionSource") or data.get("resolution_source") or "").lower()
+        if src:
+            has_up = "up" in src or "yes" in src
+            has_down = "down" in src
+            if has_down and not has_up:
+                return False
+            if has_up and not has_down:
+                return True
+    return None
+
+
+def _close_ts_from_btc_slug_market(m: dict[str, Any]) -> datetime | None:
+    """
+    Cierre aproximado de ventana 5m: slug ``btc-updown-5m-{ts_apertura_utc}`` + 300 s.
+    ``market_id`` numérico no contiene el ts; usar siempre ``market_slug``.
+    """
+    slug = str(m.get("market_slug", "") or "").strip()
+    if not slug.startswith("btc-updown-5m-"):
+        return None
+    try:
+        ts_open = int(slug.rsplit("-", 1)[-1])
+    except (ValueError, TypeError, IndexError):
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts_open) + 300, tz=timezone.utc)
+    except (ValueError, OSError):
         return None
 
 
@@ -374,6 +470,7 @@ class SixCycleEngine:
     """Loop principal 6 ciclos: Scan→Predict→Validate→Size→Fill→Settle."""
 
     def __init__(self) -> None:
+        print(f"NEW ENGINE INSTANCE id={id(self)}")
         self.scorer = MarketScorer()
         self._scorer_token: str | None = None
         self._filter = CLOBSignalFilter()
@@ -389,16 +486,19 @@ class SixCycleEngine:
         self._last_signal_line = "Sin señal — edge insuficiente o sin mercados activos"
         self._settle_tasks: set[asyncio.Task[Any]] = set()
         self._http_session: aiohttp.ClientSession | None = None
-        self._settle_payload_pending: dict[str, Any] | None = None
         self._panel_extra_lines: list[str] = []
         self._stop_run = asyncio.Event()
+        self._running = False
         self._prepare_ptb: float | None = None
         self._prepare_prev: float | None = None
         self._prepare_next_ts: int = 0
         self._prepare_slug: str = ""
         self._pending_signal: dict[str, Any] = {}
         self._last_val_snapshot: dict[str, Any] = {}
-        self._open_positions: dict[str, dict[str, Any]] = {}
+        self._current_market_id: str | None = None
+        self._current_market_filled: bool = False
+        self._filled_market_ids: set[str] = set()
+        self._last_scan_focus_market_id: str | None = None
         self._ensure_csv_header()
 
     def _validate_with_clob_extreme_override(
@@ -822,6 +922,9 @@ class SixCycleEngine:
         market: dict[str, Any] | None,
         signal: dict[str, Any],
         val: dict[str, Any] | None,
+        stake_usdc: float | None = None,
+        fill_price: float | None = None,
+        simulated: bool | None = None,
     ) -> dict[str, Any]:
         ts = datetime.now(timezone.utc).isoformat()
         wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
@@ -869,9 +972,9 @@ class SixCycleEngine:
             "signal": self._csv_bool(sig_b),
             "direction": dir_v,
             "edge": f"{float(edge_v):.6f}" if edge_v != "" and edge_v is not None else "",
-            "stake_usdc": "",
-            "fill_price": "",
-            "simulated": "",
+            "stake_usdc": f"{float(stake_usdc):.4f}" if stake_usdc is not None else "",
+            "fill_price": f"{float(fill_price):.6f}" if fill_price is not None else "",
+            "simulated": self._csv_bool(simulated) if simulated is not None else "",
             "resolved": "",
             "resolution_up": "",
             "pnl_usdc": "",
@@ -886,6 +989,16 @@ class SixCycleEngine:
 
     async def run(self) -> None:
         """Loop infinito con SCAN_INTERVAL_SECONDS entre iteraciones."""
+        if self._running:
+            log.warning("Engine ya corriendo — ignorando segunda llamada a run()")
+            return
+        self._running = True
+        try:
+            await self._run_main_loop()
+        finally:
+            self._running = False
+
+    async def _run_main_loop(self) -> None:
         mode = "[DRY_RUN]" if DRY_RUN else "[LIVE]"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
@@ -1019,7 +1132,22 @@ class SixCycleEngine:
                             self._panel_extra_lines.append(f"  P(up) proxy={model_prob:.4f}")
 
                         signal_taken = False
+                        executed_row: dict[str, Any] | None = None
                         for m in markets:
+                            mid = str(m.get("market_id", "")).strip()
+                            if mid in self._filled_market_ids:
+                                continue
+                            if (
+                                self._current_market_filled
+                                and self._current_market_id is not None
+                                and mid != self._current_market_id
+                            ):
+                                continue
+                            if self._current_market_id == mid and self._current_market_filled:
+                                continue
+                            if self._current_market_id != mid:
+                                self._current_market_id = mid
+                                self._current_market_filled = False
                             try:
                                 t_val = time.perf_counter()
                                 clob_book = float(m["clob_yes_price"])
@@ -1094,7 +1222,7 @@ class SixCycleEngine:
                             try:
                                 t_fill = time.perf_counter()
                                 fill_out = await self.cycle_fill(
-                                    str(m["market_id"]),
+                                    mid,
                                     str(token_fill),
                                     str(val.get("direction") or "YES"),
                                     stake,
@@ -1104,7 +1232,7 @@ class SixCycleEngine:
                                 cycle_fill_ms = (time.perf_counter() - t_fill) * 1000.0
                                 log.info(
                                     "FILL: market=%s dir=%s stake=%.2f price=%.4f simulated=%s",
-                                    str(m["market_id"]),
+                                    mid,
                                     str(val.get("direction") or "YES"),
                                     stake,
                                     float(fill_out.get("price", fill_price)),
@@ -1119,25 +1247,57 @@ class SixCycleEngine:
                                     )
                                 continue
 
+                            fill_result = fill_out
+                            if not bool(fill_result.get("filled")):
+                                continue
+
+                            self._current_market_filled = True
+                            self._filled_market_ids.add(mid)
+
                             self._last_signal_line = (
                                 f"{val.get('direction')} edge={val.get('edge'):.4f} stake={stake:.2f} "
-                                f"filled={fill_out.get('filled')} sim={fill_out.get('simulated')}"
+                                f"filled={fill_result.get('filled')} sim={fill_result.get('simulated')}"
                             )
                             signal_taken = True
 
+                            dir_s = str(val.get("direction") or "YES")
+                            fill_px = float(fill_result.get("price", fill_price))
+                            close_ts_eff: datetime | None = None
+                            raw_ct = m.get("close_ts")
+                            if isinstance(raw_ct, datetime):
+                                close_ts_eff = raw_ct
+                                if close_ts_eff.tzinfo is None:
+                                    close_ts_eff = close_ts_eff.replace(tzinfo=timezone.utc)
+                                else:
+                                    close_ts_eff = close_ts_eff.astimezone(timezone.utc)
+                            if close_ts_eff is None:
+                                close_ts_eff = _close_ts_from_btc_slug_market(m)
+
+                            log.info("FILL OK — lanzando settle para market_id=%s", mid)
+                            executed_row = self._csv_row_scan(
+                                phase="EJECUTANDO",
+                                market=m,
+                                signal=signal,
+                                val=dict(val),
+                                stake_usdc=stake,
+                                fill_price=fill_px,
+                                simulated=bool(fill_result.get("simulated", True)),
+                            )
+
                             settle_payload = {
-                                "market_id": str(m["market_id"]),
+                                "market_id": mid,
                                 "market_slug": str(m.get("market_slug", "")),
-                                "direction": str(val.get("direction") or "YES"),
+                                "direction": dir_s,
                                 "stake_usdc": stake,
-                                "fill_price": float(fill_out.get("price", fill_price)),
+                                "fill_price": fill_px,
                                 "model_prob": model_prob,
                                 "clob_yes_price": float(m["clob_yes_price"]),
                                 "liquidity_usdc": float(m["liquidity_usdc"]),
                                 "tte_sec": float(m["tte_sec"]),
                                 "edge": float(val["edge"]),
-                                "filled": bool(fill_out.get("filled")),
-                                "simulated": bool(fill_out.get("simulated", True)),
+                                "filled": bool(fill_result.get("filled")),
+                                "simulated": bool(fill_result.get("simulated", True)),
+                                "close_ts": close_ts_eff,
                                 "cycle_ms_scan": round(cycle_scan_ms, 2),
                                 "cycle_ms_predict": round(cycle_predict_ms, 2),
                                 "cycle_ms_validate": round(cycle_validate_ms, 2),
@@ -1146,22 +1306,11 @@ class SixCycleEngine:
                                 "signal_snapshot": dict(signal),
                                 "val_snapshot": dict(val),
                             }
-                            self._settle_payload_pending = settle_payload
-                            self._open_positions[str(m["market_id"])] = {
-                                "market_id": str(m["market_id"]),
-                                "market_slug": str(m.get("market_slug", "")),
-                                "direction": str(val.get("direction") or "YES"),
-                                "stake_usdc": stake,
-                                "clob_yes_price": float(m["clob_yes_price"]),
-                                "edge": float(val["edge"]),
-                            }
                             task = asyncio.create_task(
                                 self.cycle_settle(
-                                    str(m["market_id"]),
-                                    str(val.get("direction") or "YES"),
-                                    stake,
+                                    dict(settle_payload),
                                 ),
-                                name=f"settle-{m['market_id']}",
+                                name=f"settle-{mid}",
                             )
                             self._settle_tasks.add(task)
                             task.add_done_callback(self._settle_tasks.discard)
@@ -1177,13 +1326,16 @@ class SixCycleEngine:
                             )
 
                         try:
-                            m0 = markets[0] if markets else None
-                            scan_row = self._csv_row_scan(
-                                phase="EJECUTANDO",
-                                market=m0,
-                                signal=signal,
-                                val=dict(self._last_val_snapshot) if self._last_val_snapshot else None,
-                            )
+                            if executed_row is not None:
+                                scan_row = executed_row
+                            else:
+                                m0 = markets[0] if markets else None
+                                scan_row = self._csv_row_scan(
+                                    phase="EJECUTANDO",
+                                    market=m0,
+                                    signal=signal,
+                                    val=dict(self._last_val_snapshot) if self._last_val_snapshot else None,
+                                )
                             await self._append_csv(scan_row)
                         except Exception as e:  # noqa: BLE001
                             log.debug("scan csv row: %s", e)
@@ -1344,6 +1496,15 @@ class SixCycleEngine:
                 log.debug(msg)
                 continue
             liq = _sum_ask_notional_top_n(book, 5)
+            # PTB siempre del Gamma ``data`` / slug de este mercado; al cambiar de mercado no arrastrar _prepare_ptb.
+            if (
+                self._last_scan_focus_market_id
+                and mid
+                and str(self._last_scan_focus_market_id).strip() != str(mid).strip()
+            ):
+                self._prepare_ptb = None
+            self._last_scan_focus_market_id = str(mid).strip()
+            ptb_row = await _resolve_price_to_beat(http, data, slug)
             out.append(
                 {
                     "market_id": mid,
@@ -1355,7 +1516,7 @@ class SixCycleEngine:
                     "tte_sec": float(tte),
                     "clob_yes_price": float(px),
                     "liquidity_usdc": float(liq),
-                    "price_to_beat": await _resolve_price_to_beat(http, data, slug),
+                    "price_to_beat": ptb_row,
                 }
             )
             break
@@ -1446,16 +1607,29 @@ class SixCycleEngine:
             log.critical("LIVE place_order falló", extra={"error": str(e)})
             raise
 
-    async def cycle_settle(self, market_id: str, direction: str, stake_usdc: float) -> None:
+    async def cycle_settle(self, settle_payload: dict[str, Any]) -> None:
         """
         Polling cada 30s hasta que el mercado cierre; resolución Gamma; PnL y CSV.
         Usar vía asyncio.create_task (no bloquea el scan loop).
         """
         http = self._http_session
-        payload = self._settle_payload_pending
-        self._settle_payload_pending = None
-        if http is None or payload is None:
+        payload = dict(settle_payload)
+        market_id = str(payload.get("market_id", "")).strip()
+        direction = str(payload.get("direction", "YES"))
+        stake_usdc = float(payload.get("stake_usdc", 0.0) or 0.0)
+        close_ts_log = payload.get("close_ts")
+        log.info(
+            "SETTLE iniciado: market_id=%s direction=%s stake=%.2f close_ts=%s",
+            market_id,
+            direction,
+            float(stake_usdc),
+            close_ts_log,
+        )
+        if http is None:
             log.warning("cycle_settle sin sesión o payload")
+            if str(self._current_market_id or "") == str(market_id).strip():
+                self._current_market_id = None
+                self._current_market_filled = False
             return
         if str(payload.get("market_id")) != str(market_id) or abs(
             float(payload.get("stake_usdc", 0)) - float(stake_usdc)
@@ -1463,13 +1637,26 @@ class SixCycleEngine:
             log.warning("cycle_settle: payload no coincide con argumentos")
         if str(payload.get("direction")) != str(direction):
             log.warning("cycle_settle: dirección payload vs arg")
-        await self._settle_trade_loop(http, payload)
+        mid_settle = str(payload["market_id"]).strip()
+        resolved_end, pnl_end = "", 0.0
+        try:
+            resolved_end, pnl_end = await self._settle_trade_loop(http, payload)
+        finally:
+            if str(self._current_market_id or "") == str(market_id).strip():
+                self._current_market_id = None
+                self._current_market_filled = False
+        log.info(
+            "SETTLE completado: market_id=%s resolved=%s pnl=%.4f",
+            mid_settle,
+            resolved_end,
+            pnl_end,
+        )
 
     async def _settle_trade_loop(
         self, http: aiohttp.ClientSession, payload: dict[str, Any]
-    ) -> None:
+    ) -> tuple[str, float]:
         """Polling hasta resolución; actualiza métricas y escribe CSV."""
-        market_id = str(payload["market_id"])
+        market_id = str(payload["market_id"]).strip()
         direction = str(payload["direction"])
         stake = float(payload["stake_usdc"])
         fill_price = float(payload["fill_price"])
@@ -1478,8 +1665,40 @@ class SixCycleEngine:
         pnl = 0.0
         up_won_final: bool | None = None
         won = False
+
+        raw_close = payload.get("close_ts")
+        close_ts_dt: datetime | None = None
+        if isinstance(raw_close, datetime):
+            close_ts_dt = raw_close
+            if close_ts_dt.tzinfo is None:
+                close_ts_dt = close_ts_dt.replace(tzinfo=timezone.utc)
+            else:
+                close_ts_dt = close_ts_dt.astimezone(timezone.utc)
+        elif isinstance(raw_close, str) and raw_close.strip():
+            try:
+                close_ts_dt = datetime.fromisoformat(raw_close.replace("Z", "+00:00"))
+                if close_ts_dt.tzinfo is None:
+                    close_ts_dt = close_ts_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                close_ts_dt = None
+
+        attempt = 0
         try:
             while True:
+                attempt += 1
+                log.info("SETTLE polling: market_id=%s intento=%d", market_id, attempt)
+                now = datetime.now(timezone.utc)
+                if close_ts_dt is not None and now > close_ts_dt + timedelta(minutes=10):
+                    log.warning(
+                        "SETTLE timeout market_id=%s — resolviendo como unknown",
+                        market_id,
+                    )
+                    resolved = "unknown"
+                    pnl = 0.0
+                    up_won_final = None
+                    won = False
+                    break
+
                 try:
                     async with http.get(url) as resp:
                         text = await resp.text()
@@ -1494,44 +1713,22 @@ class SixCycleEngine:
                 if not isinstance(m, dict):
                     await asyncio.sleep(30.0)
                     continue
+
+                log.debug("SETTLE gamma response: %s", str(m)[:500])
+
                 end_dt = _parse_gamma_end(m)
-                now = datetime.now(timezone.utc)
                 if end_dt is not None and now < end_dt:
                     await asyncio.sleep(30.0)
                     continue
                 if not api_bool_true(m.get("closed")) and not api_bool_true(m.get("isClosed")):
                     await asyncio.sleep(30.0)
                     continue
-                prices = _parse_outcome_prices(m)
-                outcomes = parse_json_maybe(m.get("outcomes"))
-                up_won: bool | None = None
-                if prices and len(prices) >= 2:
-                    try:
-                        up_won = float(prices[0]) > float(prices[1]) and float(prices[0]) >= 0.95
-                    except (TypeError, ValueError):
-                        up_won = None
-                if up_won is None and prices and len(prices) >= 1:
-                    try:
-                        up_won = float(prices[0]) >= 0.99
-                    except (TypeError, ValueError):
-                        up_won = None
-                if up_won is None and isinstance(outcomes, list) and prices:
-                    try:
-                        n = min(len(outcomes), len(prices))
-                        j = int(np.argmax(np.array(prices[:n], dtype=float)))
-                        oj = outcomes[j]
-                        if isinstance(oj, dict):
-                            lab = str(oj.get("title", oj.get("name", ""))).lower()
-                        else:
-                            lab = str(oj).lower()
-                        up_won = "up" in lab or "yes" in lab
-                    except (ValueError, IndexError, TypeError):
-                        up_won = None
+
+                up_won = _settle_parse_up_won(m)
                 if up_won is None:
-                    log.warning("settle: no se pudo inferir ganador", extra={"market_id": market_id})
-                    resolved = "unknown"
-                    pnl = 0.0
-                    break
+                    await asyncio.sleep(30.0)
+                    continue
+
                 up_won_final = bool(up_won)
                 bet_up = direction == "YES"
                 won = (bet_up and up_won) or ((not bet_up) and (not up_won))
@@ -1637,10 +1834,16 @@ class SixCycleEngine:
             "dry_run": self._csv_bool(DRY_RUN),
         }
         try:
+            log.info(
+                "SETTLE escribiendo CSV: market_id=%s resolved=%s pnl=%.4f",
+                market_id,
+                resolved,
+                float(pnl),
+            )
             await self._append_csv(row)
         finally:
             self._publish_trade_counters_to_state()
-            self._open_positions.pop(market_id, None)
+        return resolved, float(pnl)
 
 
 async def _shutdown(engine: SixCycleEngine) -> None:

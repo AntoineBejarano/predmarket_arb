@@ -1002,6 +1002,7 @@ async def _sixcycle_start() -> tuple[bool, Optional[str]]:
 
         eng = six_mod.SixCycleEngine()
         _sixcycle_engine = eng
+        log.info("Sixcycle engine instancia id=%d", id(eng))
         _sixcycle_task = asyncio.create_task(eng.run(), name="sixcycle_engine")
         log.info("sixcycle_engine: tarea asyncio creada")
         return True, None
@@ -1724,6 +1725,49 @@ async def api_sixcycle_status() -> JSONResponse:
         payload = dict(six_mod.SIXCYCLE_STATE)
     await asyncio.to_thread(_sixcycle_merge_csv_kpis_into_payload, payload)
     return JSONResponse(content=payload)
+
+
+def _sixcycle_delete_data_files() -> dict[str, Any]:
+    """Borra CSV del engine sixcycle y ``sixcycle_signals.csv`` bajo DATA_DIR."""
+    removed: list[str] = []
+    errors: list[str] = []
+    for p in (ARB_CSV_PATHS[SIXCYCLE_SLUG], SIXCYCLE_SIGNALS_CSV):
+        try:
+            if p.is_file():
+                p.unlink()
+                removed.append(str(p))
+        except OSError as e:
+            errors.append(f"{p}: {e}")
+    return {"files_removed": removed, "file_errors": errors}
+
+
+@app.post("/api/sixcycle/reset-data")
+async def api_sixcycle_reset_data() -> JSONResponse:
+    """
+    Para el motor Sixcycle en este API, borra ``logs/crypto_5m_sixcycle.csv`` y
+    ``sixcycle_signals.csv``, y reinicia ``SIXCYCLE_STATE`` en memoria.
+    No desactiva otras estrategias ni el arb_engine global.
+    """
+    try:
+        await _sixcycle_stop()
+        file_result = await asyncio.to_thread(_sixcycle_delete_data_files)
+        from scripts import sixcycle_engine as six_mod
+
+        six_mod.reset_sixcycle_live_state()
+        log.info(
+            "POST /api/sixcycle/reset-data removed=%s errors=%s",
+            len(file_result.get("files_removed") or []),
+            len(file_result.get("file_errors") or []),
+        )
+        return JSONResponse(
+            content={"ok": True, **file_result},
+        )
+    except Exception as e:
+        log.exception("POST /api/sixcycle/reset-data failed: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "detail": str(e)},
+        )
 
 
 @app.get("/sixcycle", response_model=None)

@@ -44,10 +44,13 @@
           <strong class="text-white">Encender / Parar</strong> (arriba) controlan solo Sixcycle en este API — no son el Start/Stop del <code class="text-slate-500">arb_engine</code> de <a href="/arb" class="text-indigo-400 hover:underline">/arb</a>.
           El estado <strong class="text-white">EN MARCHA / PARADO</strong> es el que importa.
         </p>
-        <p class="text-xs text-slate-500">CSV: <code class="text-slate-400">$DATA_DIR/logs/crypto_5m_sixcycle.csv</code></p>
+        <p class="text-xs text-slate-500">
+          CSV engine: <code class="text-slate-400">logs/crypto_5m_sixcycle.csv</code> · señales:
+          <code class="text-slate-400">sixcycle_signals.csv</code> — el botón <strong class="text-slate-300">Borrar datos</strong> vacía ambos y reinicia KPIs en memoria.
+        </p>
       </div>
 
-      <!-- Un solo control de marcha (coherente con tarjetas del Motor Arb) -->
+      <!-- Único bloque Encender / Parar + datos (sin duplicar abajo en el panel SSE) -->
       <div id="sixcycle-motor-strip" class="mt-4 rounded-xl border border-slate-600 bg-slate-800/60 px-4 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div class="flex flex-col sm:flex-row sm:items-center gap-3 min-w-0">
           <span id="run-badge" class="shrink-0 inline-flex items-center gap-2 text-sm font-bold px-4 py-2.5 rounded-lg border bg-slate-700/80 text-slate-300 border-slate-600">
@@ -66,6 +69,11 @@
             <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
               class="text-sm px-4 py-2 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 inline-block"
               download>CSV</a>
+            <button type="button" id="btn-clear-sixcycle-data"
+              class="text-sm px-4 py-2 rounded-lg border border-rose-700 bg-rose-950/25 text-rose-200 hover:bg-rose-950/45 font-medium disabled:opacity-40 disabled:pointer-events-none"
+              title="Borra CSV del engine y sixcycle_signals.csv; para el motor Sixcycle">
+              Borrar datos
+            </button>
           </div>
         </div>
         <a href="/arb" class="text-sm text-indigo-400 hover:underline shrink-0">← Motor Arb</a>
@@ -107,7 +115,6 @@
       </div>
       <div class="flex flex-wrap items-center justify-between gap-3 border border-slate-700 rounded-xl px-4 py-3 bg-slate-800/40">
         <div class="flex flex-wrap items-center gap-3 text-sm">
-          <span id="lv-status-hint" class="text-xs font-semibold px-2 py-1 rounded-md bg-slate-700 text-slate-300">—</span>
           <span id="lv-mode-badge" class="text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-900/50 text-amber-200 border border-amber-700/50">DRY_RUN</span>
           <span class="text-slate-500 font-mono text-xs" id="lv-utc">—</span>
           <span class="text-slate-500 text-xs">SSE</span>
@@ -219,7 +226,6 @@
       var wrap = document.getElementById("run-badge");
       var dot = document.getElementById("run-dot");
       var lab = document.getElementById("run-label");
-      var hint = document.getElementById("lv-status-hint");
       if (lab) lab.textContent = on ? "EN MARCHA" : "PARADO";
       if (dot) {
         dot.className =
@@ -231,12 +237,6 @@
           (on
             ? "bg-emerald-950/50 text-emerald-100 border-emerald-600/60"
             : "bg-slate-700/80 text-slate-300 border-slate-600");
-      }
-      if (hint) {
-        hint.textContent = on ? "Estrategia: EN MARCHA" : "Estrategia: PARADO";
-        hint.className =
-          "text-xs font-semibold px-2 py-1 rounded-md " +
-          (on ? "bg-emerald-900/40 text-emerald-200" : "bg-slate-700 text-slate-300");
       }
       updateMotorButtons(on);
     }
@@ -375,6 +375,43 @@
         await refresh();
       } finally {
         await pollSixcycleEnabled();
+      }
+    });
+    document.getElementById("btn-clear-sixcycle-data").addEventListener("click", async function (e) {
+      e.preventDefault();
+      if (
+        !confirm(
+          "Se borrarán los CSV de Sixcycle (engine + señales), se parará el motor Sixcycle en este API y los KPI del panel volverán a 0. ¿Seguir?"
+        )
+      ) {
+        return;
+      }
+      var btn = document.getElementById("btn-clear-sixcycle-data");
+      var en = document.getElementById("btn-enable");
+      var dis = document.getElementById("btn-disable");
+      if (btn) btn.disabled = true;
+      if (en) en.disabled = true;
+      if (dis) dis.disabled = true;
+      try {
+        const r = await fetch("/api/sixcycle/reset-data", { method: "POST" });
+        const body = await r.json().catch(function () {
+          return {};
+        });
+        if (!r.ok) {
+          alert("Borrar datos falló (HTTP " + r.status + "): " + (body.detail || JSON.stringify(body)));
+          return;
+        }
+        await refresh();
+        if (window.liveUi && typeof window.liveUi.reloadHistory === "function") {
+          await window.liveUi.reloadHistory();
+        }
+        await pollSixcycleEnabled();
+      } catch (err) {
+        alert("Borrar datos: " + err);
+      } finally {
+        if (btn) btn.disabled = false;
+        await pollSixcycleEnabled();
+        await refresh();
       }
     });
     refresh();
@@ -707,7 +744,7 @@
         loadHistory();
       }
 
-      return { ensureStarted };
+      return { ensureStarted, reloadHistory: loadHistory };
     })();
 
     (function initView() {
