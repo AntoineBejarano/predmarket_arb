@@ -727,6 +727,12 @@ class LatencySportsManualMatchIn(BaseModel):
     poly_away: str = ""
 
 
+class SixcycleDryStakeMultiplierIn(BaseModel):
+    """Factor sobre el stake Kelly en paper (``scripts/sixcycle_engine`` DRY_RUN)."""
+
+    multiplier: float = Field(1.0, ge=0.01, le=50000.0)
+
+
 @app.get("/api/arb/latency_sports/manual-matches")
 async def api_latency_sports_manual_matches_list() -> JSONResponse:
     from arb.latency_sports_manual_match import list_manual_matches_for_api
@@ -1665,6 +1671,15 @@ def _sixcycle_kpis_from_signals_csv(path: Path) -> Optional[dict[str, Any]]:
     }
 
 
+def _sixcycle_ensure_stake_mult_in_payload(payload: dict[str, Any]) -> None:
+    """Garantiza ``dry_run_stake_multiplier`` coherente con el motor (DRY_RUN)."""
+    from scripts import sixcycle_engine as six_mod
+
+    payload["dry_run_stake_multiplier"] = (
+        float(six_mod.get_dry_run_stake_multiplier()) if six_mod.DRY_RUN else 1.0
+    )
+
+
 def _sixcycle_merge_csv_kpis_into_payload(payload: dict[str, Any]) -> None:
     """Enriquece KPIs del panel sixcycle desde CSVs en disco si superan a la memoria del engine."""
     mem_t = int(payload.get("trades") or 0)
@@ -1683,6 +1698,7 @@ def _sixcycle_merge_csv_kpis_into_payload(payload: dict[str, Any]) -> None:
         payload["win_rate"] = best["win_rate"]
         payload["pnl_usdc"] = best["pnl_usdc"]
         payload["win_streak"] = best["win_streak"]
+    _sixcycle_ensure_stake_mult_in_payload(payload)
 
 
 async def _sixcycle_live_sse_gen(request: Request) -> AsyncIterator[str]:
@@ -1725,6 +1741,21 @@ async def api_sixcycle_status() -> JSONResponse:
         payload = dict(six_mod.SIXCYCLE_STATE)
     await asyncio.to_thread(_sixcycle_merge_csv_kpis_into_payload, payload)
     return JSONResponse(content=payload)
+
+
+@app.post("/api/sixcycle/dry-stake-multiplier")
+async def api_sixcycle_dry_stake_multiplier(body: SixcycleDryStakeMultiplierIn) -> JSONResponse:
+    """Ajusta el factor de stake Kelly en paper (ver ``sixcycle_engine.set_dry_run_stake_multiplier``)."""
+    from scripts import sixcycle_engine as six_mod
+
+    if not six_mod.DRY_RUN:
+        raise HTTPException(
+            status_code=400,
+            detail="Solo disponible con DRY_RUN=true (sin órdenes reales).",
+        )
+    v = six_mod.set_dry_run_stake_multiplier(float(body.multiplier))
+    log.info("sixcycle dry_run_stake_multiplier set to %s", v)
+    return JSONResponse(content={"ok": True, "dry_run_stake_multiplier": v})
 
 
 def _sixcycle_delete_data_files() -> dict[str, Any]:

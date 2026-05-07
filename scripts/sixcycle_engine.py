@@ -62,6 +62,9 @@ from lab.paths import data_dir  # noqa: E402
 from scripts.clob_signal_filter import CLOBSignalFilter  # noqa: E402
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
+# En DRY_RUN: factor sobre el stake Kelly (p. ej. 100 → apuestas y PnL ×100 en paper). No aplica en LIVE.
+_DRY_RUN_STAKE_MULT = 1.0
+_DRY_RUN_STAKE_MULT_LOCK = threading.Lock()
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 MIN_LIQUIDITY_USDC = float(os.getenv("MIN_LIQUIDITY_USDC", "50.0"))
 MAX_STAKE_USDC = float(os.getenv("MAX_STAKE_USDC", "10.0"))
@@ -136,7 +139,32 @@ SIXCYCLE_STATE: dict[str, Any] = {
     "clob_extreme": "NEUTRAL",
     "clob_no_price": None,
     "clob_bar": "",
+    "dry_run_stake_multiplier": 1.0,
 }
+
+
+def get_dry_run_stake_multiplier() -> float:
+    """Factor de stake en paper (solo tiene efecto si ``DRY_RUN``)."""
+    with _DRY_RUN_STAKE_MULT_LOCK:
+        return float(_DRY_RUN_STAKE_MULT)
+
+
+def set_dry_run_stake_multiplier(m: float) -> float:
+    """
+    Ajusta el multiplicador de stake Kelly en DRY_RUN. Clamp [0.01, 50_000].
+    Devuelve el valor efectivo.
+    """
+    global _DRY_RUN_STAKE_MULT
+    v = float(m)
+    if v < 0.01:
+        v = 0.01
+    elif v > 50000.0:
+        v = 50000.0
+    with _DRY_RUN_STAKE_MULT_LOCK:
+        _DRY_RUN_STAKE_MULT = v
+    with SIXCYCLE_STATE_LOCK:
+        SIXCYCLE_STATE["dry_run_stake_multiplier"] = v
+    return v
 
 
 def reset_sixcycle_live_state() -> None:
@@ -170,6 +198,7 @@ def reset_sixcycle_live_state() -> None:
                 "clob_extreme": "NEUTRAL",
                 "clob_no_price": None,
                 "clob_bar": "",
+                "dry_run_stake_multiplier": get_dry_run_stake_multiplier(),
             }
         )
 
@@ -718,6 +747,7 @@ class SixCycleEngine:
             "win_streak": int(self.win_streak),
             "best_streak": int(self.best_streak),
             "dry_run": bool(DRY_RUN),
+            "dry_run_stake_multiplier": float(get_dry_run_stake_multiplier()) if DRY_RUN else 1.0,
             "clob_extreme": clob_ex_s,
             "clob_no_price": clob_no,
             "clob_bar": clob_bar_s,
@@ -737,6 +767,8 @@ class SixCycleEngine:
             SIXCYCLE_STATE["pnl_usdc"] = round(float(self.pnl_usdc), 6)
             SIXCYCLE_STATE["win_streak"] = int(self.win_streak)
             SIXCYCLE_STATE["best_streak"] = int(self.best_streak)
+            if DRY_RUN:
+                SIXCYCLE_STATE["dry_run_stake_multiplier"] = float(get_dry_run_stake_multiplier())
 
     async def shutdown(self) -> None:
         """Solicita salida del bucle principal; ``run()`` hace ``scorer.stop()`` en ``finally``."""
@@ -1197,6 +1229,10 @@ class SixCycleEngine:
                             try:
                                 t_sz = time.perf_counter()
                                 stake = self.cycle_size(float(val["edge"]))
+                                if DRY_RUN:
+                                    mult = float(get_dry_run_stake_multiplier())
+                                    stake = float(stake) * mult
+                                    stake = max(0.01, min(float(stake), 1.0e7))
                                 cycle_size_ms = (time.perf_counter() - t_sz) * 1000.0
                             except Exception as e:  # noqa: BLE001
                                 log.warning("cycle_size error", extra={"error": str(e)})

@@ -51,32 +51,60 @@
       </div>
 
       <!-- Único bloque Encender / Parar + datos (sin duplicar abajo en el panel SSE) -->
-      <div id="sixcycle-motor-strip" class="mt-4 rounded-xl border border-slate-600 bg-slate-800/60 px-4 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div class="flex flex-col sm:flex-row sm:items-center gap-3 min-w-0">
-          <span id="run-badge" class="shrink-0 inline-flex items-center gap-2 text-sm font-bold px-4 py-2.5 rounded-lg border bg-slate-700/80 text-slate-300 border-slate-600">
-            <span id="run-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
-            <span id="run-label">PARADO</span>
-          </span>
-          <div class="flex flex-wrap items-center gap-2">
-            <button type="button" id="btn-enable"
-              class="text-sm px-4 py-2 rounded-lg border border-emerald-600 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-900/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
-              Encender
-            </button>
-            <button type="button" id="btn-disable"
-              class="text-sm px-4 py-2 rounded-lg border border-red-800 bg-red-950/20 text-red-300 hover:bg-red-950/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
-              Parar
-            </button>
-            <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
-              class="text-sm px-4 py-2 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 inline-block"
-              download>CSV</a>
-            <button type="button" id="btn-clear-sixcycle-data"
-              class="text-sm px-4 py-2 rounded-lg border border-rose-700 bg-rose-950/25 text-rose-200 hover:bg-rose-950/45 font-medium disabled:opacity-40 disabled:pointer-events-none"
-              title="Borra CSV del engine y sixcycle_signals.csv; para el motor Sixcycle">
-              Borrar datos
-            </button>
+      <div id="sixcycle-motor-strip" class="mt-4 rounded-xl border border-slate-600 bg-slate-800/60 px-4 py-4 flex flex-col gap-3">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 w-full">
+          <div class="flex flex-col sm:flex-row sm:items-center gap-3 min-w-0">
+            <span id="run-badge" class="shrink-0 inline-flex items-center gap-2 text-sm font-bold px-4 py-2.5 rounded-lg border bg-slate-700/80 text-slate-300 border-slate-600">
+              <span id="run-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+              <span id="run-label">PARADO</span>
+            </span>
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button" id="btn-enable"
+                class="text-sm px-4 py-2 rounded-lg border border-emerald-600 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-900/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
+                Encender
+              </button>
+              <button type="button" id="btn-disable"
+                class="text-sm px-4 py-2 rounded-lg border border-red-800 bg-red-950/20 text-red-300 hover:bg-red-950/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
+                Parar
+              </button>
+              <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
+                class="text-sm px-4 py-2 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 inline-block"
+                download>CSV</a>
+              <button type="button" id="btn-clear-sixcycle-data"
+                class="text-sm px-4 py-2 rounded-lg border border-rose-700 bg-rose-950/25 text-rose-200 hover:bg-rose-950/45 font-medium disabled:opacity-40 disabled:pointer-events-none"
+                title="Borra CSV del engine y sixcycle_signals.csv; para el motor Sixcycle">
+                Borrar datos
+              </button>
+            </div>
           </div>
+          <a href="/arb" class="text-sm text-indigo-400 hover:underline shrink-0">← Motor Arb</a>
         </div>
-        <a href="/arb" class="text-sm text-indigo-400 hover:underline shrink-0">← Motor Arb</a>
+        <div id="sixcycle-dry-stake-panel" class="hidden rounded-lg border border-indigo-500/35 bg-gradient-to-r from-indigo-950/50 to-slate-900/40 px-3 py-3 sm:px-4">
+          <div class="flex flex-col lg:flex-row lg:items-stretch gap-3 lg:justify-between lg:gap-4">
+            <div class="min-w-0 flex-1 space-y-1">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-[11px] font-semibold text-indigo-100">Stake simulado</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-100 border border-amber-700/40">DRY_RUN</span>
+              </div>
+              <p class="text-[10px] text-slate-400 leading-relaxed max-w-2xl">
+                Multiplica el stake Kelly de cada fill en paper: PnL y columnas del CSV escalan igual (útil para ver sensibilidad).
+                Las filas ya escritas conservan el factor vigente al ejecutarse; <strong class="text-slate-300">Borrar datos</strong> limpia CSV y KPI si quieres una serie uniforme con un nuevo ×.
+              </p>
+            </div>
+            <div class="flex flex-wrap items-end gap-2 shrink-0 border-t border-indigo-500/20 pt-3 lg:border-t-0 lg:pt-0 lg:border-l lg:pl-4 lg:ml-1">
+              <label for="dry-stake-mult-input" class="flex flex-col gap-0.5">
+                <span class="text-[10px] uppercase tracking-wide text-slate-500">× Kelly</span>
+                <input type="number" id="dry-stake-mult-input" min="0.01" max="50000" step="any" value="1" inputmode="decimal"
+                  class="w-[7.5rem] rounded-lg border border-slate-600 bg-slate-950 px-2.5 py-2 text-sm font-mono text-white shadow-inner focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/30 outline-none transition" />
+              </label>
+              <button type="button" id="dry-stake-apply"
+                class="text-sm px-4 py-2 rounded-lg border border-indigo-400/70 bg-indigo-600/35 text-indigo-50 hover:bg-indigo-600/50 font-medium shadow-sm transition">
+                Aplicar
+              </button>
+            </div>
+          </div>
+          <p id="dry-stake-feedback" class="text-[11px] mt-2 min-h-[1.15rem] font-mono text-slate-500 empty:hidden" aria-live="polite"></p>
+        </div>
       </div>
 
     </header>
@@ -141,6 +169,7 @@
         <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 text-center">
           <p class="text-[10px] uppercase text-slate-500">PnL USDC</p>
           <p class="text-xl font-bold font-mono mt-1" id="lv-mPnl">$0</p>
+          <p id="lv-pnl-mult-hint" class="hidden text-[9px] text-indigo-300/85 mt-1 font-medium leading-tight"></p>
         </div>
         <div class="rounded-xl border border-slate-700 bg-slate-800/40 p-3 text-center">
           <p class="text-[10px] uppercase text-slate-500">Win streak</p>
@@ -274,6 +303,73 @@
     });
     pollSixcycleEnabled();
     setInterval(pollSixcycleEnabled, 4000);
+
+    function syncDryStakeUx(state) {
+      var panel = document.getElementById("sixcycle-dry-stake-panel");
+      var inp = document.getElementById("dry-stake-mult-input");
+      if (!panel || !inp) return;
+      var dry = !!(state && state.dry_run);
+      if (!dry) {
+        panel.classList.add("hidden");
+        return;
+      }
+      panel.classList.remove("hidden");
+      var m = parseFloat(state.dry_run_stake_multiplier);
+      if (!Number.isFinite(m) || m <= 0) m = 1;
+      if (document.activeElement !== inp) inp.value = String(m);
+    }
+
+    async function refreshDryStakeFromApi() {
+      try {
+        const r = await fetch("/api/sixcycle/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        if (!r.ok) return;
+        syncDryStakeUx(await r.json());
+      } catch (err) {
+        console.warn("sixcycle status", err);
+      }
+    }
+
+    document.getElementById("dry-stake-apply").addEventListener("click", async function (e) {
+      e.preventDefault();
+      var inp = document.getElementById("dry-stake-mult-input");
+      var fb = document.getElementById("dry-stake-feedback");
+      if (!inp || !fb) return;
+      var v = parseFloat(String(inp.value).replace(",", "."));
+      if (!Number.isFinite(v) || v < 0.01) {
+        fb.textContent = "Usa un número ≥ 0.01 (coma o punto decimal).";
+        fb.className = "text-[11px] mt-2 min-h-[1.15rem] font-mono text-rose-400";
+        return;
+      }
+      fb.textContent = "Guardando…";
+      fb.className = "text-[11px] mt-2 min-h-[1.15rem] font-mono text-slate-400";
+      try {
+        const r = await fetch("/api/sixcycle/dry-stake-multiplier", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ multiplier: v }),
+        });
+        var j = await r.json().catch(function () {
+          return {};
+        });
+        if (!r.ok) {
+          var det = typeof j.detail === "string" ? j.detail : Array.isArray(j.detail) ? j.detail.map(function (x) { return x.msg || x; }).join(" ") : JSON.stringify(j);
+          fb.textContent = det || "Error HTTP " + r.status;
+          fb.className = "text-[11px] mt-2 min-h-[1.15rem] font-mono text-rose-400";
+          return;
+        }
+        var eff = j.dry_run_stake_multiplier != null ? j.dry_run_stake_multiplier : v;
+        inp.value = String(eff);
+        inp.blur();
+        fb.textContent = "Listo: próximos fills usan ×" + eff + " sobre Kelly (CSV/PnL coherentes).";
+        fb.className = "text-[11px] mt-2 min-h-[1.15rem] font-mono text-emerald-400/95";
+        window.setTimeout(function () {
+          if (fb.textContent.indexOf("Listo:") === 0) fb.textContent = "";
+        }, 5000);
+      } catch (err) {
+        fb.textContent = String(err);
+        fb.className = "text-[11px] mt-2 min-h-[1.15rem] font-mono text-rose-400";
+      }
+    });
 
     /* ——— Control tab (CSV / enable) ——— */
     async function fetchStatus() {
@@ -474,6 +570,7 @@
         renderSummary(st.strategies);
         const rows = await fetchLog();
         renderTable(rows);
+        await refreshDryStakeFromApi();
       } catch (e) {
         document.getElementById("tbl-msg").textContent = "Error: " + e;
       }
@@ -626,6 +723,21 @@
         pel.textContent = (pnl >= 0 ? "+" : "") + "$" + Number(pnl || 0).toFixed(2);
         pel.className = "text-xl font-bold font-mono mt-1 " + (pnl >= 0 ? "text-emerald-400" : "text-red-400");
         document.getElementById("lv-mStreak").textContent = state.win_streak ?? 0;
+
+        syncDryStakeUx(state);
+        var pnlHint = document.getElementById("lv-pnl-mult-hint");
+        if (pnlHint) {
+          if (dry) {
+            var mm = +(state.dry_run_stake_multiplier || 1);
+            pnlHint.classList.remove("hidden");
+            pnlHint.textContent =
+              !Number.isFinite(mm) || mm === 1
+                ? "Paper: Kelly ×1"
+                : "Paper: Kelly ×" + (Math.abs(mm - Math.round(mm)) < 1e-6 ? String(Math.round(mm)) : mm.toFixed(2));
+          } else {
+            pnlHint.classList.add("hidden");
+          }
+        }
 
         const ph = (state.phase || "OFFLINE").toUpperCase();
         const pb = document.getElementById("lv-phase-badge");
