@@ -510,7 +510,7 @@ class SixCycleEngine:
         """
         val = self.cycle_validate(signal, clob_yes, liquidity)
         if val.get("signal"):
-            return val
+            return self._apply_empirical_post_filters(val, signal, clob_yes, liquidity)
         if liquidity < MIN_LIQUIDITY_USDC:
             return val
         eps = 1e-5
@@ -535,7 +535,7 @@ class SixCycleEngine:
             if v2.get("signal") and str(v2.get("direction")) == "NO":
                 r = dict(v2)
                 r["reason"] = str(r.get("reason", "")) + " [clob_extreme>0.65]"
-                return r
+                return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity)
         elif clob_yes < 0.35:
             # Debe quedar estrictamente > 0.5 para rama YES del filtro.
             m_try = max(0.5 + 2e-4, float(clob_yes) + MIN_EDGE + eps)
@@ -558,7 +558,7 @@ class SixCycleEngine:
             if v2.get("signal") and str(v2.get("direction")) == "YES":
                 r = dict(v2)
                 r["reason"] = str(r.get("reason", "")) + " [clob_extreme<0.35]"
-                return r
+                return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity)
         return val
 
     def _sync_sixcycle_state(
@@ -1534,6 +1534,53 @@ class SixCycleEngine:
             min_abs_score=5,
         )
 
+    def _apply_empirical_post_filters(
+        self,
+        val: dict[str, Any],
+        signal: dict[str, Any],
+        clob_yes_price: float,
+        liquidity: float,
+    ) -> dict[str, Any]:
+        """
+        Tras ``CLOBSignalFilter.evaluate`` (u override de extremo): vetos empíricos (67 trades).
+        Solo actúa si ``val['signal']`` ya es True; el ``reason`` del veto va a CSV y log.
+        """
+        if not val.get("signal"):
+            return val
+        direction = str(val.get("direction") or "YES").upper()
+        cy = float(clob_yes_price)
+        if direction == "YES":
+            fill = cy
+        else:
+            fill = max(0.0, min(1.0, 1.0 - cy))
+        liq = float(liquidity)
+        try:
+            score = int(round(float(signal.get("score", 0) or 0)))
+        except (TypeError, ValueError):
+            score = 0
+
+        reason_rej = ""
+        if fill < 0.12:
+            reason_rej = f"fill {fill:.2f} <0.12: CLOB demasiado extremo, mercado tiene info"
+        elif 0.18 <= fill < 0.24:
+            reason_rej = f"fill {fill:.2f} en zona muerta 0.18-0.24 (WR 8% empírico)"
+        elif fill > 0.40:
+            reason_rej = f"fill {fill:.2f} >0.40: CLOB no suficientemente extremo"
+        elif liq > 1500.0:
+            reason_rej = f"liquidez {liq:.0f} >1500: mercado demasiado eficiente"
+        elif abs(score) < 3:
+            reason_rej = f"score {score} demasiado neutral (WR 13% empírico cuando |score|<3)"
+
+        if reason_rej:
+            log.info("Señal rechazada (filtro empírico): %s", reason_rej)
+            return {
+                "signal": False,
+                "edge": float(val.get("edge", 0) or 0),
+                "direction": direction if direction in ("YES", "NO") else "YES",
+                "reason": reason_rej,
+            }
+        return val
+
     def cycle_validate(
         self, signal: dict[str, Any], clob_yes_price: float, liquidity: float
     ) -> dict[str, Any]:
@@ -1546,13 +1593,16 @@ class SixCycleEngine:
                 "reason": "scorer sin dirección o datos insuficientes (buffer/CLOB)",
             }
         model_prob = _model_prob_from_signal(signal)
-        return self._filter.evaluate(
+        val = self._filter.evaluate(
             model_prob=model_prob,
             clob_yes_price=clob_yes_price,
             min_edge=MIN_EDGE,
             min_liquidity_usdc=MIN_LIQUIDITY_USDC,
             liquidity=liquidity,
         )
+        if val.get("signal"):
+            return self._apply_empirical_post_filters(val, signal, clob_yes_price, liquidity)
+        return val
 
     def cycle_size(self, edge: float) -> float:
         """
