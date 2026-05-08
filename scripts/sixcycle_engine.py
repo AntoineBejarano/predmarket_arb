@@ -483,6 +483,28 @@ def _minutes_elapsed_from_tte(tte_sec: float | None) -> str:
         return ""
 
 
+def _minutes_elapsed_float_for_filter(val: dict[str, Any], market: dict[str, Any] | None) -> float | None:
+    """Minutos desde apertura ventana 5m: ``val`` / ``market`` o derivado de ``tte_sec``."""
+    for src in (val, market or {}):
+        if not isinstance(src, dict):
+            continue
+        raw = src.get("minutes_elapsed")
+        if raw is not None and str(raw).strip() != "":
+            try:
+                return float(str(raw).strip().replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+    mkt = market or {}
+    tte = mkt.get("tte_sec")
+    if tte is None:
+        return None
+    try:
+        elapsed_sec = max(0.0, min(300.0, 300.0 - float(tte)))
+        return elapsed_sec / 60.0
+    except (TypeError, ValueError):
+        return None
+
+
 def _scorer_confirms_extreme(signal: dict[str, Any], extreme: str) -> bool:
     d = signal.get("direction")
     if d is None or extreme == "NEUTRAL":
@@ -531,15 +553,19 @@ class SixCycleEngine:
         self._ensure_csv_header()
 
     def _validate_with_clob_extreme_override(
-        self, signal: dict[str, Any], clob_yes: float, liquidity: float
+        self,
+        signal: dict[str, Any],
+        clob_yes: float,
+        liquidity: float,
+        market: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Primero CLOBSignalFilter; si no hay señal y el CLOB está en extremo con liquidez OK,
         re-evalúa con model_prob sintético (misma clase, sin tocar clob_signal_filter.py).
         """
-        val = self.cycle_validate(signal, clob_yes, liquidity)
+        val = self.cycle_validate(signal, clob_yes, liquidity, market)
         if val.get("signal"):
-            return self._apply_empirical_post_filters(val, signal, clob_yes, liquidity)
+            return self._apply_empirical_post_filters(val, signal, clob_yes, liquidity, market)
         if liquidity < MIN_LIQUIDITY_USDC:
             return val
         eps = 1e-5
@@ -564,7 +590,7 @@ class SixCycleEngine:
             if v2.get("signal") and str(v2.get("direction")) == "NO":
                 r = dict(v2)
                 r["reason"] = str(r.get("reason", "")) + " [clob_extreme>0.65]"
-                return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity)
+                return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity, market)
         elif clob_yes < 0.35:
             # Debe quedar estrictamente > 0.5 para rama YES del filtro.
             m_try = max(0.5 + 2e-4, float(clob_yes) + MIN_EDGE + eps)
@@ -587,7 +613,7 @@ class SixCycleEngine:
             if v2.get("signal") and str(v2.get("direction")) == "YES":
                 r = dict(v2)
                 r["reason"] = str(r.get("reason", "")) + " [clob_extreme<0.35]"
-                return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity)
+                return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity, market)
         return val
 
     def _sync_sixcycle_state(
@@ -1195,7 +1221,7 @@ class SixCycleEngine:
                                     else float(m["liquidity_usdc"])
                                 )
                                 # Extremos CLOB vs precio YES del scan (evita desalineación con WS del scorer).
-                                val = self._validate_with_clob_extreme_override(signal, clob_book, liq)
+                                val = self._validate_with_clob_extreme_override(signal, clob_book, liq, m)
                                 self._last_val_snapshot = dict(val)
                                 cycle_validate_ms = (time.perf_counter() - t_val) * 1000.0
                             except Exception as e:  # noqa: BLE001
@@ -1576,6 +1602,7 @@ class SixCycleEngine:
         signal: dict[str, Any],
         clob_yes_price: float,
         liquidity: float,
+        market: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Tras ``CLOBSignalFilter.evaluate`` (u override de extremo): vetos empíricos (67 trades).
@@ -1583,6 +1610,11 @@ class SixCycleEngine:
         """
         if not val.get("signal"):
             return val
+        minutes_elapsed = _minutes_elapsed_float_for_filter(val, market)
+        if minutes_elapsed is not None and minutes_elapsed > 3.0:
+            reason_tm = f"timing: minuto {minutes_elapsed:.1f} >3.0 (WR 0% empírico)"
+            log.info("Señal rechazada (filtro empírico): %s", reason_tm)
+            return {**val, "signal": False, "reason": reason_tm}
         direction = str(val.get("direction") or "YES").upper()
         cy = float(clob_yes_price)
         if direction == "YES":
@@ -1618,7 +1650,11 @@ class SixCycleEngine:
         return val
 
     def cycle_validate(
-        self, signal: dict[str, Any], clob_yes_price: float, liquidity: float
+        self,
+        signal: dict[str, Any],
+        clob_yes_price: float,
+        liquidity: float,
+        market: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Llamar CLOBSignalFilter.evaluate() con P(up) derivada del scorer."""
         if not signal.get("ready") or signal.get("direction") is None:
@@ -1637,7 +1673,7 @@ class SixCycleEngine:
             liquidity=liquidity,
         )
         if val.get("signal"):
-            return self._apply_empirical_post_filters(val, signal, clob_yes_price, liquidity)
+            return self._apply_empirical_post_filters(val, signal, clob_yes_price, liquidity, market)
         return val
 
     def cycle_size(self, edge: float) -> float:
