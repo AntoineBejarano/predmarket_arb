@@ -414,11 +414,17 @@ class PolymarketLiveAccount:
         avail = _parse_balance(raw)
         in_pos = _estimate_open_orders_notional(client)
         total = (avail + in_pos) if avail is not None else None
+        sig_type = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
+        # Para sig_type=1 (POLY_PROXY) el endpoint CLOB devuelve 0 aunque haya fondos
+        # disponibles en el proxy wallet — no es un error, es una limitación del endpoint.
+        proxy_managed = sig_type in (1, 2) and total == 0.0
         return {
             "usdc_available": avail,
             "usdc_in_positions": in_pos,
             "total": total,
             "raw_collateral": raw,
+            "signature_type": sig_type,
+            "proxy_managed": proxy_managed,
         }
 
     def get_positions(self) -> list[dict[str, Any]]:

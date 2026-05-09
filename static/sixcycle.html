@@ -786,7 +786,10 @@
             apiSfx +
             " · fuente: " +
             String(b.source || "live");
-          if (!b.error && !envDry && Number.isFinite(Number(b.total)) && Number(b.total) <= 0) {
+          if (!b.error && !envDry && b.proxy_managed) {
+            hint.textContent = head + " · balance gestionado por proxy Polymarket (CLOB no expone saldo directo — fondos disponibles).";
+            hint.className = "text-[10px] text-slate-400 font-mono min-h-[1rem]";
+          } else if (!b.error && !envDry && Number.isFinite(Number(b.total)) && Number(b.total) <= 0) {
             hint.textContent =
               head +
               " · balance en 0.00 (si esperabas fondos, revisa que sea esta misma cuenta/funder y que haya collateral en CLOB).";
