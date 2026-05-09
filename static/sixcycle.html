@@ -562,13 +562,48 @@
       }
     }
 
+    function fmtApiDetail(j, status) {
+      var d = j && j.detail;
+      if (typeof d === "string") return d;
+      if (Array.isArray(d)) {
+        return d
+          .map(function (x) {
+            if (typeof x === "string") return x;
+            if (x && typeof x.msg === "string") return x.msg;
+            try {
+              return JSON.stringify(x);
+            } catch (e) {
+              return String(x);
+            }
+          })
+          .join("; ");
+      }
+      if (d && typeof d === "object") {
+        try {
+          return JSON.stringify(d);
+        } catch (e2) {
+          return String(d);
+        }
+      }
+      return status ? "Error HTTP " + status : "Respuesta inválida del servidor";
+    }
+
     var accDryToggle = document.getElementById("acc-dry-run-toggle");
     if (accDryToggle) {
       accDryToggle.addEventListener("click", async function () {
         var msg = document.getElementById("acc-panel-msg");
         try {
           var cR = await fetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
-          if (!cR.ok) return;
+          if (!cR.ok) {
+            var cj = await cR.json().catch(function () {
+              return {};
+            });
+            if (msg) {
+              msg.textContent = "No se pudo leer la config: " + fmtApiDetail(cj, cR.status);
+              msg.className = "text-[10px] font-mono text-rose-400 min-h-[1rem]";
+            }
+            return;
+          }
           var pack = await cR.json();
           var cur = !!(pack.config && pack.config.dry_run);
           var next = !cur;
@@ -576,7 +611,9 @@
           if (!next && pack.dry_run_process_env) {
             if (
               !confirm(
-                "El proceso tiene DRY_RUN=true en entorno. ¿Persistir dry_run=false (confirm_live) con motor parado?"
+                "El servidor tiene DRY_RUN=true en el entorno. Se guardará dry_run=false en la config; " +
+                  "si el motor Sixcycle está en marcha, se parará solo para aplicar el cambio. " +
+                  "Las órdenes reales solo tendrán efecto con DRY_RUN=false en el proceso y credenciales CLOB. ¿Continuar?"
               )
             )
               return;
@@ -592,15 +629,22 @@
           });
           if (!r.ok) {
             if (msg) {
-              msg.textContent = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
-              msg.className = "text-[10px] font-mono text-rose-400";
+              msg.textContent = fmtApiDetail(j, r.status);
+              msg.className = "text-[10px] font-mono text-rose-400 min-h-[1rem]";
             }
             return;
+          }
+          if (msg && body.confirm_live) {
+            msg.textContent = "Config guardada. Si el motor se paró, pulsa Encender para operar en LIVE.";
+            msg.className = "text-[10px] font-mono text-emerald-400/90 min-h-[1rem]";
           }
           await refreshAccountPanel();
           await loadSixcycleConfigUi();
         } catch (err) {
-          if (msg) msg.textContent = String(err);
+          if (msg) {
+            msg.textContent = String(err);
+            msg.className = "text-[10px] font-mono text-rose-400 min-h-[1rem]";
+          }
         }
       });
     }

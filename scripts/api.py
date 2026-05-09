@@ -2245,10 +2245,10 @@ async def api_sixcycle_post_config(body: dict[str, Any] = Body(...)) -> JSONResp
                 "envía confirm_live=true y deja el motor Sixcycle parado (sin órdenes reales hasta reinicio acorde).",
             )
         if _sixcycle_running():
-            raise HTTPException(
-                status_code=400,
-                detail="Parar Sixcycle (POST disable / Parar en UI) antes de dry_run=false con DRY_RUN en el proceso.",
+            log.info(
+                "sixcycle: motor en marcha; parada automática antes de persistir dry_run=false (confirm_live)"
             )
+            await _sixcycle_stop()
 
     if "enabled" in partial:
         if bool(partial["enabled"]):
