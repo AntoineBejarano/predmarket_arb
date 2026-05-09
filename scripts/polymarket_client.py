@@ -147,10 +147,17 @@ def _get_clob_client() -> Any:
                 _ACCOUNT_PATH,
             )
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
-        except ImportError as e:
-            raise RuntimeError("Instala py-clob-client (pyproject/requirements)") from e
+            from py_clob_client_v2.client import ClobClient
+            from py_clob_client_v2.clob_types import ApiCreds
+        except ImportError:
+            try:
+                from py_clob_client.client import ClobClient  # type: ignore[assignment]
+                from py_clob_client.clob_types import ApiCreds  # type: ignore[assignment]
+                log.warning(
+                    "py-clob-client-v2 no instalado — usando v1 (puede causar order_version_mismatch con sig_type=1)"
+                )
+            except ImportError as e:
+                raise RuntimeError("Instala py-clob-client-v2 (pyproject/requirements)") from e
 
         host = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
         chain_id = int(os.getenv("POLYGON_CHAIN_ID", "137"))
@@ -282,10 +289,17 @@ class PolymarketTradingClient:
             return {"success": True, "price": px, "order_id": oid, "simulated": True}
 
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY
-        except ImportError as e:
-            raise RuntimeError("py-clob-client no instalado") from e
+            from py_clob_client_v2.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client_v2.order_builder.constants import BUY, SELL as _SELL
+            _v2 = True
+        except ImportError:
+            try:
+                from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore[assignment]
+                from py_clob_client.order_builder.constants import BUY, SELL as _SELL  # type: ignore[assignment]
+                PartialCreateOrderOptions = None  # type: ignore[assignment,misc]
+                _v2 = False
+            except ImportError as e:
+                raise RuntimeError("py-clob-client-v2 no instalado") from e
 
         token_id_eff = str(token_id or "").strip()
         if not token_id_eff:
@@ -294,9 +308,14 @@ class PolymarketTradingClient:
         if share_size <= 0 or not math.isfinite(share_size):
             return {"success": False, "price": px, "order_id": None, "error": "invalid_size"}
 
+        _side_const = BUY if str(side).upper() in ("YES", "BUY") else _SELL
         client = _get_clob_client()
-        order_args = OrderArgs(token_id=str(token_id_eff), price=float(px), size=float(share_size), side=BUY)
-        resp = client.create_and_post_order(order_args, options=None)
+        order_args = OrderArgs(token_id=str(token_id_eff), price=float(px), size=float(share_size), side=_side_const)
+        if _v2:
+            opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+            resp = client.create_and_post_order(order_args, options=opts, order_type=OrderType.GTC)
+        else:
+            resp = client.create_and_post_order(order_args, options=None)
         oid = None
         if isinstance(resp, dict):
             oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
