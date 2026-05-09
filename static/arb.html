@@ -26,16 +26,15 @@
           <div>
             <h1 class="text-2xl font-bold text-white tracking-tight">PredMarket Arb</h1>
             <p class="text-slate-400 text-sm mt-1">Arb Engine — ejecución de estrategias sobre order book Polymarket (edges, paper / L2)</p>
-            <p class="text-xs text-slate-500 mt-2 max-w-xl">Independiente del <a href="/ml" class="text-indigo-400 hover:underline">catálogo ML</a> y del <a href="/" class="text-indigo-400 hover:underline">monitor validador</a> (<code class="text-slate-400">signals.csv</code>).</p>
+            <p class="text-xs text-slate-500 mt-2 max-w-xl">Independiente del <a href="/" class="text-indigo-400 hover:underline">inicio</a>, <a href="/ml" class="text-indigo-400 hover:underline">catálogo ML</a> y del <a href="/ml/model/crypto_5m_lgbm" class="text-indigo-400 hover:underline">monitor ML 5m</a> (<code class="text-slate-400">signals.csv</code> en el validador).</p>
           </div>
         </div>
       </div>
       <nav class="flex flex-wrap gap-2 items-center text-sm">
-        <span class="text-slate-500">Vistas:</span>
-        <a href="/ml"
-          class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Catálogo ML</a>
-        <a href="/"
-          class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Monitor validador</a>
+        <span class="text-slate-500">Ir a:</span>
+        <a href="/" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Inicio</a>
+        <a href="/ml" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Catálogo ML</a>
+        <a href="/ml/model/crypto_5m_lgbm" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Monitor ML (5m)</a>
         <span class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Motor Arb (CLOB)</span>
       </nav>
     </header>

@@ -105,9 +105,11 @@
         <img src="/static/logo.png" alt="" width="44" height="44" class="rounded-xl ring-1 ring-slate-600 shrink-0 bg-slate-800/50 mt-0.5" />
         <div class="min-w-0 flex-1">
           <nav class="flex flex-wrap gap-2 text-sm mb-3">
+            <a href="/" class="text-slate-400 hover:text-white">Inicio</a>
+            <span class="text-slate-600">/</span>
             <a href="/ml" class="text-slate-400 hover:text-white">Catálogo ML</a>
             <span class="text-slate-600">/</span>
-            <a href="/" class="text-slate-400 hover:text-white">Monitor validador</a>
+            <a href="/ml/model/crypto_5m_lgbm" class="text-slate-400 hover:text-white">Monitor ML (5m)</a>
             <span class="text-slate-600">/</span>
             <a href="/arb" class="text-indigo-400 hover:underline">Motor Arb (CLOB)</a>
             <span class="text-slate-600">/</span>
@@ -117,7 +119,7 @@
           <p class="text-sm text-slate-400 mt-1 max-w-3xl">
             Estrategia <strong class="text-slate-300">sin modelo ML</strong>: confluencia en vivo con
             <code class="text-slate-500">MarketScorer</code> (WS Binance 1m + libro CLOB Polymarket), paper y CSV.
-            El <a href="/" class="text-indigo-400 hover:underline">monitor validador</a> y el catálogo ML son el pipeline
+            El <a href="/ml/model/crypto_5m_lgbm" class="text-indigo-400 hover:underline">monitor ML 5m</a> y el catálogo ML son el pipeline
             <strong class="text-slate-400">LightGBM</strong> sobre el mismo tipo de mercado 5m — concepto distinto en el lab.
           </p>
         </div>

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PredMarket Arb — Inicio</title>
+  <link rel="icon" type="image/png" href="/static/logo.png" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'] }
+        }
+      }
+    };
+  </script>
+</head>
+<body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
+  <div class="max-w-6xl mx-auto px-4 py-8 space-y-10">
+    <header class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-6 border-b border-slate-700 pb-8">
+      <div class="flex items-start gap-4">
+        <img src="/static/logo.png" alt="" width="56" height="56"
+          class="rounded-xl ring-1 ring-slate-600 shrink-0 bg-slate-800/50" />
+        <div>
+          <h1 class="text-3xl font-bold text-white tracking-tight">PredMarket Arb</h1>
+          <p class="text-slate-400 mt-2 max-w-xl text-sm leading-relaxed">
+            Panel de control: resumen de paper trading y enlaces a cada módulo. El monitor ML de un solo modelo está bajo <strong class="text-slate-300">Catálogo ML</strong>, no aquí.
+          </p>
+        </div>
+      </div>
+    </header>
+
+    <nav class="flex flex-wrap gap-2 items-center text-sm">
+      <span class="text-slate-500">Ir a:</span>
+      <span class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Inicio</span>
+      <a href="/ml" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Catálogo ML</a>
+      <a id="linkMlMonitor" href="/ml/model/crypto_5m_lgbm" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Monitor ML (5m)</a>
+      <a href="/arb" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Motor Arb (CLOB)</a>
+      <a href="/arb/strategy/crypto_5m_sixcycle?view=live" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Sixcycle · vivo</a>
+      <a href="/arb/strategy/latency_arb_sports" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Latency sports</a>
+    </nav>
+
+    <section id="summarySection" class="space-y-4">
+      <h2 class="text-lg font-semibold text-white">Resumen rápido</h2>
+      <p id="summaryError" class="hidden text-sm text-red-400"></p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wide">Paper motor (EUR)</div>
+          <div id="valPaperPnl" class="font-mono text-2xl text-emerald-300 mt-1">—</div>
+          <div id="valPaperRoi" class="text-xs text-slate-500 mt-1 font-mono">ROI mezclado —</div>
+        </div>
+        <div class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wide">PnL CSV logs (estimado)</div>
+          <div id="valCsvPnl" class="font-mono text-2xl text-cyan-300 mt-1">—</div>
+          <div id="valCsvToday" class="text-xs text-slate-500 mt-1 font-mono">Hoy —</div>
+        </div>
+        <div class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wide">Validador ML</div>
+          <div id="valValRunning" class="font-mono text-lg text-white mt-1">—</div>
+          <div id="valValRows" class="text-xs text-slate-500 mt-1 font-mono">filas CSV —</div>
+        </div>
+        <div class="rounded-xl border border-slate-700 bg-slate-800/50 p-4">
+          <div class="text-xs text-slate-500 uppercase tracking-wide">Motor Arb</div>
+          <div id="valArbRunning" class="font-mono text-lg text-white mt-1">—</div>
+          <div id="valArbDry" class="text-xs text-slate-500 mt-1">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="space-y-3">
+      <h2 class="text-lg font-semibold text-white">Paper por estrategia</h2>
+      <div class="overflow-x-auto rounded-xl border border-slate-700">
+        <table class="w-full text-sm text-left">
+          <thead class="bg-slate-800 text-slate-400 text-xs uppercase">
+            <tr>
+              <th class="px-3 py-2">Estrategia</th>
+              <th class="px-3 py-2">Estado</th>
+              <th class="px-3 py-2 text-right">PnL acum. (EUR)</th>
+              <th class="px-3 py-2 text-right">ROI</th>
+              <th class="px-3 py-2">Panel</th>
+            </tr>
+          </thead>
+          <tbody id="tblStrategies" class="divide-y divide-slate-700 font-mono text-xs"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="rounded-xl border border-slate-600 bg-slate-800/40 p-6 space-y-3">
+      <h2 class="text-lg font-semibold text-white">Acceso y contraseña</h2>
+      <p id="authBlurb" class="text-sm text-slate-400 leading-relaxed">
+        Cargando…
+      </p>
+      <ul class="text-sm text-slate-400 list-disc pl-5 space-y-1">
+        <li>Usuario y contraseña del popup del navegador vienen de <code class="text-slate-300">API_HTTP_BASIC_USER</code> y <code class="text-slate-300">API_HTTP_BASIC_PASSWORD</code> en el entorno (Railway / <code class="text-slate-300">.env</code>), no se cambian desde esta web.</li>
+        <li>Tras un login correcto, el servidor deja una cookie de sesión varios días (<code class="text-slate-300">API_AUTH_SESSION_DAYS</code>); no hace falta reintroducir la contraseña en cada visita.</li>
+        <li>Para cambiar la clave: edita variables de entorno y redeploy / reinicia el proceso.</li>
+      </ul>
+    </section>
+
+    <footer class="text-xs text-slate-600 pt-4 border-t border-slate-800">
+      <a href="/health" class="text-indigo-400 hover:underline">/health</a> (sin auth, p. ej. probes)
+    </footer>
+  </div>
+
+  <script>
+    const SLUG_LABEL = {
+      bundle_arb: "Bundle / NegRisk",
+      cross_exchange: "Cross exchange",
+      market_maker: "Market maker",
+      combinatorial_arb: "Combinatorial",
+      term_structure: "Term structure",
+      latency_arb: "Latency arb",
+      latency_arb_sports: "Latency sports",
+      crypto_5m_sixcycle: "Sixcycle 5m",
+    };
+
+    function arbPanelHref(slug) {
+      if (slug === "latency_arb_sports") return "/arb/strategy/latency_arb_sports";
+      return "/arb/strategy/" + encodeURIComponent(slug);
+    }
+
+    async function loadSummary() {
+      const err = document.getElementById("summaryError");
+      try {
+        const r = await fetch("/api/dashboard/summary");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const d = await r.json();
+        if (err) err.classList.add("hidden");
+
+        const mlSlug = d.default_ml_model_slug || "crypto_5m_lgbm";
+        const lm = document.getElementById("linkMlMonitor");
+        if (lm) lm.setAttribute("href", "/ml/model/" + encodeURIComponent(mlSlug));
+
+        const arb = d.arb_engine || {};
+        const pp = Number(arb.paper_pnl_eur_total);
+        const pr = Number(arb.paper_roi_blended);
+        document.getElementById("valPaperPnl").textContent =
+          (isNaN(pp) ? "—" : pp.toFixed(2)) + " €";
+        document.getElementById("valPaperRoi").textContent =
+          "ROI mezclado " + (isNaN(pr) ? "—" : (pr * 100).toFixed(2) + "%");
+
+        const csv = d.account_csv || {};
+        const pt = Number(csv.pnl_total);
+        const ptd = Number(csv.pnl_today);
+        document.getElementById("valCsvPnl").textContent =
+          (isNaN(pt) ? "—" : pt.toFixed(2)) + " (u.)";
+        document.getElementById("valCsvToday").textContent =
+          "Hoy " + (isNaN(ptd) ? "—" : ptd.toFixed(2)) + " · trades " + (csv.trades_today ?? "—");
+
+        const v = d.validator || {};
+        document.getElementById("valValRunning").textContent = v.running ? "EN MARCHA" : "PARADO";
+        document.getElementById("valValRows").textContent =
+          "signals.csv · " + (v.csv_rows ?? "—") + " filas · hoy " + (v.signals_today ?? "—") + " señales";
+
+        document.getElementById("valArbRunning").textContent = arb.running ? "EN MARCHA" : "PARADO";
+        document.getElementById("valArbDry").textContent = arb.dry_run ? "DRY_RUN" : "LIVE (CLOB)";
+
+        const auth = d.auth || {};
+        const ab = document.getElementById("authBlurb");
+        if (ab) {
+          if (auth.http_basic_enabled) {
+            ab.textContent =
+              "HTTP Basic está activo en este despliegue. Sesión del navegador hasta ~" +
+              (auth.session_days || 30) +
+              " días (cookie), salvo que borres cookies o cambies la contraseña en el servidor.";
+          } else {
+            ab.textContent =
+              "Este despliegue no tiene HTTP Basic (no hay API_HTTP_BASIC_PASSWORD en el entorno). Cualquiera que llegue a la URL ve el panel.";
+          }
+        }
+
+        const tbody = document.getElementById("tblStrategies");
+        const rows = arb.strategies || [];
+        tbody.innerHTML = rows
+          .map(function (s) {
+            const pnl = Number(s.fict_pnl_cumulative_eur);
+            const roi = Number(s.fict_roi);
+            const name = SLUG_LABEL[s.slug] || s.slug;
+            return (
+              "<tr class='hover:bg-slate-800/60'>" +
+              "<td class='px-3 py-2 text-slate-200'>" +
+              name +
+              "</td>" +
+              "<td class='px-3 py-2'>" +
+              (s.enabled
+                ? "<span class='text-emerald-400'>ON</span>"
+                : "<span class='text-slate-500'>off</span>") +
+              "</td>" +
+              "<td class='px-3 py-2 text-right'>" +
+              (isNaN(pnl) ? "—" : pnl.toFixed(2)) +
+              "</td>" +
+              "<td class='px-3 py-2 text-right'>" +
+              (isNaN(roi) ? "—" : (roi * 100).toFixed(2) + "%") +
+              "</td>" +
+              "<td class='px-3 py-2'><a href='" +
+              arbPanelHref(s.slug) +
+              "' class='text-indigo-400 hover:underline'>Abrir</a></td>" +
+              "</tr>"
+            );
+          })
+          .join("");
+      } catch (e) {
+        if (err) {
+          err.textContent = "No se pudo cargar el resumen: " + (e && e.message ? e.message : e);
+          err.classList.remove("hidden");
+        }
+      }
+    }
+
+    loadSummary();
+    setInterval(loadSummary, 45000);
+  </script>
+</body>
+</html>

@@ -6,9 +6,14 @@ API FastAPI: dashboard HTML + control del proceso validate_edge (subprocess).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import csv
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import math
 import os
 import subprocess
@@ -30,6 +35,8 @@ from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette import status as starlette_status
+from starlette.middleware.base import BaseHTTPMiddleware
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -62,6 +69,8 @@ SIGNALS_CSV = DATA_DIR / "logs" / "signals.csv"
 STATIC_DIR = REPO_ROOT / "static"
 ML_MODELS_HTML = STATIC_DIR / "ml_models.html"
 ML_MODEL_DETAIL_HTML = STATIC_DIR / "ml_model_detail.html"
+HOME_HTML = STATIC_DIR / "home.html"
+DEFAULT_ML_MODEL_SLUG = "crypto_5m_lgbm"
 ARB_HTML = STATIC_DIR / "arb.html"
 ARB_STRATEGY_DETAIL_HTML = STATIC_DIR / "arb_strategy_detail.html"
 LATENCY_SPORTS_HTML = STATIC_DIR / "latency_sports.html"
@@ -86,6 +95,105 @@ LATENCY_ARB_SPORTS_SNAPSHOTS_CSV = DATA_DIR / "logs" / "latency_arb_sports_snaps
 LATENCY_SPORTS_CYCLE_METRICS_JSON = DATA_DIR / "logs" / "latency_arb_sports_cycle_metrics.json"
 LATENCY_SPORTS_SCHEDULE_JSON = DATA_DIR / "logs" / "latency_sports_schedule.json"
 LATENCY_SPORTS_PENDING_JSON = DATA_DIR / "logs" / "latency_arb_sports_pending_matches.json"
+
+# HTTP Basic opcional: credenciales solo por entorno (nunca en el repo).
+API_HTTP_BASIC_USER = (os.getenv("API_HTTP_BASIC_USER", "admin") or "admin").strip()
+API_HTTP_BASIC_PASSWORD = os.getenv("API_HTTP_BASIC_PASSWORD", "").strip()
+PM_AUTH_COOKIE_NAME = "pm_dash_auth"
+
+
+def _auth_session_ttl_sec() -> int:
+    try:
+        days = int(os.getenv("API_AUTH_SESSION_DAYS", "30").strip())
+    except ValueError:
+        days = 30
+    return max(1, min(days, 365)) * 86400
+
+
+def _sign_auth_session(username: str, password: str, ttl_sec: int) -> str:
+    exp = int(time.time()) + ttl_sec
+    msg = f"v1|{exp}|{username}".encode("utf-8")
+    sig = hmac.new(password.encode("utf-8"), msg, hashlib.sha256).digest()
+    return f"{exp}|{username}|{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
+
+
+def _auth_session_cookie_ok(request: Request, username: str, password: str) -> bool:
+    raw = request.cookies.get(PM_AUTH_COOKIE_NAME)
+    if not raw or raw.count("|") != 2:
+        return False
+    exp_s, user, sig_b64 = raw.split("|", 2)
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    if time.time() > exp:
+        return False
+    if not secrets.compare_digest(user, username):
+        return False
+    pad = "=" * (-len(sig_b64) % 4)
+    try:
+        sig_got = base64.urlsafe_b64decode(sig_b64 + pad)
+    except (ValueError, binascii.Error, TypeError):
+        return False
+    msg = f"v1|{exp}|{username}".encode("utf-8")
+    sig_exp = hmac.new(password.encode("utf-8"), msg, hashlib.sha256).digest()
+    return secrets.compare_digest(sig_got, sig_exp)
+
+
+def _basic_credentials_ok(request: Request, username: str, password: str) -> bool:
+    raw = request.headers.get("authorization")
+    if not raw or not raw.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(raw.split(" ", 1)[1].strip(), validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    user, sep, pw = decoded.partition(":")
+    if not sep:
+        return False
+    return secrets.compare_digest(user, username) and secrets.compare_digest(pw, password)
+
+
+def _http_basic_challenge_response() -> JSONResponse:
+    return JSONResponse(
+        {"detail": "Unauthorized"},
+        status_code=starlette_status.HTTP_401_UNAUTHORIZED,
+        headers={"WWW-Authenticate": 'Basic realm="PredMarket"'},
+    )
+
+
+class _HttpBasicAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, username: str, password: str, session_ttl_sec: int):
+        super().__init__(app)
+        self._username = username
+        self._password = password
+        self._session_ttl_sec = session_ttl_sec
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        path = request.url.path
+        if path == "/health" or path.startswith("/static/") or path == "/favicon.ico":
+            return await call_next(request)
+        if _auth_session_cookie_ok(request, self._username, self._password):
+            return await call_next(request)
+        if _basic_credentials_ok(request, self._username, self._password):
+            resp = await call_next(request)
+            token = _sign_auth_session(self._username, self._password, self._session_ttl_sec)
+            secure = request.url.scheme == "https" or (
+                request.headers.get("x-forwarded-proto", "").lower() == "https"
+            )
+            resp.set_cookie(
+                PM_AUTH_COOKIE_NAME,
+                token,
+                max_age=self._session_ttl_sec,
+                httponly=True,
+                secure=secure,
+                samesite="lax",
+                path="/",
+            )
+            return resp
+        return _http_basic_challenge_response()
 
 
 def _read_latency_sports_cycle_metrics() -> dict[str, Any]:
@@ -463,15 +571,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+if API_HTTP_BASIC_PASSWORD:
+    _ttl = _auth_session_ttl_sec()
+    app.add_middleware(
+        _HttpBasicAuthMiddleware,
+        username=API_HTTP_BASIC_USER,
+        password=API_HTTP_BASIC_PASSWORD,
+        session_ttl_sec=_ttl,
+    )
+    log.info(
+        "HTTP Basic activo (usuario=%r). Tras el primer login el navegador guarda sesión ~%d días "
+        "(cookie HttpOnly; EventSource incluye la cookie). Público: /health, /static/*.",
+        API_HTTP_BASIC_USER,
+        max(1, _ttl // 86400),
+    )
 
 
 @app.get("/", response_model=None)
 async def root() -> Union[FileResponse, JSONResponse]:
-    """Validador ML (modelo por defecto); misma UI que /ml/model/crypto_5m_lgbm."""
+    """Hub de inicio: enlaces a ML, Arb, resumen y seguridad."""
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
-    if not ML_MODEL_DETAIL_HTML.is_file():
-        return JSONResponse({"detail": "static/ml_model_detail.html not found"}, status_code=404)
-    return FileResponse(path=str(ML_MODEL_DETAIL_HTML), media_type="text/html; charset=utf-8")
+    if not HOME_HTML.is_file():
+        return JSONResponse({"detail": "static/home.html not found"}, status_code=404)
+    return FileResponse(path=str(HOME_HTML), media_type="text/html; charset=utf-8")
 
 
 @app.get("/ml", response_model=None)
@@ -1297,9 +1419,8 @@ def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
     return {"files_removed": removed, "file_errors": errors}
 
 
-@app.get("/api/arb/status")
-async def arb_status() -> JSONResponse:
-    state = await _state_manager.get_all()
+def _build_arb_strategy_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Filas de estado paper por estrategia (misma forma que ``GET /api/arb/status``)."""
     strategies: list[dict[str, Any]] = []
     for slug in STRATEGY_SLUGS:
         if slug == SIXCYCLE_SLUG:
@@ -1369,6 +1490,81 @@ async def arb_status() -> JSONResponse:
                 )
                 row["ref_health_state"] = m.get("ref_health_state")
         strategies.append(row)
+    return strategies
+
+
+def _dashboard_auth_info() -> dict[str, Any]:
+    try:
+        days = int(os.getenv("API_AUTH_SESSION_DAYS", "30").strip())
+    except ValueError:
+        days = 30
+    days = max(1, min(days, 365))
+    return {
+        "http_basic_enabled": bool(API_HTTP_BASIC_PASSWORD),
+        "session_days": days,
+    }
+
+
+def _dashboard_account_csv_sync() -> dict[str, Any]:
+    from scripts import account_metrics as am
+
+    agg = am.aggregate_pnl_from_strategy_logs(DATA_DIR / "logs")
+    agg["dry_run_env"] = _env_dry_run_global()
+    return agg
+
+
+@app.get("/api/dashboard/summary")
+async def api_dashboard_summary() -> JSONResponse:
+    """Resumen para la página de inicio: auth (sin secretos), validador, motor arb paper, PnL CSV."""
+    state = await _state_manager.get_all()
+    strategies = _build_arb_strategy_rows(state)
+    tot_pnl = sum(float(r["fict_pnl_cumulative_eur"]) for r in strategies)
+    tot_cap = sum(float(r["fict_capital_eur"]) for r in strategies)
+    roi_blend = tot_pnl / tot_cap if tot_cap > 0 else 0.0
+    running = False
+    with _arb_lock:
+        if _arb_proc is not None and _arb_proc.poll() is None:
+            running = True
+    vs = build_status_payload()
+    acc = await asyncio.to_thread(_dashboard_account_csv_sync)
+    payload: dict[str, Any] = {
+        "auth": _dashboard_auth_info(),
+        "default_ml_model_slug": DEFAULT_ML_MODEL_SLUG,
+        "validator": {
+            "running": vs["running"],
+            "csv_rows": vs["csv_rows"],
+            "signals_today": vs["signals_today"],
+            "uptime_seconds": vs["uptime_seconds"],
+        },
+        "arb_engine": {
+            "running": running,
+            "dry_run": ARB_ENGINE_DRY_RUN,
+            "paper_pnl_eur_total": round(tot_pnl, 4),
+            "paper_capital_eur_total": round(tot_cap, 2),
+            "paper_roi_blended": round(roi_blend, 6),
+            "strategies": [
+                {
+                    "slug": r["slug"],
+                    "enabled": r["enabled"],
+                    "fict_pnl_cumulative_eur": r["fict_pnl_cumulative_eur"],
+                    "fict_roi": r["fict_roi"],
+                    "fict_capital_eur": r["fict_capital_eur"],
+                }
+                for r in strategies
+            ],
+        },
+        "account_csv": acc,
+    }
+    return JSONResponse(
+        content=payload,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
+@app.get("/api/arb/status")
+async def arb_status() -> JSONResponse:
+    state = await _state_manager.get_all()
+    strategies = _build_arb_strategy_rows(state)
     running = False
     with _arb_lock:
         if _arb_proc is not None and _arb_proc.poll() is None:
