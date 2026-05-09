@@ -1910,6 +1910,7 @@ class SixCycleEngine:
                     side=dir_s,
                     amount_usdc=float(stake_usdc),
                     price=fill_px,
+                    token_id=str(token_id).strip(),
                 )
 
             out = await asyncio.to_thread(_place)

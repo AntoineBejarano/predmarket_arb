@@ -233,6 +233,7 @@ class PolymarketTradingClient:
         side: str,
         amount_usdc: float,
         price: float,
+        token_id: str = "",
     ) -> dict[str, Any]:
         """
         Coloca BUY en outcome YES/NO. ``amount_usdc`` = notional aproximado (como Kelly previo).
@@ -259,13 +260,15 @@ class PolymarketTradingClient:
         except ImportError as e:
             raise RuntimeError("py-clob-client no instalado") from e
 
-        token_id = _resolve_token_id_for_side(market_id, side)
+        token_id_eff = str(token_id or "").strip()
+        if not token_id_eff:
+            token_id_eff = _resolve_token_id_for_side(market_id, side)
         share_size = float(amount_usdc) / max(px, 1e-9)
         if share_size <= 0 or not math.isfinite(share_size):
             return {"success": False, "price": px, "order_id": None, "error": "invalid_size"}
 
         client = _get_clob_client()
-        order_args = OrderArgs(token_id=str(token_id), price=float(px), size=float(share_size), side=BUY)
+        order_args = OrderArgs(token_id=str(token_id_eff), price=float(px), size=float(share_size), side=BUY)
         resp = client.create_and_post_order(order_args, options=None)
         oid = None
         if isinstance(resp, dict):
@@ -275,7 +278,7 @@ class PolymarketTradingClient:
             "place_order LIVE market_id=%s side=%s token=%s… price=%.4f size_shares=%.6f",
             str(market_id)[:20],
             side,
-            str(token_id)[:10],
+            str(token_id_eff)[:10],
             px,
             share_size,
         )
