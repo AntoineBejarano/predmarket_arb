@@ -33,3 +33,4 @@ strategies/**/experiments/**/*.zip
 
 # Secrets
 .env
+data/polymarket_account.json

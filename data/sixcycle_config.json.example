@@ -11,10 +11,13 @@
   "fill_min": 0.12,
   "kelly_fraction": 0.25,
   "liquidity_max": 1500.0,
+  "max_concurrent_trades": 1,
+  "max_daily_loss_usdc": 20.0,
   "max_stake_usdc": 5.0,
   "min_edge": 0.05,
   "score_min_abs": 3,
   "timing_dead_zone_high": 3.0,
   "timing_dead_zone_low": 2.5,
-  "timing_max_minutes": 3.0
+  "timing_max_minutes": 3.0,
+  "stake_usdc": 1.0
 }

@@ -1743,6 +1743,125 @@ async def api_sixcycle_status() -> JSONResponse:
     return JSONResponse(content=payload)
 
 
+def _env_dry_run_global() -> bool:
+    return os.getenv("DRY_RUN", "true").strip().lower() != "false"
+
+
+@app.get("/api/account/balance")
+async def api_account_balance() -> JSONResponse:
+    """Balance USDC CLOB (siempre intenta cuenta real vía ``py-clob-client``)."""
+
+    def _run() -> dict[str, Any]:
+        from scripts import polymarket_client as pc
+
+        try:
+            bal = pc.get_live_account_client().get_balance()
+            bal["source"] = "live"
+            bal["dry_run_env"] = _env_dry_run_global()
+            return bal
+        except Exception as e:
+            log.warning("GET /api/account/balance: %s", e)
+            return {
+                "usdc_available": None,
+                "usdc_in_positions": None,
+                "total": None,
+                "source": "unavailable",
+                "error": str(e),
+                "credentials_path": str(pc.account_json_path()),
+                "dry_run_env": _env_dry_run_global(),
+            }
+
+    return JSONResponse(content=await asyncio.to_thread(_run))
+
+
+@app.get("/api/account/positions")
+async def api_account_positions() -> JSONResponse:
+    """Órdenes abiertas CLOB (cuenta real)."""
+
+    def _run() -> list[dict[str, Any]]:
+        from scripts import polymarket_client as pc
+
+        try:
+            return pc.get_live_account_client().get_positions()
+        except Exception as e:
+            log.warning("GET /api/account/positions: %s", e)
+            return [{"error": str(e), "credentials_path": str(pc.account_json_path())}]
+
+    return JSONResponse(content=await asyncio.to_thread(_run))
+
+
+@app.get("/api/account/pnl")
+async def api_account_pnl() -> JSONResponse:
+    """PnL agregado desde CSV de logs (todas las estrategias bajo DATA_DIR/logs)."""
+    from scripts import account_metrics as am
+
+    def _run() -> dict[str, Any]:
+        agg = am.aggregate_pnl_from_strategy_logs(DATA_DIR / "logs")
+        agg["source"] = "csv"
+        agg["dry_run_env"] = _env_dry_run_global()
+        return agg
+
+    return JSONResponse(content=await asyncio.to_thread(_run))
+
+
+@app.get("/api/strategies")
+async def api_strategies_list() -> JSONResponse:
+    """Listado multi-estrategia: enabled, dry_run/stake (sixcycle desde JSON), PnL hoy por CSV."""
+    from scripts import account_metrics as am
+    from scripts import sixcycle_config_store as scs
+
+    pnl_by = await asyncio.to_thread(am.per_slug_pnl_today, DATA_DIR / "logs")
+    state = await _state_manager.get_all()
+    rows: list[dict[str, Any]] = []
+    sc_cfg = scs.load_config()
+    for slug in STRATEGY_SLUGS:
+        st = state.get(slug, {}) or {}
+        enabled = bool(st.get("enabled", False))
+        if slug == SIXCYCLE_SLUG:
+            enabled = _sixcycle_running()
+        row: dict[str, Any] = {
+            "slug": slug,
+            "enabled": enabled,
+        }
+        if slug == SIXCYCLE_SLUG:
+            row["dry_run"] = bool(sc_cfg.get("dry_run", True))
+            row["stake_usdc"] = float(sc_cfg.get("stake_usdc", 1.0))
+            row["max_daily_loss_usdc"] = float(sc_cfg.get("max_daily_loss_usdc", 20.0))
+            row["max_concurrent_trades"] = int(sc_cfg.get("max_concurrent_trades", 1))
+        snap = pnl_by.get(slug)
+        if snap:
+            row["pnl_hoy"] = snap.get("pnl_hoy")
+            row["trades_hoy"] = snap.get("trades_hoy")
+            row["win_rate_hoy"] = snap.get("win_rate_hoy")
+        else:
+            row["pnl_hoy"] = 0.0
+            row["trades_hoy"] = 0
+            row["win_rate_hoy"] = 0.0
+        rows.append(row)
+    return JSONResponse(
+        content={
+            "strategies": rows,
+            "dry_run_env": _env_dry_run_global(),
+        }
+    )
+
+
+@app.post("/api/strategies/{slug}/config")
+async def api_strategies_post_config(slug: str, body: dict[str, Any] = Body(...)) -> JSONResponse:
+    """
+    Actualiza config por estrategia. Solo ``crypto_5m_sixcycle`` está cableado a
+    ``sixcycle_config.json`` (mismas reglas que ``POST /api/sixcycle/config``).
+    """
+    if slug not in STRATEGY_SLUGS:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {slug}")
+    if slug != SIXCYCLE_SLUG:
+        raise HTTPException(
+            status_code=501,
+            detail="Config por slug solo implementada para crypto_5m_sixcycle; use /api/sixcycle/config",
+        )
+    return await api_sixcycle_post_config(body)
+
+
 async def _sixcycle_config_api_bundle() -> dict[str, Any]:
     """Payload enriquecido para GET /api/sixcycle/config (agentes / UI)."""
     from scripts import sixcycle_config_store as scs

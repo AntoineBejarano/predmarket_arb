@@ -15,6 +15,91 @@
 </head>
 <body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
   <div class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+    <!-- Cuenta Polymarket (balance real + PnL desde CSV) -->
+    <section id="sixcycle-account-panel" class="rounded-xl border border-slate-600 bg-slate-800/70 px-4 py-4 space-y-3 shadow-lg">
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-lg" aria-hidden="true">💰</span>
+          <h2 class="text-sm font-semibold text-white tracking-tight">Cuenta</h2>
+          <span id="acc-mode-badge" class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-900/50 text-amber-200 border-amber-700/50">SIMULADO</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-xs">
+          <span class="text-slate-400">DRY</span>
+          <button type="button" id="acc-dry-run-toggle" role="switch" aria-checked="true"
+            class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border border-slate-500 bg-slate-700 transition">
+            <span id="acc-dry-run-knob" class="pointer-events-none inline-block h-5 w-5 translate-x-1 translate-y-0.5 rounded-full bg-amber-400 shadow transition"></span>
+          </button>
+          <span class="text-slate-400">LIVE</span>
+          <label class="flex items-center gap-1 ml-2 text-slate-300">
+            <span class="text-slate-500">Stake</span>
+            <input type="number" id="acc-stake-input" min="0.01" step="any" value="1"
+              class="w-20 rounded border border-slate-600 bg-slate-950 px-1.5 py-1 font-mono text-xs text-white" />
+            <span class="text-slate-500">USDC</span>
+          </label>
+          <button type="button" id="acc-stake-apply"
+            class="rounded border border-indigo-500/60 bg-indigo-600/30 px-2 py-1 text-indigo-100 hover:bg-indigo-600/45">Guardar stake</button>
+        </div>
+      </div>
+      <div class="flex flex-col sm:flex-row flex-wrap items-end gap-3 pt-2 border-t border-slate-700/50 text-xs">
+        <label class="flex flex-col gap-0.5 text-slate-300 min-w-0">
+          <span class="text-[10px] text-slate-500">Pérdida máx. día (circuit breaker, USDC)</span>
+          <input type="number" id="acc-max-loss-input" min="0.01" step="any" value="20"
+            class="w-28 rounded border border-slate-600 bg-slate-950 px-2 py-1 font-mono text-white" />
+        </label>
+        <label class="flex flex-col gap-0.5 text-slate-300">
+          <span class="text-[10px] text-slate-500">Máx. settles abiertos</span>
+          <input type="number" id="acc-max-conc-input" min="1" step="1" value="1"
+            class="w-16 rounded border border-slate-600 bg-slate-950 px-2 py-1 font-mono text-white" />
+        </label>
+        <button type="button" id="acc-risk-apply"
+          class="rounded border border-slate-500 bg-slate-700/50 px-3 py-1.5 text-slate-100 hover:bg-slate-600/60 shrink-0">Guardar riesgo</button>
+        <p id="acc-strategy-snapshot" class="text-[10px] text-slate-500 sm:ml-auto max-w-md leading-relaxed"></p>
+      </div>
+      <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+        <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
+          <p class="text-[10px] uppercase text-slate-500">USDC disponible</p>
+          <p id="acc-usdc-avail" class="text-base font-bold text-emerald-200 mt-0.5">—</p>
+        </div>
+        <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
+          <p class="text-[10px] uppercase text-slate-500">En posiciones</p>
+          <p id="acc-usdc-pos" class="text-base font-bold text-sky-200 mt-0.5">—</p>
+        </div>
+        <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
+          <p class="text-[10px] uppercase text-slate-500">PnL hoy</p>
+          <p id="acc-pnl-today" class="text-base font-bold text-white mt-0.5">—</p>
+          <p id="acc-pnl-today-meta" class="text-[10px] text-slate-500 mt-0.5"></p>
+        </div>
+        <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
+          <p class="text-[10px] uppercase text-slate-500">PnL total (CSV)</p>
+          <p id="acc-pnl-total" class="text-base font-bold text-white mt-0.5">—</p>
+        </div>
+      </div>
+      <details class="rounded-lg border border-slate-700/60 bg-slate-900/30 mt-1 group">
+        <summary
+          class="cursor-pointer list-none px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-slate-800/50 rounded-lg marker:hidden flex items-center justify-between gap-2 [&::-webkit-details-marker]:hidden">
+          <span>📋 Posiciones abiertas (CLOB)</span>
+          <span class="text-[10px] text-slate-500 font-normal group-open:hidden">desplegar</span>
+          <span class="text-[10px] text-slate-500 font-normal hidden group-open:inline">ocultar</span>
+        </summary>
+        <div class="px-2 pb-2 max-h-56 overflow-y-auto overflow-x-auto border-t border-slate-700/50">
+          <table class="min-w-full text-[10px] font-mono text-left">
+            <thead class="text-slate-500 sticky top-0 bg-slate-900/95">
+              <tr>
+                <th class="px-2 py-1.5">Mercado</th>
+                <th class="px-2 py-1.5">Lado</th>
+                <th class="px-2 py-1.5">Cant.</th>
+                <th class="px-2 py-1.5">Valor ~</th>
+                <th class="px-2 py-1.5">Orden</th>
+              </tr>
+            </thead>
+            <tbody id="acc-positions-body" class="divide-y divide-slate-800 text-slate-300"></tbody>
+          </table>
+          <p id="acc-positions-empty" class="text-[10px] text-slate-500 px-2 py-2 hidden">Sin órdenes abiertas o credenciales no disponibles.</p>
+        </div>
+      </details>
+      <p id="acc-panel-msg" class="text-[10px] text-slate-500 font-mono min-h-[1rem]"></p>
+    </section>
+
     <header class="border-b border-slate-700 pb-5">
       <div class="flex items-start gap-4 mb-4">
         <img src="/static/logo.png" alt="" width="44" height="44" class="rounded-xl ring-1 ring-slate-600 shrink-0 bg-slate-800/50 mt-0.5" />
@@ -283,6 +368,285 @@
   <script>
     const SLUG = "crypto_5m_sixcycle";
 
+    function accShortId(s, n) {
+      s = String(s || "");
+      if (s.length <= n) return s || "—";
+      return s.slice(0, Math.floor(n / 2) - 1) + "…" + s.slice(-Math.floor(n / 2) + 1);
+    }
+
+    async function refreshAccountPanel() {
+      var msg = document.getElementById("acc-panel-msg");
+      try {
+        var bR = fetch("/api/account/balance", { cache: "no-store", headers: { Accept: "application/json" } });
+        var pR = fetch("/api/account/pnl", { cache: "no-store", headers: { Accept: "application/json" } });
+        var cR = fetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
+        var posR = fetch("/api/account/positions", { cache: "no-store", headers: { Accept: "application/json" } });
+        var stR = fetch("/api/strategies", { cache: "no-store", headers: { Accept: "application/json" } });
+        var results = await Promise.all([bR, pR, cR, posR, stR]);
+        var b = results[0].ok ? await results[0].json() : {};
+        var p = results[1].ok ? await results[1].json() : {};
+        var pack = results[2].ok ? await results[2].json() : {};
+        var positions = results[3].ok ? await results[3].json() : [];
+        var stratPack = results[4].ok ? await results[4].json() : {};
+        var cfg = pack.config || {};
+        function fmtMoney(x) {
+          if (x == null || !Number.isFinite(Number(x))) return "—";
+          var n = Number(x);
+          return (n >= 0 ? "" : "-") + "$" + Math.abs(n).toFixed(2);
+        }
+        var ea = document.getElementById("acc-usdc-avail");
+        var ep = document.getElementById("acc-usdc-pos");
+        if (ea) ea.textContent = fmtMoney(b.usdc_available);
+        if (ep) ep.textContent = fmtMoney(b.usdc_in_positions);
+        var pToday = document.getElementById("acc-pnl-today");
+        var pTot = document.getElementById("acc-pnl-total");
+        var pMeta = document.getElementById("acc-pnl-today-meta");
+        var pt = Number(p.pnl_today || 0);
+        if (pToday) {
+          pToday.textContent = (pt >= 0 ? "+" : "") + "$" + Math.abs(pt).toFixed(2);
+          pToday.className =
+            "text-base font-bold mt-0.5 " + (pt >= 0 ? "text-emerald-300" : "text-rose-300");
+        }
+        if (pMeta) {
+          var tr = p.trades_today || 0;
+          var wrPct = Math.round(Number(p.win_rate_today || 0) * 100);
+          pMeta.textContent = "(" + tr + " trades, " + wrPct + "% wr hoy)";
+        }
+        var totp = Number(p.pnl_total || 0);
+        if (pTot) {
+          pTot.textContent = (totp >= 0 ? "+" : "") + "$" + Math.abs(totp).toFixed(2);
+          pTot.className =
+            "text-base font-bold mt-0.5 " + (totp >= 0 ? "text-emerald-300" : "text-rose-300");
+        }
+        var envDry = !!pack.dry_run_process_env;
+        var stratDry = !!cfg.dry_run;
+        var eff = envDry || stratDry;
+        var badge = document.getElementById("acc-mode-badge");
+        if (badge) {
+          if (eff) {
+            badge.textContent = "SIMULADO";
+            badge.className =
+              "text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-900/50 text-amber-200 border-amber-700/50";
+          } else {
+            badge.textContent = "LIVE 🔴";
+            badge.className =
+              "text-[10px] font-bold px-2 py-0.5 rounded-full border bg-rose-950/60 text-rose-100 border-rose-600/70";
+          }
+        }
+        var stakeInp = document.getElementById("acc-stake-input");
+        if (stakeInp && document.activeElement !== stakeInp) {
+          stakeInp.value = String(cfg.stake_usdc != null ? cfg.stake_usdc : "1");
+        }
+        var lossInp = document.getElementById("acc-max-loss-input");
+        var concInp = document.getElementById("acc-max-conc-input");
+        if (lossInp && document.activeElement !== lossInp) {
+          lossInp.value = String(cfg.max_daily_loss_usdc != null ? cfg.max_daily_loss_usdc : "20");
+        }
+        if (concInp && document.activeElement !== concInp) {
+          concInp.value = String(cfg.max_concurrent_trades != null ? cfg.max_concurrent_trades : "1");
+        }
+        var posBody = document.getElementById("acc-positions-body");
+        var posEmpty = document.getElementById("acc-positions-empty");
+        if (posBody) {
+          posBody.innerHTML = "";
+          var list = Array.isArray(positions) ? positions : [];
+          var hasErr = list.length === 1 && list[0] && list[0].error;
+          if (hasErr) {
+            if (posEmpty) {
+              posEmpty.textContent = "Posiciones: " + String(list[0].error);
+              posEmpty.classList.remove("hidden");
+            }
+          } else if (!list.length) {
+            if (posEmpty) {
+              posEmpty.textContent = "Sin órdenes abiertas.";
+              posEmpty.classList.remove("hidden");
+            }
+          } else {
+            if (posEmpty) posEmpty.classList.add("hidden");
+            list.forEach(function (row) {
+              if (!row || row.error) return;
+              var tr = document.createElement("tr");
+              tr.innerHTML =
+                "<td class=\"px-2 py-1 break-all\" title=\"" +
+                String(row.market_id || "") +
+                "\">" +
+                accShortId(row.market_id, 22) +
+                "</td><td class=\"px-2 py-1\">" +
+                String(row.side || "—") +
+                "</td><td class=\"px-2 py-1\">" +
+                (row.amount != null ? Number(row.amount).toFixed(4) : "—") +
+                "</td><td class=\"px-2 py-1\">" +
+                (row.current_value != null ? "$" + Number(row.current_value).toFixed(2) : "—") +
+                "</td><td class=\"px-2 py-1 break-all text-slate-500\">" +
+                accShortId(row.order_id, 18) +
+                "</td>";
+              posBody.appendChild(tr);
+            });
+          }
+        }
+        var snap = document.getElementById("acc-strategy-snapshot");
+        if (snap) {
+          var rows = (stratPack.strategies || []).filter(function (x) {
+            return x && x.slug === SLUG;
+          });
+          var s0 = rows[0] || {};
+          var ph = s0.pnl_hoy != null ? Number(s0.pnl_hoy).toFixed(2) : "0";
+          var th = s0.trades_hoy != null ? s0.trades_hoy : 0;
+          var wrStr = "—";
+          if (s0.win_rate_hoy != null && s0.win_rate_hoy !== "") {
+            var wrn = Number(s0.win_rate_hoy);
+            if (Number.isFinite(wrn)) wrStr = String(Math.round(wrn * 100)) + "%";
+          }
+          snap.textContent =
+            "Sixcycle (CSV hoy): PnL " +
+            (Number(ph) >= 0 ? "+" : "") +
+            ph +
+            " USDC · " +
+            th +
+            " trades · wr " +
+            wrStr +
+            " · motor " +
+            (s0.enabled ? "EN MARCHA" : "PARADO");
+        }
+        var knob = document.getElementById("acc-dry-run-knob");
+        var wrap = document.getElementById("acc-dry-run-toggle");
+        if (knob && wrap) {
+          var onDry = stratDry;
+          wrap.setAttribute("aria-checked", onDry ? "true" : "false");
+          knob.style.transform = onDry ? "translateX(0.15rem)" : "translateX(1.25rem)";
+          wrap.className =
+            "relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border transition " +
+            (onDry ? "border-amber-600 bg-amber-900/40" : "border-rose-600 bg-rose-900/40");
+        }
+        if (msg) {
+          msg.textContent = b.error ? "Balance: " + b.error : envDry ? "Proceso en DRY_RUN global: órdenes reales bloqueadas." : "";
+          msg.className = "text-[10px] font-mono min-h-[1rem] " + (b.error ? "text-amber-400" : "text-slate-500");
+        }
+      } catch (err) {
+        if (msg) {
+          msg.textContent = String(err);
+          msg.className = "text-[10px] font-mono text-rose-400 min-h-[1rem]";
+        }
+      }
+    }
+
+    var accDryToggle = document.getElementById("acc-dry-run-toggle");
+    if (accDryToggle) {
+      accDryToggle.addEventListener("click", async function () {
+        var msg = document.getElementById("acc-panel-msg");
+        try {
+          var cR = await fetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
+          if (!cR.ok) return;
+          var pack = await cR.json();
+          var cur = !!(pack.config && pack.config.dry_run);
+          var next = !cur;
+          var body = { dry_run: next };
+          if (!next && pack.dry_run_process_env) {
+            if (
+              !confirm(
+                "El proceso tiene DRY_RUN=true en entorno. ¿Persistir dry_run=false (confirm_live) con motor parado?"
+              )
+            )
+              return;
+            body.confirm_live = true;
+          }
+          var r = await fetch("/api/sixcycle/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify(body),
+          });
+          var j = await r.json().catch(function () {
+            return {};
+          });
+          if (!r.ok) {
+            if (msg) {
+              msg.textContent = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
+              msg.className = "text-[10px] font-mono text-rose-400";
+            }
+            return;
+          }
+          await refreshAccountPanel();
+          await loadSixcycleConfigUi();
+        } catch (err) {
+          if (msg) msg.textContent = String(err);
+        }
+      });
+    }
+    var accRiskApply = document.getElementById("acc-risk-apply");
+    if (accRiskApply) {
+      accRiskApply.addEventListener("click", async function (e) {
+        e.preventDefault();
+        var lossInp = document.getElementById("acc-max-loss-input");
+        var concInp = document.getElementById("acc-max-conc-input");
+        var msg = document.getElementById("acc-panel-msg");
+        if (!lossInp || !concInp) return;
+        var loss = parseFloat(String(lossInp.value).replace(",", "."));
+        var conc = parseInt(String(concInp.value).replace(",", "."), 10);
+        if (!Number.isFinite(loss) || loss < 0.01) {
+          if (msg) msg.textContent = "Pérdida máx. día ≥ 0.01";
+          return;
+        }
+        if (!Number.isFinite(conc) || conc < 1) {
+          if (msg) msg.textContent = "Concurrentes ≥ 1 entero";
+          return;
+        }
+        try {
+          var r = await fetch("/api/sixcycle/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ max_daily_loss_usdc: loss, max_concurrent_trades: conc }),
+          });
+          var j = await r.json().catch(function () {
+            return {};
+          });
+          if (!r.ok) {
+            if (msg) msg.textContent = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
+            return;
+          }
+          if (msg) msg.textContent = "Riesgo guardado";
+          await refreshAccountPanel();
+          await loadSixcycleConfigUi();
+        } catch (err) {
+          if (msg) msg.textContent = String(err);
+        }
+      });
+    }
+    var accStakeApply = document.getElementById("acc-stake-apply");
+    if (accStakeApply) {
+      accStakeApply.addEventListener("click", async function (e) {
+        e.preventDefault();
+        var inp = document.getElementById("acc-stake-input");
+        var msg = document.getElementById("acc-panel-msg");
+        if (!inp) return;
+        var v = parseFloat(String(inp.value).replace(",", "."));
+        if (!Number.isFinite(v) || v < 0.01) {
+          if (msg) msg.textContent = "Stake mínimo 0.01 USDC";
+          return;
+        }
+        try {
+          var r = await fetch("/api/sixcycle/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ stake_usdc: v }),
+          });
+          var j = await r.json().catch(function () {
+            return {};
+          });
+          if (!r.ok) {
+            if (msg) msg.textContent = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
+            return;
+          }
+          if (msg) msg.textContent = "Stake guardado";
+          await refreshAccountPanel();
+          await loadSixcycleConfigUi();
+        } catch (err) {
+          if (msg) msg.textContent = String(err);
+        }
+      });
+    }
+    refreshAccountPanel();
+    setInterval(refreshAccountPanel, 30000);
+
     const motorBanner = document.getElementById("lv-motor-banner");
     function updateMotorButtons(on) {
       var en = document.getElementById("btn-enable");
@@ -517,6 +881,7 @@
           }
           await loadSixcycleConfigUi();
           await pollSixcycleEnabled();
+          await refreshAccountPanel();
           await refresh();
         } catch (err) {
           if (fb) {

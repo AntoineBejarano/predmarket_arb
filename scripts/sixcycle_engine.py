@@ -61,6 +61,7 @@ from lab.market_scorer import MarketScorer  # noqa: E402
 from lab.paths import data_dir  # noqa: E402
 from scripts.clob_signal_filter import CLOBSignalFilter  # noqa: E402
 from scripts import sixcycle_config_store as _sixcycle_cfg  # noqa: E402
+from scripts.polymarket_client import get_polymarket_client  # noqa: E402
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
 # En DRY_RUN: factor sobre el stake Kelly (p. ej. 100 → apuestas y PnL ×100 en paper). No aplica en LIVE.
@@ -537,6 +538,8 @@ class SixCycleEngine:
         self._last_scan_focus_market_id: str | None = None
         self._config: dict[str, Any] = dict(_sixcycle_cfg.DEFAULT_SIXCYCLE_CONFIG)
         self._dry_run_effective = bool(DRY_RUN)
+        self._daily_pnl_usdc: float = 0.0
+        self._daily_pnl_date_utc: datetime | None = None
         self.reload_config()
         self._ensure_csv_header()
 
@@ -547,6 +550,22 @@ class SixCycleEngine:
             self._dry_run_effective = True
         else:
             self._dry_run_effective = bool(self._config.get("dry_run", False))
+
+    def _maybe_reset_daily_pnl_utc(self) -> None:
+        """Reinicia contador de PnL diario (UTC) para circuit breaker."""
+        now = datetime.now(timezone.utc).date()
+        if self._daily_pnl_date_utc != now:
+            self._daily_pnl_date_utc = now
+            self._daily_pnl_usdc = 0.0
+
+    def _record_settled_daily_pnl(self, pnl: float, resolved: str) -> None:
+        if resolved not in ("win", "loss"):
+            return
+        self._maybe_reset_daily_pnl_utc()
+        self._daily_pnl_usdc += float(pnl)
+
+    def _open_settle_task_count(self) -> int:
+        return sum(1 for t in self._settle_tasks if not t.done())
 
     def _extreme_yes(self, clob_yes: float | None) -> Literal["UP", "DOWN", "NEUTRAL"]:
         return clob_extreme_from_levels(
@@ -1286,9 +1305,34 @@ class SixCycleEngine:
                                 )
                                 continue
 
+                            self._maybe_reset_daily_pnl_utc()
+                            loss_limit = float(self._config["max_daily_loss_usdc"])
+                            if self._daily_pnl_usdc < -loss_limit:
+                                log.warning(
+                                    "Circuit breaker: pérdida diaria %.2f USDC supera límite %.2f — no fill",
+                                    self._daily_pnl_usdc,
+                                    loss_limit,
+                                )
+                                self._last_signal_line = (
+                                    f"Circuit breaker: pérdida diaria {self._daily_pnl_usdc:.2f} > límite {loss_limit:.2f}"
+                                )
+                                continue
+                            max_ct = int(self._config["max_concurrent_trades"])
+                            open_settles = self._open_settle_task_count()
+                            if open_settles >= max_ct:
+                                log.warning(
+                                    "max_concurrent_trades=%s con settles abiertos=%s — no fill",
+                                    max_ct,
+                                    open_settles,
+                                )
+                                self._last_signal_line = (
+                                    f"Límite posiciones abiertas ({open_settles}/{max_ct})"
+                                )
+                                continue
+
                             try:
                                 t_sz = time.perf_counter()
-                                stake = self.cycle_size(float(val["edge"]))
+                                stake = float(self._config["stake_usdc"])
                                 if DRY_RUN:
                                     mult = float(get_dry_run_stake_multiplier())
                                     stake = float(stake) * mult
@@ -1752,32 +1796,41 @@ class SixCycleEngine:
         clob: PolyCLOBClient,
     ) -> dict[str, Any]:
         """
-        DRY_RUN: simular fill. LIVE: POST /order (sin reintentos aquí).
+        DRY_RUN: simular fill. LIVE: ``py-clob-client`` (cuenta centralizada JSON).
         """
-        _ = market_id
-        _ = direction
+        _ = token_id
+        _ = clob
+        pm = get_polymarket_client(bool(self._config.get("dry_run", True)))
+        fill_px = float(clob_yes_price)
+        dir_s = str(direction or "YES").upper()
+
         if self._dry_run_effective:
             log.info(
                 "[DRY_RUN] fill simulado",
-                extra={"token": token_id[:16], "stake": stake_usdc, "price": clob_yes_price},
+                extra={"token": token_id[:16], "stake": stake_usdc, "price": fill_px},
             )
             return {
                 "filled": True,
-                "price": float(clob_yes_price),
+                "price": fill_px,
                 "order_id": "",
                 "simulated": True,
             }
         try:
-            out = await clob.place_order(
-                token_id=str(token_id),
-                side="BUY",
-                price=float(clob_yes_price),
-                size_usdc=float(stake_usdc),
-            )
-            oid = str(out.get("orderID") or out.get("order_id") or out.get("id") or "")
+
+            def _place() -> dict[str, Any]:
+                return pm.place_order(
+                    market_id=str(market_id).strip(),
+                    side=dir_s,
+                    amount_usdc=float(stake_usdc),
+                    price=fill_px,
+                )
+
+            out = await asyncio.to_thread(_place)
+            ok = bool(out.get("success"))
+            oid = str(out.get("order_id") or "")
             return {
-                "filled": True,
-                "price": float(clob_yes_price),
+                "filled": ok,
+                "price": float(out.get("price", fill_px)),
                 "order_id": oid,
                 "simulated": False,
             }
@@ -1923,6 +1976,7 @@ class SixCycleEngine:
                     self.win_streak = 0
                 self.trades += 1
                 self.pnl_usdc += pnl
+                self._record_settled_daily_pnl(float(pnl), str(resolved))
                 self._console.print(
                     Panel.fit(
                         f"[settle] {market_id} {resolved} pnl={pnl:.4f} USDC",

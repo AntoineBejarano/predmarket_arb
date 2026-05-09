@@ -37,6 +37,9 @@ DEFAULT_SIXCYCLE_CONFIG: dict[str, Any] = {
     "min_edge": 0.05,
     "max_stake_usdc": 5.0,
     "kelly_fraction": 0.25,
+    "stake_usdc": 1.0,
+    "max_daily_loss_usdc": 20.0,
+    "max_concurrent_trades": 1,
     "dry_run": True,
     "enabled": True,
 }
@@ -61,6 +64,19 @@ SCHEMA: dict[str, dict[str, Any]] = {
     "min_edge": {"type": "float", "min": 0.001, "max": 0.5, "description": "Edge mínimo CLOBSignalFilter"},
     "max_stake_usdc": {"type": "float", "min": 0.01, "max": 1e7, "description": "Tope capital Kelly (USDC)"},
     "kelly_fraction": {"type": "float", "min": 0.001, "max": 1.0, "description": "Fracción Kelly"},
+    "stake_usdc": {"type": "float", "min": 0.01, "max": 1e7, "description": "Notional USDC por fill (override Kelly)"},
+    "max_daily_loss_usdc": {
+        "type": "float",
+        "min": 0.01,
+        "max": 1e9,
+        "description": "Circuit breaker: pérdida diaria máx. (USDC) antes de vetar fills",
+    },
+    "max_concurrent_trades": {
+        "type": "int",
+        "min": 1,
+        "max": 100,
+        "description": "Máx. settles simultáneos / posiciones abiertas por motor",
+    },
     "dry_run": {"type": "bool", "description": "Paper: sin órdenes reales (ver restricciones LIVE)"},
     "enabled": {"type": "bool", "description": "Espejo deseado; estado vivo en strategy_state"},
 }
@@ -145,6 +161,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ValueError("min_edge debe estar en (0.001, 0.5)")
     if float(c["max_stake_usdc"]) <= 0 or float(c["kelly_fraction"]) <= 0:
         raise ValueError("max_stake_usdc y kelly_fraction deben ser positivos")
+    if float(c["stake_usdc"]) <= 0:
+        raise ValueError("stake_usdc debe ser > 0")
+    if float(c["max_daily_loss_usdc"]) <= 0:
+        raise ValueError("max_daily_loss_usdc debe ser > 0")
+    if int(c["max_concurrent_trades"]) < 1:
+        raise ValueError("max_concurrent_trades debe ser >= 1")
     if not isinstance(c.get("dry_run"), bool):
         raise ValueError("dry_run debe ser booleano")
     if not isinstance(c.get("enabled"), bool):

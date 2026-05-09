@@ -17,6 +17,7 @@ dependencies = [
     "websockets>=12.0",
     "eth-account>=0.13.0",
     "py-order-utils>=0.3.2",
+    "py-clob-client>=0.34.0",
     "numpy>=1.24.0",
     "rich>=13.0.0",
     "joblib>=1.3.0",
