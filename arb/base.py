@@ -71,6 +71,12 @@ class ArbStrategy(ABC):
             out.setdefault(k, "")
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.all_csv_columns, extrasaction="ignore").writerow(out)
+        try:
+            from persistence.writes import append_arb_event
+
+            append_arb_event(self.slug, out)
+        except Exception:
+            pass
 
     async def log_signal_async(self, row: dict[str, Any]) -> None:
         """Igual que log_signal pero enriquece capital ficticio (paper) si hay state_manager."""

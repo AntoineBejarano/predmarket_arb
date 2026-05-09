@@ -213,6 +213,16 @@ def signals_path() -> Path:
 
 
 def read_signals_df() -> pd.DataFrame:
+    from persistence.config import primary_store_postgres
+    from persistence.readers import load_signals_dataframe_from_postgres
+
+    if primary_store_postgres():
+        try:
+            dfp = load_signals_dataframe_from_postgres()
+            if not dfp.empty:
+                return dfp
+        except Exception:
+            log.exception("read_signals_df: fallo leyendo Postgres; fallback CSV")
     p = signals_path()
     if not p.is_file():
         return pd.DataFrame()
@@ -1505,6 +1515,18 @@ def _dashboard_auth_info() -> dict[str, Any]:
     }
 
 
+def _persistence_public_status() -> dict[str, Any]:
+    from persistence import write_stats_snapshot
+    from persistence.config import database_url, persistence_active_for_writes, primary_store_postgres
+
+    return {
+        "database_configured": bool(database_url()),
+        "supabase_writes": persistence_active_for_writes(),
+        "primary_store_postgres": primary_store_postgres(),
+        **write_stats_snapshot(),
+    }
+
+
 def _dashboard_account_csv_sync() -> dict[str, Any]:
     from scripts import account_metrics as am
 
@@ -1539,6 +1561,7 @@ async def api_dashboard_summary() -> JSONResponse:
         "arb_engine": {
             "running": running,
             "dry_run": ARB_ENGINE_DRY_RUN,
+            "poly_clob_l2_configured": _poly_clob_l2_env_configured(),
             "paper_pnl_eur_total": round(tot_pnl, 4),
             "paper_capital_eur_total": round(tot_cap, 2),
             "paper_roi_blended": round(roi_blend, 6),
@@ -1554,11 +1577,18 @@ async def api_dashboard_summary() -> JSONResponse:
             ],
         },
         "account_csv": acc,
+        "persistence": _persistence_public_status(),
     }
     return JSONResponse(
         content=payload,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
     )
+
+
+@app.get("/api/persistence/status")
+async def api_persistence_status() -> dict[str, Any]:
+    """Diagnóstico de dual-write Postgres (sin secretos)."""
+    return _persistence_public_status()
 
 
 @app.get("/api/arb/status")
@@ -1572,6 +1602,7 @@ async def arb_status() -> JSONResponse:
     payload = {
         "engine_running": running,
         "dry_run": ARB_ENGINE_DRY_RUN,
+        "poly_clob_l2_configured": _poly_clob_l2_env_configured(),
         "strategies": strategies,
         # Diagnóstico: CSV de arb viven bajo DATA_DIR; strategy_state sigue en data/ del repo (ver risk/strategy_state.py).
         "data_dir": str(DATA_DIR),
@@ -1937,6 +1968,16 @@ async def api_sixcycle_status() -> JSONResponse:
         payload = dict(six_mod.SIXCYCLE_STATE)
     await asyncio.to_thread(_sixcycle_merge_csv_kpis_into_payload, payload)
     return JSONResponse(content=payload)
+
+
+def _poly_clob_l2_env_configured() -> bool:
+    """True si las cuatro credenciales L2 están en env (no valida contra el CLOB)."""
+    return bool(
+        os.getenv("POLY_API_KEY", "").strip()
+        and os.getenv("POLY_API_SECRET", "").strip()
+        and os.getenv("POLY_PASSPHRASE", "").strip()
+        and os.getenv("POLY_PRIVATE_KEY", "").strip()
+    )
 
 
 def _env_dry_run_global() -> bool:

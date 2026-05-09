@@ -102,6 +102,12 @@ class StrategyStateManager:
     def _save(self) -> None:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+        try:
+            from persistence.writes import upsert_strategy_state
+
+            upsert_strategy_state(dict(self._state))
+        except Exception:
+            pass
 
     def _reload_if_file(self) -> None:
         if STATE_FILE.exists():

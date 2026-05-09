@@ -559,6 +559,12 @@ def append_signals_row(row: dict[str, Any]) -> None:
                 if header:
                     f.write(",".join(CSV_COLUMNS) + "\n")
                 f.write(line)
+            try:
+                from persistence.writes import append_validator_signal
+
+                append_validator_signal(row)
+            except Exception:
+                pass
             return
         except OSError as e:
             log.error("CSV write intento %s/%s: %s", attempt + 1, CSV_WRITE_RETRIES, e)
@@ -608,6 +614,12 @@ def update_csv_results_for_condition(condition_id: str, result: str) -> None:
             tmp = SIGNALS_CSV.with_suffix(".tmp")
             df.to_csv(tmp, index=False)
             tmp.replace(SIGNALS_CSV)
+            try:
+                from persistence.writes import update_validator_signals_result
+
+                update_validator_signals_result(condition_id, result)
+            except Exception:
+                pass
             return
         except Exception as e:
             log.error("update_csv_results intento %s: %s", attempt + 1, e)

@@ -41,6 +41,26 @@
       <a href="/arb/strategy/latency_arb_sports" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Latency sports</a>
     </nav>
 
+    <section class="rounded-xl border border-cyan-900/45 bg-cyan-950/25 p-5 space-y-3">
+      <h2 class="text-lg font-semibold text-cyan-100">Polymarket — credenciales del CLOB</h2>
+      <p class="text-sm text-slate-300 leading-relaxed">
+        <strong class="text-slate-200">No hay formulario en esta web</strong> para API key, secret, passphrase ni clave privada:
+        van solo en el <strong class="text-slate-200">entorno del servidor</strong> (Railway / Docker / fichero <code class="text-slate-400">.env</code> local), nunca en el navegador.
+      </p>
+      <ul class="text-sm text-slate-400 list-disc pl-5 space-y-1.5">
+        <li>
+          Variables: <code class="text-slate-300">POLY_API_KEY</code>,
+          <code class="text-slate-300">POLY_API_SECRET</code>,
+          <code class="text-slate-300">POLY_PASSPHRASE</code>,
+          <code class="text-slate-300">POLY_PRIVATE_KEY</code> (wallet). Opcionales: <code class="text-slate-300">POLY_FUNDER</code>, <code class="text-slate-300">POLY_SIGNATURE_TYPE</code>.
+        </li>
+        <li>Plantilla: copia <code class="text-slate-300">.env.example</code> → <code class="text-slate-300">.env</code> y rellena esas claves ahí.</li>
+        <li>Órdenes reales: además <code class="text-slate-300">DRY_RUN=false</code> y reiniciar el API / motor.</li>
+        <li>En local puedes derivar las credenciales L2 con: <code class="text-slate-300">python scripts/derive_polymarket_clob_api_key.py</code></li>
+      </ul>
+      <p id="polyL2HomeLine" class="text-sm font-mono text-slate-500">Comprobando entorno del servidor…</p>
+    </section>
+
     <section id="summarySection" class="space-y-4">
       <h2 class="text-lg font-semibold text-white">Resumen rápido</h2>
       <p id="summaryError" class="hidden text-sm text-red-400"></p>
@@ -155,6 +175,16 @@
 
         document.getElementById("valArbRunning").textContent = arb.running ? "EN MARCHA" : "PARADO";
         document.getElementById("valArbDry").textContent = arb.dry_run ? "DRY_RUN" : "LIVE (CLOB)";
+
+        const pl2 = document.getElementById("polyL2HomeLine");
+        if (pl2) {
+          const ok = arb.poly_clob_l2_configured === true;
+          pl2.textContent = ok
+            ? "Estado del servidor: las cuatro variables POLY_* L2 están definidas (los valores no se muestran en la UI)."
+            : "Estado del servidor: faltan o están vacías una o más variables POLY_* — el CLOB en vivo no estará disponible hasta configurarlas en el entorno.";
+          pl2.className =
+            "text-sm font-mono " + (ok ? "text-emerald-400/95" : "text-amber-300/95");
+        }
 
         const auth = d.auth || {};
         const ab = document.getElementById("authBlurb");

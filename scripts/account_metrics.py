@@ -38,6 +38,14 @@ def _float_cell(x: Any) -> float | None:
 
 def per_slug_pnl_today(log_dir: Path) -> dict[str, dict[str, Any]]:
     """PnL agregado hoy (UTC) por slug de CSV bajo ``log_dir``."""
+    from persistence.config import primary_store_postgres
+    from persistence.readers import per_slug_pnl_today_from_postgres
+
+    if primary_store_postgres():
+        pg = per_slug_pnl_today_from_postgres()
+        if pg is not None:
+            return pg
+
     today = datetime.now(timezone.utc).date()
     out: dict[str, dict[str, Any]] = {}
     if not log_dir.is_dir():
@@ -99,6 +107,14 @@ def aggregate_pnl_from_strategy_logs(
     - ``crypto_5m_sixcycle``: filas ``phase=SETTLED`` y ``resolved`` win/loss, columna ``pnl_usdc``.
     - Otras estrategias: columna ``fict_pnl_est_eur`` si existe, timestamp ``ts``.
     """
+    from persistence.config import primary_store_postgres
+    from persistence.readers import aggregate_pnl_from_postgres
+
+    if primary_store_postgres():
+        pg = aggregate_pnl_from_postgres()
+        if pg is not None:
+            return pg
+
     today = datetime.now(timezone.utc).date()
     pnl_today = 0.0
     pnl_total = 0.0

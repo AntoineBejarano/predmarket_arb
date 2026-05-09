@@ -1013,9 +1013,16 @@ class SixCycleEngine:
 
     async def _append_csv(self, row: dict[str, Any]) -> None:
         async with self._csv_lock:
+            out_row = {k: row.get(k, "") for k in CSV_COLUMNS}
             with self._csv_path.open("a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-                w.writerow({k: row.get(k, "") for k in CSV_COLUMNS})
+                w.writerow(out_row)
+            try:
+                from persistence.writes import append_sixcycle_row
+
+                append_sixcycle_row(dict(out_row))
+            except Exception:
+                pass
 
     def _csv_bool(self, v: Any) -> str:
         if v is True or str(v).lower() in ("true", "1", "yes"):

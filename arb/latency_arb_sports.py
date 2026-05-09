@@ -2286,6 +2286,12 @@ class LatencyArbSportsStrategy(ArbStrategy):
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            try:
+                from persistence.writes import append_latency_cycle_snapshot
+
+                append_latency_cycle_snapshot(payload)
+            except Exception:
+                pass
         except OSError as e:
             log.debug("[latency_arb_sports] cycle metrics json: %s", e)
 

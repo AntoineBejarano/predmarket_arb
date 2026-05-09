@@ -53,6 +53,19 @@
             Cada tarjeta: interruptor = estrategia <strong class="text-slate-400">habilitada</strong> (solo esas corren dentro del motor).
             Start/Stop = proceso <strong class="text-slate-400">arb_engine</strong>. Con otra pestaña en detalle de estrategia, el estado se sincroniza al instante.
           </p>
+          <div class="mt-3 max-w-2xl rounded-lg border border-cyan-900/40 bg-cyan-950/20 px-3 py-2.5 space-y-1.5">
+            <p class="text-xs font-medium text-cyan-200/90">Credenciales Polymarket (CLOB)</p>
+            <p class="text-[11px] text-slate-400 leading-relaxed">
+              No se configuran en esta página. En el servidor (Railway / <code class="text-slate-500">.env</code>):
+              <code class="text-slate-400">POLY_API_KEY</code>,
+              <code class="text-slate-400">POLY_API_SECRET</code>,
+              <code class="text-slate-400">POLY_PASSPHRASE</code>,
+              <code class="text-slate-400">POLY_PRIVATE_KEY</code>.
+              Órdenes reales: <code class="text-slate-400">DRY_RUN=false</code>.
+              Ver también <a href="/" class="text-indigo-400 hover:underline">Inicio</a> (bloque Polymarket).
+            </p>
+            <p id="polyL2ArbLine" class="text-[11px] font-mono text-slate-500">Comprobando variables en el servidor…</p>
+          </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <button type="button" onclick="arbStart()"
@@ -437,6 +450,16 @@
         db.className = "text-xs font-medium px-2 py-0.5 rounded-full " + (data.dry_run
           ? "bg-emerald-900/60 text-emerald-200"
           : "bg-red-900/60 text-red-200");
+      }
+      const pl2 = document.getElementById("polyL2ArbLine");
+      if (pl2 && Object.prototype.hasOwnProperty.call(data, "poly_clob_l2_configured")) {
+        if (data.poly_clob_l2_configured) {
+          pl2.textContent = "Servidor: variables L2 POLY_* presentes (no se muestran aquí).";
+          pl2.className = "text-[11px] font-mono text-emerald-400/90";
+        } else {
+          pl2.textContent = "Servidor: faltan o vacías POLY_API_KEY / SECRET / PASSPHRASE / PRIVATE_KEY.";
+          pl2.className = "text-[11px] font-mono text-amber-300/90";
+        }
       }
       renderCards(data);
       for (const slug of Object.keys(_logVisible)) {
