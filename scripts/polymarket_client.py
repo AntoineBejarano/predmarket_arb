@@ -1,7 +1,14 @@
 """
 Cliente singleton de cuenta Polymarket (CLOB) vía ``py-clob-client``.
 
-Credenciales: ``data/polymarket_account.json`` (no versionar; ver ``.gitignore``).
+Credenciales L2 (mismo significado que en el resto del repo):
+
+- Archivo ``<DATA_DIR>/polymarket_account.json`` con claves
+  ``api_key``, ``api_secret``, ``api_passphrase``, ``private_key``, o
+- Variables de entorno ``POLY_API_KEY``, ``POLY_API_SECRET``,
+  ``POLY_PASSPHRASE``, ``POLY_PRIVATE_KEY`` (p. ej. ``.env`` / Railway).
+
+Por cada campo se usa el JSON si viene relleno; si no, el valor del env.
 Nunca loguear ``api_secret`` ni ``private_key``.
 """
 
@@ -48,6 +55,26 @@ def _normalize_hex_key(key: str) -> str:
     return s
 
 
+def _pick_cred(acc: dict[str, Any], json_key: str, env_key: str) -> str:
+    """Valor del JSON si no está vacío; si no, del entorno."""
+    raw = acc.get(json_key)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+    return os.getenv(env_key, "").strip()
+
+
+def _clob_credential_bundle() -> dict[str, str]:
+    """api_key / api_secret / api_passphrase / private_key (hex normalizado)."""
+    acc = _load_account_file()
+    pk_raw = _pick_cred(acc, "private_key", "POLY_PRIVATE_KEY")
+    return {
+        "private_key": _normalize_hex_key(pk_raw),
+        "api_key": _pick_cred(acc, "api_key", "POLY_API_KEY"),
+        "api_secret": _pick_cred(acc, "api_secret", "POLY_API_SECRET"),
+        "api_passphrase": _pick_cred(acc, "api_passphrase", "POLY_PASSPHRASE"),
+    }
+
+
 def _load_account_file() -> dict[str, Any]:
     global _LOADED
     with _LOCK:
@@ -72,15 +99,25 @@ def _get_clob_client() -> Any:
     with _LOCK:
         if _CLOB_CLIENT is not None:
             return _CLOB_CLIENT
-        acc = _load_account_file()
-        pk = _normalize_hex_key(str(acc.get("private_key", "") or ""))
-        api_key = str(acc.get("api_key", "") or "").strip()
-        api_secret = str(acc.get("api_secret", "") or "").strip()
-        api_pass = str(acc.get("api_passphrase", "") or "").strip()
+        creds = _clob_credential_bundle()
+        pk = creds["private_key"]
+        api_key = creds["api_key"]
+        api_secret = creds["api_secret"]
+        api_pass = creds["api_passphrase"]
         if not pk or not api_key or not api_secret or not api_pass:
             raise RuntimeError(
-                "Faltan credenciales en polymarket_account.json "
-                "(api_key, api_secret, api_passphrase, private_key)"
+                "Faltan credenciales CLOB L2: rellena "
+                f"{_ACCOUNT_PATH} (api_key, api_secret, api_passphrase, private_key) "
+                "o las variables de entorno POLY_API_KEY, POLY_API_SECRET, "
+                "POLY_PASSPHRASE y POLY_PRIVATE_KEY (p. ej. en .env)."
+            )
+        acc_file = _load_account_file()
+        keys_j = ("private_key", "api_key", "api_secret", "api_passphrase")
+        file_complete = all(str(acc_file.get(k) or "").strip() for k in keys_j)
+        if not file_complete and pk and api_key and api_secret and api_pass:
+            log.info(
+                "Credenciales CLOB para py-clob-client: POLY_* del entorno completan o sustituyen %s.",
+                _ACCOUNT_PATH,
             )
         try:
             from py_clob_client.client import ClobClient
@@ -333,7 +370,7 @@ def get_live_account_client() -> "PolymarketLiveAccount":
 
 
 class PolymarketLiveAccount:
-    """Lecturas L2 siempre sobre la misma cuenta (credenciales JSON)."""
+    """Lecturas L2 siempre sobre la misma cuenta (JSON y/o variables POLY_*)."""
 
     def get_balance(self) -> dict[str, Any]:
         try:
