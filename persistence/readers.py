@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from persistence.config import database_url
+from persistence.config import database_url, primary_store_postgres
 from persistence.pool import get_pool
 
 log = logging.getLogger("persistence.readers")
@@ -194,5 +194,124 @@ def aggregate_pnl_from_postgres() -> dict[str, Any] | None:
         "trades_total": int(trades_total),
         "win_rate_total": round((wins_total / trades_total) if trades_total else 0.0, 4),
     }
+
+
+def _sixcycle_kpis_engine_style_from_rows(chrono_oldest_first: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Última fila con ``trades_total`` en la ventana final (misma idea que el tail del CSV engine)."""
+    if not chrono_oldest_first:
+        return None
+    tail = chrono_oldest_first[-300:] if len(chrono_oldest_first) > 300 else chrono_oldest_first
+    for r in reversed(tail):
+        raw = str(r.get("trades_total", "") or "").strip()
+        if not raw:
+            continue
+        try:
+            trades = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if trades <= 0:
+            continue
+        wr_s = str(r.get("win_rate_pct", "") or "0").replace("%", "").strip()
+        try:
+            win_rate = float(wr_s)
+        except (TypeError, ValueError):
+            win_rate = 0.0
+        try:
+            pnl = float(str(r.get("pnl_cumulative_usdc", "") or "0").strip() or "0")
+        except (TypeError, ValueError):
+            pnl = 0.0
+        try:
+            streak = int(float(str(r.get("win_streak", "") or "0").strip() or "0"))
+        except (TypeError, ValueError):
+            streak = 0
+        return {
+            "trades": trades,
+            "win_rate": round(win_rate, 2),
+            "pnl_usdc": round(pnl, 6),
+            "win_streak": streak,
+        }
+    return None
+
+
+def _sixcycle_kpis_signals_style_from_rows(chrono_oldest_first: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Un settle por ``market_id`` (última fila win/loss por timestamp), alineado con ``sixcycle_signals.csv``."""
+    by_market: dict[str, dict[str, Any]] = {}
+    for r in chrono_oldest_first:
+        mid = str(r.get("market_id") or "").strip()
+        if not mid:
+            continue
+        res = str(r.get("resolved") or "").lower().strip()
+        if res not in ("win", "loss"):
+            continue
+        ts = str(r.get("timestamp_utc") or r.get("timestamp") or "")
+        prev = by_market.get(mid)
+        if prev is None or str(prev.get("_ts") or "") <= ts:
+            nr = dict(r)
+            nr["_ts"] = ts
+            by_market[mid] = nr
+    if not by_market:
+        return None
+    settled = sorted(by_market.values(), key=lambda x: str(x.get("_ts") or ""))
+    trades = len(settled)
+    wins = sum(1 for r in settled if str(r.get("resolved") or "").lower() == "win")
+    wr = (100.0 * wins / trades) if trades else 0.0
+    pnl = 0.0
+    for r in settled:
+        try:
+            pnl += float(r.get("pnl_usdc") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    streak_end = 0
+    for r in reversed(settled):
+        if str(r.get("resolved") or "").lower() == "win":
+            streak_end += 1
+        else:
+            break
+    return {
+        "trades": trades,
+        "win_rate": round(wr, 2),
+        "pnl_usdc": round(pnl, 6),
+        "win_streak": streak_end,
+    }
+
+
+def sixcycle_sse_kpis_from_postgres() -> dict[str, Any] | None:
+    """
+    KPIs para ``/api/sixcycle/live`` leyendo solo ``sixcycle_engine_rows`` (sin CSV).
+
+    Solo aplica con ``PRIMARY_STORE=postgres`` y pool disponible. Si la tabla está vacía,
+    devuelve contadores a cero (el caller puede conservar memoria si va por delante del flush).
+    """
+    if not primary_store_postgres():
+        return None
+    pool = get_pool()
+    if pool is None:
+        return None
+    try:
+        with pool.connection() as conn:
+            cur = conn.execute(
+                "SELECT payload FROM sixcycle_engine_rows ORDER BY id DESC LIMIT %s",
+                (20_000,),
+            )
+            batch = [dict(pl) if isinstance(pl, dict) else {} for (pl,) in cur]
+    except Exception as e:
+        log.warning("sixcycle_sse_kpis_from_postgres: %s", e)
+        return None
+    if not batch:
+        return {"trades": 0, "win_rate": 0.0, "pnl_usdc": 0.0, "win_streak": 0}
+    chrono = list(reversed(batch))
+    eng = _sixcycle_kpis_engine_style_from_rows(chrono)
+    sig = _sixcycle_kpis_signals_style_from_rows(chrono)
+    best_t = -1
+    best: dict[str, Any] | None = None
+    for cand in (eng, sig):
+        if cand is None:
+            continue
+        t = int(cand.get("trades") or 0)
+        if t > best_t:
+            best_t, best = t, cand
+    if best is None:
+        return {"trades": 0, "win_rate": 0.0, "pnl_usdc": 0.0, "win_streak": 0}
+    return best
 
 

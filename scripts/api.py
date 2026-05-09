@@ -1936,8 +1936,23 @@ def _sixcycle_ensure_stake_mult_in_payload(payload: dict[str, Any]) -> None:
 
 
 def _sixcycle_merge_csv_kpis_into_payload(payload: dict[str, Any]) -> None:
-    """Enriquece KPIs del panel sixcycle desde CSVs en disco si superan a la memoria del engine."""
+    """Enriquece KPIs del panel sixcycle: Postgres si ``PRIMARY_STORE=postgres``, si no CSV en disco."""
+    from persistence.config import primary_store_postgres
+    from persistence.readers import sixcycle_sse_kpis_from_postgres
+
     mem_t = int(payload.get("trades") or 0)
+    if primary_store_postgres():
+        pg = sixcycle_sse_kpis_from_postgres()
+        if pg is not None:
+            pg_t = int(pg.get("trades") or 0)
+            if pg_t >= mem_t:
+                payload["trades"] = pg_t
+                payload["win_rate"] = float(pg.get("win_rate") or 0.0)
+                payload["pnl_usdc"] = float(pg.get("pnl_usdc") or 0.0)
+                payload["win_streak"] = int(pg.get("win_streak") or 0)
+        _sixcycle_ensure_stake_mult_in_payload(payload)
+        return
+
     path = ARB_CSV_PATHS.get(SIXCYCLE_SLUG)
     best: Optional[dict[str, Any]] = None
     best_t = mem_t
