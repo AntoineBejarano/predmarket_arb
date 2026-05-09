@@ -16,19 +16,31 @@ Uso::
     export PRIVATE_KEY='0x...'   # o pásala solo en esta sesión
     python scripts/derive_polymarket_clob_api_key.py
 
-Salida: JSON con las claves ``api_key``, ``api_secret``, ``api_passphrase`` y
-``private_key`` para pegar en ``data/polymarket_account.json`` (ver
-``data/polymarket_account.json.example``). No subas ese archivo a git.
+Por defecto imprime en **stdout** los valores etiquetados y debajo el JSON
+indentado (para verlo en terminal o redirigir solo el bloque JSON).
+
+    python scripts/derive_polymarket_clob_api_key.py --json-only > data/polymarket_account.json
+
+No subas ``data/polymarket_account.json`` a git.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Deriva credenciales L2 CLOB Polymarket")
+    ap.add_argument(
+        "--json-only",
+        action="store_true",
+        help="Solo imprime JSON (sin bloque etiquetado); útil para redirección a archivo",
+    )
+    args = ap.parse_args()
+
     key = (os.getenv("PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY") or "").strip()
     if not key:
         print(
@@ -60,9 +72,19 @@ def main() -> int:
         "api_passphrase": creds.api_passphrase,
         "private_key": key,
     }
-    print(json.dumps(out, indent=2))
+    if args.json_only:
+        print(json.dumps(out, indent=2), flush=True)
+        return 0
+
+    print("=== Credenciales L2 (CLOB Polymarket) ===\n", flush=True)
+    print(f"api_key:        {out['api_key']}", flush=True)
+    print(f"api_secret:     {out['api_secret']}", flush=True)
+    print(f"api_passphrase: {out['api_passphrase']}", flush=True)
+    print(f"private_key:    {out['private_key']}", flush=True)
+    print("\n=== JSON (copiar a data/polymarket_account.json) ===\n", flush=True)
+    print(json.dumps(out, indent=2), flush=True)
     print(
-        "\n# Copia el JSON a data/polymarket_account.json (ruta bajo DATA_DIR si usas otro directorio).",
+        "\n# Copia el bloque JSON a data/polymarket_account.json (o $DATA_DIR/polymarket_account.json).",
         file=sys.stderr,
     )
     return 0
