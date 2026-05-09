@@ -7,11 +7,7 @@ import logging
 import threading
 from typing import Any, Optional
 
-from persistence.config import (
-    database_url,
-    persistence_active_for_writes,
-    primary_store_postgres,
-)
+from persistence.config import database_url
 
 log = logging.getLogger("persistence.pool")
 
@@ -31,13 +27,14 @@ def _close_pool() -> None:
 
 
 def pool_needed() -> bool:
+    """Pool si hay ``DATABASE_URL``: escrituras, lecturas primarias Postgres, o tareas como reset (DELETE)."""
     if not database_url():
         return False
-    return persistence_active_for_writes() or primary_store_postgres()
+    return True
 
 
 def get_pool() -> Any | None:
-    """Pool compartido si hay ``DATABASE_URL`` y (escrituras o lectura primaria Postgres)."""
+    """Pool compartido si hay ``DATABASE_URL`` (escrituras, lecturas Postgres o reset)."""
     global _pool
     if not pool_needed():
         with _pool_lock:
@@ -59,7 +56,11 @@ def get_pool() -> Any | None:
                 timeout=10.0,
                 max_waiting=20,
                 num_workers=2,
-                kwargs={"connect_timeout": 8},
+                kwargs={
+                    "connect_timeout": 8,
+                    # Supabase transaction pool (:6543) / PgBouncer: evita prepared statements en servidor.
+                    "prepare_threshold": None,
+                },
             )
             log.info("Postgres ConnectionPool inicializado (max_size=6)")
             atexit.register(_close_pool)

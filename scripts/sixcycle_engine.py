@@ -76,7 +76,7 @@ PREPARE_LAST_SECONDS = int(os.getenv("SIXCYCLE_PREPARE_LAST_SECONDS", "90"))
 GAMMA_API_URL = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com").rstrip("/")
 BINANCE_REST_URL = os.getenv("BINANCE_REST_URL", "https://api.binance.com").rstrip("/")
 
-CSV_COLUMNS = [
+_SIXCYCLE_CSV_BASE_COLUMNS = [
     "timestamp_utc",
     "phase",
     "market_id",
@@ -106,6 +106,8 @@ CSV_COLUMNS = [
     "reason",
     "dry_run",
 ]
+SIXCYCLE_CSV_LEGACY_HEADER = ",".join(_SIXCYCLE_CSV_BASE_COLUMNS)
+CSV_COLUMNS = _SIXCYCLE_CSV_BASE_COLUMNS + ["config_profile_slug", "config_fingerprint"]
 
 _DEFAULT_HEADERS = {
     "User-Agent": "predmarket-arb/sixcycle-engine (+https://github.com)",
@@ -551,6 +553,12 @@ class SixCycleEngine:
         else:
             self._dry_run_effective = bool(self._config.get("dry_run", False))
 
+    def _row_profile_meta(self) -> tuple[str, str]:
+        """Etiqueta legible + huella de parámetros (para CSV/Postgres y análisis por versión)."""
+        slug = str(self._config.get("profile_slug") or "default").strip() or "default"
+        fp = _sixcycle_cfg.config_fingerprint(self._config)
+        return slug, fp
+
     def _maybe_reset_daily_pnl_utc(self) -> None:
         """Reinicia contador de PnL diario (UTC) para circuit breaker."""
         now = datetime.now(timezone.utc).date()
@@ -986,6 +994,41 @@ class SixCycleEngine:
         title = f"{mode} PREPARANDO {self._prepare_slug}"
         self._console.print(Panel.fit(body, title=title, border_style="yellow"))
 
+    def _migrate_sixcycle_csv_add_profile_columns(self) -> None:
+        """Añade columnas de versión de config sin perder filas históricas."""
+        src = self._csv_path
+        rows: list[dict[str, str]] = []
+        try:
+            with src.open("r", encoding="utf-8") as f:
+                rdr = csv.DictReader(f)
+                for row in rdr:
+                    row = dict(row)
+                    row.setdefault("config_profile_slug", "")
+                    row.setdefault("config_fingerprint", "")
+                    rows.append({k: str(row.get(k, "") or "") for k in CSV_COLUMNS})
+        except OSError as e:
+            log.warning("migrate sixcycle csv read failed: %s", e)
+            return
+        tmp = src.with_suffix(".csv.migrating")
+        try:
+            with tmp.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+                w.writeheader()
+                for row in rows:
+                    w.writerow(row)
+            tmp.replace(src)
+            log.info(
+                "CSV sixcycle migrado a cabecera con config_profile_slug/config_fingerprint (%d filas)",
+                len(rows),
+            )
+        except OSError as e:
+            log.warning("migrate sixcycle csv write failed: %s", e)
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+
     def _ensure_csv_header(self) -> None:
         self._csv_path.parent.mkdir(parents=True, exist_ok=True)
         expected = ",".join(CSV_COLUMNS)
@@ -1000,6 +1043,9 @@ class SixCycleEngine:
         except OSError:
             first = ""
         if first == expected:
+            return
+        if first == SIXCYCLE_CSV_LEGACY_HEADER:
+            self._migrate_sixcycle_csv_add_profile_columns()
             return
         bak = self._csv_path.with_name(self._csv_path.name + ".bak_" + str(int(time.time())))
         try:
@@ -1072,6 +1118,7 @@ class SixCycleEngine:
         edge_v = v.get("edge", "")
         dir_v = str(v.get("direction", "") or "")
         reason_v = str(v.get("reason", "") or "")
+        pslug, pfp = self._row_profile_meta()
         return {
             "timestamp_utc": ts,
             "phase": phase,
@@ -1101,6 +1148,8 @@ class SixCycleEngine:
             "pnl_cumulative_usdc": f"{self.pnl_usdc:.6f}",
             "reason": reason_v,
             "dry_run": self._csv_bool(self._dry_run_effective),
+            "config_profile_slug": pslug,
+            "config_fingerprint": pfp,
         }
 
     async def run(self) -> None:
@@ -1430,6 +1479,7 @@ class SixCycleEngine:
                                 fill_price=fill_px,
                                 simulated=bool(fill_result.get("simulated", True)),
                             )
+                            pslug, pfp = self._row_profile_meta()
 
                             settle_payload = {
                                 "market_id": mid,
@@ -1452,6 +1502,8 @@ class SixCycleEngine:
                                 "cycle_ms_fill": round(cycle_fill_ms, 2),
                                 "signal_snapshot": dict(signal),
                                 "val_snapshot": dict(val),
+                                "config_profile_slug": pslug,
+                                "config_fingerprint": pfp,
                             }
                             task = asyncio.create_task(
                                 self.cycle_settle(
@@ -2042,6 +2094,9 @@ class SixCycleEngine:
         if up_won_final is not None:
             res_up_cell = self._csv_bool(up_won_final)
 
+        pslug = str(payload.get("config_profile_slug") or "").strip() or "default"
+        pfp = str(payload.get("config_fingerprint") or "").strip()
+
         row = {
             "timestamp_utc": ts,
             "phase": "SETTLED",
@@ -2071,6 +2126,8 @@ class SixCycleEngine:
             "pnl_cumulative_usdc": f"{self.pnl_usdc:.6f}",
             "reason": "settle",
             "dry_run": self._csv_bool(self._dry_run_effective),
+            "config_profile_slug": pslug,
+            "config_fingerprint": pfp,
         }
         try:
             log.info(

@@ -208,6 +208,9 @@
           <span class="text-indigo-300 text-xs font-normal hidden group-open:inline">Cerrar</span>
         </summary>
         <div class="px-4 pb-4 pt-0 border-t border-slate-700/80 space-y-4">
+          <div id="sixcycle-config-version-strip"
+            class="rounded-lg border border-indigo-500/25 bg-indigo-950/20 px-3 py-2 text-[11px] text-slate-300 space-y-1 font-mono leading-relaxed">
+          </div>
           <p id="sixcycle-config-active-filters" class="text-[11px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap"></p>
           <div id="sixcycle-config-fields" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[min(70vh,32rem)] overflow-y-auto pr-1"></div>
           <div class="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-700/60">
@@ -221,6 +224,38 @@
             </button>
             <span id="sixcycle-config-feedback" class="text-xs font-mono text-slate-500 min-w-[8rem]"></span>
           </div>
+          <details class="rounded-lg border border-slate-700/70 bg-slate-900/25 mt-2">
+            <summary class="cursor-pointer px-3 py-2 text-xs text-indigo-200/95 hover:bg-slate-800/50 rounded-lg">
+              Historial de versiones · PnL por huella (<code class="text-slate-500">config_fingerprint</code>)
+            </summary>
+            <div class="px-3 pb-3 pt-1 space-y-2 border-t border-slate-700/50">
+              <div class="flex flex-wrap items-center gap-2">
+                <button type="button" id="sixcycle-versions-refresh"
+                  class="text-xs px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800">
+                  Actualizar tabla
+                </button>
+                <span id="sixcycle-versions-meta" class="text-[10px] text-slate-500 font-mono"></span>
+              </div>
+              <div class="overflow-x-auto max-h-72 overflow-y-auto rounded border border-slate-700/80">
+                <table class="min-w-full text-[10px] text-left font-mono text-slate-300">
+                  <thead class="sticky top-0 bg-slate-950/95 text-slate-500 uppercase tracking-wide">
+                    <tr>
+                      <th class="px-2 py-1.5 border-b border-slate-700">Huella</th>
+                      <th class="px-2 py-1.5 border-b border-slate-700">Trades</th>
+                      <th class="px-2 py-1.5 border-b border-slate-700">WR</th>
+                      <th class="px-2 py-1.5 border-b border-slate-700">PnL Σ</th>
+                      <th class="px-2 py-1.5 border-b border-slate-700">Slugs</th>
+                    </tr>
+                  </thead>
+                  <tbody id="sixcycle-versions-tbody"></tbody>
+                </table>
+              </div>
+              <p class="text-[10px] text-slate-500 leading-snug">
+                Cada vez que pulsas <strong class="text-slate-400">Aplicar cambios</strong> se registra una versión si cambian parámetros, nombre o nota.
+                Las filas <code class="text-slate-600">SETTLED</code> del CSV llevan la huella activa al fill para poder comparar rendimiento.
+              </p>
+            </div>
+          </details>
         </div>
       </details>
 
@@ -774,38 +809,59 @@
       var box = document.getElementById("sixcycle-config-fields");
       if (!box || !schema) return;
       box.innerHTML = "";
-      Object.keys(schema)
-        .sort()
-        .forEach(function (key) {
-          var meta = schema[key] || {};
-          var val = config[key];
-          var wrap = document.createElement("label");
-          wrap.className = "flex flex-col gap-1 rounded-lg border border-slate-700/80 bg-slate-900/40 p-2";
-          var lab = document.createElement("span");
-          lab.className = "text-[10px] text-slate-500 leading-snug";
-          lab.textContent = key + (meta.description ? " — " + meta.description : "");
-          var input;
-          if (meta.type === "bool") {
-            input = document.createElement("input");
-            input.type = "checkbox";
-            input.checked = !!val;
-            input.className = "h-4 w-4 rounded border-slate-600 text-indigo-500 shrink-0";
+      var keys = Object.keys(schema).sort();
+      keys.sort(function (a, b) {
+        var pa = a.indexOf("profile_") === 0 ? 0 : 1;
+        var pb = b.indexOf("profile_") === 0 ? 0 : 1;
+        if (pa !== pb) return pa - pb;
+        return a.localeCompare(b);
+      });
+      keys.forEach(function (key) {
+        var meta = schema[key] || {};
+        var val = config[key];
+        var wrap = document.createElement("label");
+        wrap.className = "flex flex-col gap-1 rounded-lg border border-slate-700/80 bg-slate-900/40 p-2";
+        var lab = document.createElement("span");
+        lab.className = "text-[10px] text-slate-500 leading-snug";
+        lab.textContent = key + (meta.description ? " — " + meta.description : "");
+        var input;
+        var typ = meta.type || "float";
+        if (typ === "bool") {
+          input = document.createElement("input");
+          input.type = "checkbox";
+          input.checked = !!val;
+          input.className = "h-4 w-4 rounded border-slate-600 text-indigo-500 shrink-0";
+        } else if (typ === "str") {
+          if (key === "profile_note") {
+            input = document.createElement("textarea");
+            input.rows = 2;
+            input.value = val != null ? String(val) : "";
+            input.className =
+              "text-xs font-mono border border-slate-600 rounded px-2 py-1 bg-slate-950 text-slate-100 w-full min-w-0 resize-y";
           } else {
             input = document.createElement("input");
-            input.type = "number";
-            input.step = meta.type === "int" ? "1" : "any";
+            input.type = "text";
             input.value = val != null ? String(val) : "";
             input.className =
               "text-sm font-mono border border-slate-600 rounded px-2 py-1 bg-slate-950 text-slate-100 w-full min-w-0";
-            if (meta.min != null) input.min = String(meta.min);
-            if (meta.max != null) input.max = String(meta.max);
+            if (key === "profile_slug") input.placeholder = "ej. timing_max_5";
           }
-          input.dataset.cfgKey = key;
-          input.dataset.cfgType = meta.type || "float";
-          wrap.appendChild(lab);
-          wrap.appendChild(input);
-          box.appendChild(wrap);
-        });
+        } else {
+          input = document.createElement("input");
+          input.type = "number";
+          input.step = typ === "int" ? "1" : "any";
+          input.value = val != null ? String(val) : "";
+          input.className =
+            "text-sm font-mono border border-slate-600 rounded px-2 py-1 bg-slate-950 text-slate-100 w-full min-w-0";
+          if (meta.min != null) input.min = String(meta.min);
+          if (meta.max != null) input.max = String(meta.max);
+        }
+        input.dataset.cfgKey = key;
+        input.dataset.cfgType = typ;
+        wrap.appendChild(lab);
+        wrap.appendChild(input);
+        box.appendChild(wrap);
+      });
     }
 
     function collectSixcycleConfigPayload() {
@@ -819,6 +875,12 @@
           out[k] = !!inp.checked;
           return;
         }
+        if (t === "str") {
+          var s = String(inp.value || "").trim();
+          if (k === "profile_slug") out[k] = s || "default";
+          else out[k] = String(inp.value || "");
+          return;
+        }
         var raw = String(inp.value || "").replace(",", ".").trim();
         if (raw === "") return;
         var v = parseFloat(raw);
@@ -827,6 +889,83 @@
         else out[k] = v;
       });
       return out;
+    }
+
+    function fillSixcycleVersionStrip(pack) {
+      var el = document.getElementById("sixcycle-config-version-strip");
+      if (!el || !pack) return;
+      var fp = pack.config_fingerprint != null ? String(pack.config_fingerprint) : "—";
+      var st = pack.stats_last_100_this_fingerprint || {};
+      var stAll = pack.stats_last_100 || {};
+      var lines = [
+        "<span class='text-indigo-300/90'>Huella actual</span> <code class='text-emerald-300/90'>" + fp + "</code>",
+        "Últimos settles <strong class='text-slate-200'>esta huella</strong>: trades=" +
+          (st.trades != null ? st.trades : "0") +
+          " · WR=" +
+          (st.win_rate != null ? st.win_rate : "0") +
+          " · EV/trade=" +
+          (st.ev_per_trade != null ? st.ev_per_trade : "0") +
+          " · pnl_norm=" +
+          (st.pnl_norm != null ? st.pnl_norm : "0"),
+        "<span class='text-slate-500'>Referencia (todos los settles en muestra CSV): trades=" +
+          (stAll.trades != null ? stAll.trades : "0") +
+          "</span>",
+      ];
+      var log = pack.version_log_tail || [];
+      if (log.length) {
+        lines.push("<span class='text-slate-500 pt-1 block'>Último guardado: " + String(log[log.length - 1].applied_at || "") + " · <code>" + String(log[log.length - 1].profile_slug || "") + "</code></span>");
+      }
+      el.innerHTML = lines.join("<br/>");
+    }
+
+    async function loadSixcycleVersionsTable() {
+      var tb = document.getElementById("sixcycle-versions-tbody");
+      var meta = document.getElementById("sixcycle-versions-meta");
+      if (!tb) return;
+      tb.innerHTML = "<tr><td colspan='5' class='px-2 py-2 text-slate-500'>Cargando…</td></tr>";
+      try {
+        var r = await fetch("/api/sixcycle/config/versions?limit=40&csv_rows=12000", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        var j = await r.json();
+        var by = j.stats_by_fingerprint || {};
+        var keys = Object.keys(by).sort();
+        if (meta) meta.textContent = "Filas CSV usadas: " + (j.csv_rows_used != null ? j.csv_rows_used : "—");
+        if (!keys.length) {
+          tb.innerHTML = "<tr><td colspan='5' class='px-2 py-2 text-slate-500'>Sin settles con huella en el CSV (o CSV vacío).</td></tr>";
+          return;
+        }
+        tb.innerHTML = "";
+        keys.forEach(function (fp) {
+          var row = by[fp] || {};
+          var tr = document.createElement("tr");
+          tr.className = "border-b border-slate-800/80 hover:bg-slate-900/40";
+          var slugMap = row.profile_slugs_seen || {};
+          var slugTxt = Object.keys(slugMap)
+            .map(function (s) {
+              return s + "(" + slugMap[s] + ")";
+            })
+            .join(" ");
+          tr.innerHTML =
+            "<td class='px-2 py-1 align-top break-all text-emerald-200/90'>" +
+            fp +
+            "</td><td class='px-2 py-1 align-top'>" +
+            (row.trades != null ? row.trades : "") +
+            "</td><td class='px-2 py-1 align-top'>" +
+            (row.win_rate != null ? row.win_rate : "") +
+            "</td><td class='px-2 py-1 align-top'>" +
+            (row.pnl_sum_usdc != null ? row.pnl_sum_usdc : "") +
+            "</td><td class='px-2 py-1 align-top text-slate-400 max-w-[10rem] break-words'>" +
+            (slugTxt || "—") +
+            "</td>";
+          tb.appendChild(tr);
+        });
+      } catch (err) {
+        tb.innerHTML =
+          "<tr><td colspan='5' class='px-2 py-2 text-rose-400'>" + String(err).replace(/</g, "&lt;") + "</td></tr>";
+      }
     }
 
     async function loadSixcycleConfigUi() {
@@ -843,6 +982,7 @@
         var schema = await sR.json();
         var pack = await cR.json();
         var cfg = pack.config || {};
+        fillSixcycleVersionStrip(pack);
         var af = document.getElementById("sixcycle-config-active-filters");
         if (af && pack.active_filters) af.textContent = (pack.active_filters || []).join("\n");
         renderSixcycleConfigFields(schema, cfg);
@@ -882,6 +1022,7 @@
             fb.className = "text-xs font-mono text-emerald-400";
           }
           await loadSixcycleConfigUi();
+          await loadSixcycleVersionsTable();
           await pollSixcycleEnabled();
           await refreshAccountPanel();
           await refresh();
@@ -891,6 +1032,13 @@
             fb.className = "text-xs font-mono text-rose-400";
           }
         }
+      });
+    }
+    var sixcycleVerRefresh = document.getElementById("sixcycle-versions-refresh");
+    if (sixcycleVerRefresh) {
+      sixcycleVerRefresh.addEventListener("click", function (e) {
+        e.preventDefault();
+        loadSixcycleVersionsTable();
       });
     }
     var sixcycleReset = document.getElementById("sixcycle-config-reset");
@@ -920,6 +1068,7 @@
             fb.className = "text-xs font-mono text-emerald-400";
           }
           await loadSixcycleConfigUi();
+          await loadSixcycleVersionsTable();
           await refresh();
         } catch (err) {
           if (fb) {
@@ -1210,6 +1359,7 @@
       }
     });
     refresh();
+    loadSixcycleVersionsTable();
     setInterval(refresh, 8000);
 
     /* ——— Live tab (SSE + Chart) ——— */

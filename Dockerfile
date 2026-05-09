@@ -14,8 +14,10 @@ COPY pyproject.toml .
 RUN uv pip install --system --no-cache \
     "pandas>=2.0.0" "pyarrow>=14.0.0" "tqdm>=4.65.0" "requests>=2.31.0" \
     "lightgbm>=4.0.0" "scikit-learn>=1.6.1,<1.7" "scipy>=1.13.0" "aiohttp>=3.9.0" "websockets>=12.0" \
-    "eth-account>=0.13.0" "py-order-utils>=0.3.2" "numpy>=1.24.0" "rich>=13.0.0" "joblib>=1.3.0" \
-    "fastapi>=0.110.0" "uvicorn>=0.27.0" "websocket-client>=1.6.0"
+    "eth-account>=0.13.0" "py-order-utils>=0.3.2" "py-clob-client>=0.34.0" "numpy>=1.24.0" "rich>=13.0.0" "joblib>=1.3.0" \
+    "fastapi>=0.110.0" "uvicorn>=0.27.0" "websocket-client>=1.6.0" \
+    "psycopg[binary]>=3.2.0" "psycopg-pool>=3.2.0" "alembic>=1.14.0" "sqlalchemy>=2.0.0" \
+    "supabase>=2.20.0"
 
 COPY . .
 

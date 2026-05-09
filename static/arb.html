@@ -420,10 +420,16 @@
         return;
       }
       const errs = body.file_errors || [];
-      if (errs.length) {
-        alert("Datos reiniciados con avisos al borrar archivos:\n" + errs.join("\n"));
+      const pgErrs = body.postgres_errors || [];
+      const pgOk = body.postgres_engine_logs_cleared === true;
+      if (errs.length || pgErrs.length) {
+        let msg = "Datos reiniciados con avisos:\n";
+        if (errs.length) msg += "\nArchivos:\n" + errs.join("\n");
+        if (pgErrs.length) msg += "\nPostgres:\n" + pgErrs.join("\n");
+        else if (pgOk) msg += "\n(Postgres: tablas de logs vaciadas.)";
+        alert(msg);
       } else {
-        alert("Datos reiniciados.");
+        alert(pgOk ? "Datos reiniciados (CSV y tablas Postgres de logs)." : "Datos reiniciados.");
       }
       await refreshArbStatus();
       broadcastArbControlPlaneChanged();

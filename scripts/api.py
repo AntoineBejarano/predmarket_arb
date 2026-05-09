@@ -1426,7 +1426,15 @@ def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
                 removed.append(str(p))
         except OSError as e:
             errors.append(f"{p}: {e}")
-    return {"files_removed": removed, "file_errors": errors}
+    out: dict[str, Any] = {"files_removed": removed, "file_errors": errors}
+    try:
+        from persistence.writes import clear_postgres_on_arb_data_reset
+
+        out.update(clear_postgres_on_arb_data_reset(include_validator_signals=include_validator))
+    except Exception as e:
+        log.warning("_arb_delete_data_files: postgres clear: %s", e)
+        out.setdefault("postgres_errors", []).append(str(e))
+    return out
 
 
 def _build_arb_strategy_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1516,6 +1524,7 @@ def _dashboard_auth_info() -> dict[str, Any]:
 
 
 def _persistence_public_status() -> dict[str, Any]:
+    from clients.supabase_py import supabase_env_status
     from persistence import write_stats_snapshot
     from persistence.config import database_url, persistence_active_for_writes, primary_store_postgres
 
@@ -1523,6 +1532,7 @@ def _persistence_public_status() -> dict[str, Any]:
         "database_configured": bool(database_url()),
         "supabase_writes": persistence_active_for_writes(),
         "primary_store_postgres": primary_store_postgres(),
+        "supabase_rest": supabase_env_status(),
         **write_stats_snapshot(),
     }
 
@@ -1591,6 +1601,21 @@ async def api_persistence_status() -> dict[str, Any]:
     return _persistence_public_status()
 
 
+@app.get("/api/supabase/status")
+async def api_supabase_status() -> dict[str, Any]:
+    """Cliente REST supabase-py: solo si hay ``SUPABASE_URL`` + ``SUPABASE_KEY``."""
+    from clients.supabase_py import get_supabase_client, supabase_env_status
+
+    st = supabase_env_status()
+    ok = False
+    if st.get("configured"):
+        try:
+            ok = get_supabase_client() is not None
+        except Exception as e:
+            return {**st, "client_ok": False, "error": type(e).__name__}
+    return {**st, "client_ok": ok}
+
+
 @app.get("/api/arb/status")
 async def arb_status() -> JSONResponse:
     state = await _state_manager.get_all()
@@ -1646,7 +1671,10 @@ async def arb_reset_data(
     resetea contadores paper y desactiva todas las estrategias (no arranca el motor).
     """
     try:
-        await _sixcycle_stop()
+        try:
+            await _sixcycle_stop()
+        except Exception as e:
+            log.warning("POST /api/arb/reset-data: sixcycle_stop: %s", e)
         engine_stopped_here, _ = await asyncio.to_thread(_arb_engine_stop)
         file_result = await asyncio.to_thread(_arb_delete_data_files, include_validator)
         await _state_manager.reset_fictional_paper()
@@ -2110,13 +2138,18 @@ async def _sixcycle_config_api_bundle() -> dict[str, Any]:
     cfg["enabled"] = enabled_live
     rows = _read_arb_csv_tail(ARB_CSV_PATHS[SIXCYCLE_SLUG], n=300)
     stats = scs.stats_last_n_from_csv_rows(rows, 100)
+    cur_fp = scs.config_fingerprint(cfg_disk)
+    stats_this_fp = scs.stats_last_n_from_csv_rows(rows, 100, config_fingerprint=cur_fp)
     return {
         "config": cfg,
         "enabled": enabled_live,
         "stats_last_100": stats,
+        "stats_last_100_this_fingerprint": stats_this_fp,
+        "config_fingerprint": cur_fp,
         "active_filters": scs.build_active_filters(cfg_disk),
         "last_updated": scs.get_last_updated_iso(),
         "dry_run_process_env": bool(six_mod.DRY_RUN),
+        "version_log_tail": scs.load_version_tail(20),
     }
 
 
@@ -2130,6 +2163,26 @@ async def api_sixcycle_config_schema() -> JSONResponse:
     from scripts import sixcycle_config_store as scs
 
     return JSONResponse(content=dict(scs.SCHEMA))
+
+
+@app.get("/api/sixcycle/config/versions")
+async def api_sixcycle_config_versions(
+    limit: int = Query(50, ge=1, le=200),
+    csv_rows: int = Query(8000, ge=100, le=50_000),
+) -> JSONResponse:
+    """Historial de configs aplicadas + agregados PnL por ``config_fingerprint`` (CSV motor)."""
+    from scripts import sixcycle_config_store as scs
+
+    tail = scs.load_version_tail(limit)
+    rows = await asyncio.to_thread(_read_arb_csv_tail, ARB_CSV_PATHS[SIXCYCLE_SLUG], csv_rows)
+    by_fp = scs.stats_by_fingerprint_from_rows(rows)
+    return JSONResponse(
+        content={
+            "version_log_tail": tail,
+            "stats_by_fingerprint": by_fp,
+            "csv_rows_used": len(rows),
+        }
+    )
 
 
 @app.post("/api/sixcycle/config/suggest")
@@ -2237,7 +2290,15 @@ def _sixcycle_delete_data_files() -> dict[str, Any]:
                 removed.append(str(p))
         except OSError as e:
             errors.append(f"{p}: {e}")
-    return {"files_removed": removed, "file_errors": errors}
+    out: dict[str, Any] = {"files_removed": removed, "file_errors": errors}
+    try:
+        from persistence.writes import clear_postgres_sixcycle_rows
+
+        out.update(clear_postgres_sixcycle_rows())
+    except Exception as e:
+        log.warning("_sixcycle_delete_data_files: postgres clear: %s", e)
+        out.setdefault("postgres_errors", []).append(str(e))
+    return out
 
 
 @app.post("/api/sixcycle/reset-data")

@@ -1,0 +1,20 @@
+Migraciones Postgres con Alembic (misma URL que persistence: DATABASE_URL).
+
+  alembic revision -m "descripcion"   # nueva migración vacía (editar upgrade/downgrade)
+  alembic upgrade head                 # aplicar todas
+  alembic downgrade -1               # revertir la última
+  alembic current                    # revisión aplicada
+
+La revisión inicial duplica el SQL de supabase/migrations/20260209120000_init_persistence.sql;
+puedes seguir aplicando ese .sql a mano en el SQL editor de Supabase si no usas Alembic en CI.
+
+## Supabase
+
+- La URI **directa** (`db.<ref>.supabase.co:5432`) suele ser **solo IPv6**; en redes o clientes sin IPv6
+  verás `connection refused`. Usa la cadena del botón **Connect** del dashboard:
+  - **Transaction pool** (mismo host `db.<ref>.supabase.co`, puerto **6543**) — suele funcionar desde
+    macOS/red IPv4; `env.py` desactiva prepared statements para este modo.
+  - O **Session pool** (`aws-0-<region>.pooler.supabase.com:5432`, usuario `postgres.<ref>`) para
+    sesión larga (también válido para migraciones).
+
+Copia la URI tal cual del panel; no pongas la contraseña entre corchetes `[]` en la URL.

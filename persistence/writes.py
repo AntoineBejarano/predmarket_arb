@@ -134,6 +134,49 @@ def upsert_strategy_state(state: dict[str, Any]) -> None:
         log.warning("Postgres upsert_strategy_state: %s", e)
 
 
+def clear_postgres_on_arb_data_reset(*, include_validator_signals: bool) -> dict[str, Any]:
+    """
+    Borra filas en tablas espejo de logs del motor (paralelas a CSV bajo DATA_DIR).
+    Requiere ``DATABASE_URL`` (mismo pool que escrituras; no depende de ``SUPABASE_WRITES``).
+    """
+    out: dict[str, Any] = {
+        "postgres_engine_logs_cleared": False,
+        "postgres_errors": [],
+    }
+    pool = get_pool()
+    if pool is None:
+        return out
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM arb_events")
+            conn.execute("DELETE FROM sixcycle_engine_rows")
+            conn.execute("DELETE FROM latency_sports_cycle_snapshots")
+            if include_validator_signals:
+                conn.execute("DELETE FROM signal_observations")
+        out["postgres_engine_logs_cleared"] = True
+    except Exception as e:
+        msg = str(e)
+        out["postgres_errors"].append(msg)
+        log.warning("clear_postgres_on_arb_data_reset: %s", e)
+    return out
+
+
+def clear_postgres_sixcycle_rows() -> dict[str, Any]:
+    """Borra solo ``sixcycle_engine_rows`` (reset parcial Sixcycle desde /api/sixcycle/reset-data)."""
+    out: dict[str, Any] = {"postgres_sixcycle_cleared": False, "postgres_errors": []}
+    pool = get_pool()
+    if pool is None:
+        return out
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM sixcycle_engine_rows")
+        out["postgres_sixcycle_cleared"] = True
+    except Exception as e:
+        out["postgres_errors"].append(str(e))
+        log.warning("clear_postgres_sixcycle_rows: %s", e)
+    return out
+
+
 def upsert_model_state(state: dict[str, Any]) -> None:
     if not persistence_active_for_writes():
         return

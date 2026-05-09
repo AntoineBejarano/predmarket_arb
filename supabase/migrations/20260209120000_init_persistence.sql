@@ -1,5 +1,6 @@
 -- PredMarket Arb: tablas para dual-write / lectura Postgres (Supabase compatible).
--- Ejecutar en el SQL editor de Supabase o con: psql "$DATABASE_URL" -f ...
+-- Preferible aplicar el mismo esquema con Alembic: `alembic upgrade head` (ver alembic/README).
+-- También puedes pegar esto en el SQL editor de Supabase o: psql "$DATABASE_URL" -f ...
 
 CREATE TABLE IF NOT EXISTS signal_observations (
     id bigserial PRIMARY KEY,

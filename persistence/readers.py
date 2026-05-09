@@ -1,4 +1,4 @@
-"""Lecturas desde Postgres cuando ``PRIMARY_STORE=postgres``."""
+"""Lecturas desde Postgres cuando hay ``DATABASE_URL`` (por defecto; opt-out ``PRIMARY_STORE=csv``)."""
 
 from __future__ import annotations
 

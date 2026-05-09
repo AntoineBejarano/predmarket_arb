@@ -1,4 +1,6 @@
 {
+  "profile_slug": "default",
+  "profile_note": "",
   "clob_extreme_high": 0.7,
   "clob_extreme_low": 0.3,
   "clob_threshold_high": 0.65,

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -19,6 +21,8 @@ _CONFIG_LOCK = threading.RLock()
 _LAST_UPDATED_ISO: str | None = None
 
 CONFIG_PATH = data_dir() / "sixcycle_config.json"
+VERSION_LOG_PATH = data_dir() / "sixcycle_config_versions.jsonl"
+_VERSION_LOG_MAX_BYTES = 800_000
 
 DEFAULT_SIXCYCLE_CONFIG: dict[str, Any] = {
     "fill_min": 0.12,
@@ -42,10 +46,15 @@ DEFAULT_SIXCYCLE_CONFIG: dict[str, Any] = {
     "max_concurrent_trades": 1,
     "dry_run": True,
     "enabled": True,
+    "profile_slug": "default",
+    "profile_note": "",
 }
 
 # Claves persistidas (enabled/dry_run se guardan para referencia; enabled vivo viene de strategy_state).
 _CONFIG_KEYS = frozenset(DEFAULT_SIXCYCLE_CONFIG.keys())
+# Parámetros que definen la «versión» para analítica (excluye enabled: espejo de strategy_state).
+_FINGERPRINT_KEYS = frozenset(_CONFIG_KEYS - {"enabled", "profile_slug", "profile_note"})
+_PROFILE_SLUG_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
 
 SCHEMA: dict[str, dict[str, Any]] = {
     "fill_min": {"type": "float", "min": 0.0, "max": 1.0, "description": "Fill mínimo permitido (lado apostado)"},
@@ -79,6 +88,11 @@ SCHEMA: dict[str, dict[str, Any]] = {
     },
     "dry_run": {"type": "bool", "description": "Paper: sin órdenes reales (ver restricciones LIVE)"},
     "enabled": {"type": "bool", "description": "Espejo deseado; estado vivo en strategy_state"},
+    "profile_slug": {
+        "type": "str",
+        "description": "Nombre de la versión de config (p. ej. timing_v3); va en cada fila CSV/Postgres",
+    },
+    "profile_note": {"type": "str", "description": "Nota libre para el historial de versiones (opcional)"},
 }
 
 
@@ -171,6 +185,161 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ValueError("dry_run debe ser booleano")
     if not isinstance(c.get("enabled"), bool):
         raise ValueError("enabled debe ser booleano")
+    slug = str(c.get("profile_slug") or "default").strip() or "default"
+    if not _PROFILE_SLUG_RE.match(slug):
+        raise ValueError("profile_slug: 1-64 caracteres [a-zA-Z0-9._-]")
+    note = str(c.get("profile_note") or "")
+    if len(note) > 2000:
+        raise ValueError("profile_note: máximo 2000 caracteres")
+
+
+def canonical_params_for_fingerprint(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Subconjunto estable de parámetros para hash y registro de versiones."""
+    out: dict[str, Any] = {}
+    for k in sorted(_FINGERPRINT_KEYS):
+        if k not in cfg:
+            continue
+        v = cfg[k]
+        if isinstance(v, bool):
+            out[k] = bool(v)
+        elif isinstance(v, int) and not isinstance(v, bool):
+            out[k] = int(v)
+        elif isinstance(v, float):
+            out[k] = float(v)
+        else:
+            try:
+                if k == "max_concurrent_trades" or k == "score_min_abs":
+                    out[k] = int(v)
+                else:
+                    out[k] = float(v)
+            except (TypeError, ValueError):
+                out[k] = v
+    return out
+
+
+def config_fingerprint(cfg: dict[str, Any]) -> str:
+    """Identificador corto único por conjunto de parámetros (excluye enabled / metadatos de perfil)."""
+    canon = canonical_params_for_fingerprint(cfg)
+    raw = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _last_version_record() -> dict[str, Any] | None:
+    p = VERSION_LOG_PATH
+    if not p.is_file():
+        return None
+    try:
+        lines = [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if not lines:
+            return None
+        return json.loads(lines[-1])
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def append_config_version_record(full: dict[str, Any]) -> None:
+    """Añade una línea JSON al log cuando cambia la config persistida (evita duplicar guardados idénticos)."""
+    fp = config_fingerprint(full)
+    slug = str(full.get("profile_slug") or "default").strip() or "default"
+    note = str(full.get("profile_note") or "")[:2000]
+    params = canonical_params_for_fingerprint(full)
+    prev = _last_version_record()
+    if prev and prev.get("config_fingerprint") == fp and prev.get("profile_slug") == slug and prev.get("profile_note") == note:
+        try:
+            if json.dumps(prev.get("params"), sort_keys=True) == json.dumps(params, sort_keys=True):
+                return
+        except (TypeError, ValueError):
+            pass
+    rec = {
+        "applied_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "profile_slug": slug,
+        "profile_note": note,
+        "config_fingerprint": fp,
+        "params": params,
+    }
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    VERSION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with VERSION_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError as e:
+        log.warning("sixcycle version log append failed: %s", e)
+        return
+    _trim_version_log_if_needed()
+
+
+def _trim_version_log_if_needed() -> None:
+    try:
+        p = VERSION_LOG_PATH
+        if not p.is_file() or p.stat().st_size <= _VERSION_LOG_MAX_BYTES:
+            return
+        lines = [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        keep = lines[-400:]
+        p.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_version_tail(n: int = 50) -> list[dict[str, Any]]:
+    """Últimas n entradas del log de versiones (más reciente al final)."""
+    p = VERSION_LOG_PATH
+    if not p.is_file():
+        return []
+    try:
+        lines = [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for ln in lines[-max(1, n) :]:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def stats_by_fingerprint_from_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Agrega trades SETTLED win/loss por ``config_fingerprint`` (filas sin huella → ``__legacy__``)."""
+    by_fp: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        ph = str(r.get("phase", "")).upper().strip()
+        res = str(r.get("resolved", "")).lower().strip()
+        if ph != "SETTLED" or res not in ("win", "loss"):
+            continue
+        fp = str(r.get("config_fingerprint") or "").strip() or "__legacy__"
+        by_fp.setdefault(fp, []).append(r)
+    out: dict[str, dict[str, Any]] = {}
+    for fp, settled in by_fp.items():
+        wins = sum(1 for r in settled if str(r.get("resolved", "")).lower() == "win")
+        t = len(settled)
+        wr = wins / t if t else 0.0
+        pnl_sum = 0.0
+        stake_sum = 0.0
+        for r in settled:
+            try:
+                pnl_sum += float(r.get("pnl_usdc") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                stake_sum += float(r.get("stake_usdc") or 0.0)
+            except (TypeError, ValueError):
+                pass
+        ev = pnl_sum / t if t else 0.0
+        pnl_norm = pnl_sum / max(stake_sum, 1e-9)
+        slug_counts: dict[str, int] = {}
+        for r in settled:
+            ps = str(r.get("config_profile_slug") or "").strip() or "?"
+            slug_counts[ps] = slug_counts.get(ps, 0) + 1
+        out[fp] = {
+            "trades": t,
+            "win_rate": round(wr, 4),
+            "ev_per_trade": round(ev, 6),
+            "pnl_norm": round(pnl_norm, 6),
+            "pnl_sum_usdc": round(pnl_sum, 6),
+            "stake_sum_usdc": round(stake_sum, 6),
+            "profile_slugs_seen": slug_counts,
+        }
+    return dict(sorted(out.items(), key=lambda kv: kv[0]))
 
 
 def merge_and_validate(current: dict[str, Any], partial: dict[str, Any]) -> dict[str, Any]:
@@ -205,6 +374,7 @@ def save_config(full: dict[str, Any]) -> None:
                 pass
     with _CONFIG_LOCK:
         _LAST_UPDATED_ISO = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    append_config_version_record(full)
 
 
 def build_active_filters(cfg: dict[str, Any]) -> list[str]:
@@ -229,19 +399,29 @@ def build_active_filters(cfg: dict[str, Any]) -> list[str]:
     ]
 
 
-def stats_last_n_from_csv_rows(rows: list[dict[str, Any]], n: int = 100) -> dict[str, Any]:
+def stats_last_n_from_csv_rows(
+    rows: list[dict[str, Any]],
+    n: int = 100,
+    *,
+    config_fingerprint: str | None = None,
+) -> dict[str, Any]:
     """
     Últimas n filas SETTLED (win/loss) con stake y pnl.
     pnl_norm = sum(pnl_usdc) / max(sum(stake_usdc), 1e-9) por esas filas.
+    Si ``config_fingerprint`` se informa, solo cuenta filas con esa huella.
     """
+    fp_filter = (config_fingerprint or "").strip() or None
     settled: list[dict[str, Any]] = []
     for r in reversed(rows):
         if len(settled) >= n:
             break
         ph = str(r.get("phase", "")).upper().strip()
         res = str(r.get("resolved", "")).lower().strip()
-        if ph == "SETTLED" and res in ("win", "loss"):
-            settled.append(r)
+        if ph != "SETTLED" or res not in ("win", "loss"):
+            continue
+        if fp_filter is not None and str(r.get("config_fingerprint") or "").strip() != fp_filter:
+            continue
+        settled.append(r)
     if not settled:
         return {
             "trades": 0,

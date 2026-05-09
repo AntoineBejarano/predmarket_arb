@@ -30,6 +30,8 @@ strategies/**/experiments/**/*.zip
 
 # Local agent / IDE artefacts
 .claude/
+.agents/
+skills-lock.json
 
 # Secrets
 .env
