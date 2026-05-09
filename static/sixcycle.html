@@ -406,6 +406,13 @@
       return s.slice(0, Math.floor(n / 2) - 1) + "…" + s.slice(-Math.floor(n / 2) + 1);
     }
 
+    /** true = modo simulado (paper); false = LIVE en config. Acepta boolean o strings típicos de JSON mal editado. */
+    function isConfigDryRun(v) {
+      if (v === false || v === "false" || v === 0 || v === "0") return false;
+      if (v === true || v === "true" || v === 1 || v === "1") return true;
+      return true;
+    }
+
     async function refreshAccountPanel() {
       var msg = document.getElementById("acc-panel-msg");
       try {
@@ -451,7 +458,7 @@
             "text-base font-bold mt-0.5 " + (totp >= 0 ? "text-emerald-300" : "text-rose-300");
         }
         var envDry = !!pack.dry_run_process_env;
-        var stratDry = !!cfg.dry_run;
+        var stratDry = isConfigDryRun(cfg.dry_run);
         var eff = envDry || stratDry;
         var badge = document.getElementById("acc-mode-badge");
         if (badge) {
@@ -545,14 +552,21 @@
         if (knob && wrap) {
           var onDry = stratDry;
           wrap.setAttribute("aria-checked", onDry ? "true" : "false");
-          knob.style.transform = onDry ? "translateX(0.15rem)" : "translateX(1.25rem)";
+          knob.style.transform = onDry
+            ? "translate(0.125rem, 0.125rem)"
+            : "translate(1.25rem, 0.125rem)";
           wrap.className =
             "relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border transition " +
             (onDry ? "border-amber-600 bg-amber-900/40" : "border-rose-600 bg-rose-900/40");
         }
         if (msg) {
-          msg.textContent = b.error ? "Balance: " + b.error : envDry ? "Proceso en DRY_RUN global: órdenes reales bloqueadas." : "";
-          msg.className = "text-[10px] font-mono min-h-[1rem] " + (b.error ? "text-amber-400" : "text-slate-500");
+          if (b.error) {
+            msg.textContent = "Balance: " + b.error;
+            msg.className = "text-[10px] font-mono min-h-[1rem] text-amber-400";
+          } else if (envDry) {
+            msg.textContent = "Proceso en DRY_RUN global: órdenes reales bloqueadas.";
+            msg.className = "text-[10px] font-mono min-h-[1rem] text-slate-500";
+          }
         }
       } catch (err) {
         if (msg) {
@@ -605,7 +619,7 @@
             return;
           }
           var pack = await cR.json();
-          var cur = !!(pack.config && pack.config.dry_run);
+          var cur = pack.config ? isConfigDryRun(pack.config.dry_run) : true;
           var next = !cur;
           var body = { dry_run: next };
           if (!next && pack.dry_run_process_env) {
@@ -634,12 +648,13 @@
             }
             return;
           }
-          if (msg && body.confirm_live) {
-            msg.textContent = "Config guardada. Si el motor se paró, pulsa Encender para operar en LIVE.";
-            msg.className = "text-[10px] font-mono text-emerald-400/90 min-h-[1rem]";
-          }
           await refreshAccountPanel();
           await loadSixcycleConfigUi();
+          if (msg && body.confirm_live) {
+            msg.textContent =
+              "Config guardada. Si el motor se paró, pulsa Encender. Órdenes reales: DRY_RUN=false en el proceso y credenciales CLOB.";
+            msg.className = "text-[10px] font-mono text-emerald-400/90 min-h-[1rem]";
+          }
         } catch (err) {
           if (msg) {
             msg.textContent = String(err);
@@ -868,7 +883,7 @@
         if (typ === "bool") {
           input = document.createElement("input");
           input.type = "checkbox";
-          input.checked = !!val;
+          input.checked = key === "dry_run" ? isConfigDryRun(val) : !!val;
           input.className = "h-4 w-4 rounded border-slate-600 text-indigo-500 shrink-0";
         } else if (typ === "str") {
           if (key === "profile_note") {

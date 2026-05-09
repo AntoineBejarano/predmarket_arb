@@ -114,6 +114,30 @@ def _merge_defaults(disk: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _coerce_bool_key(key: str, v: Any) -> Any:
+    """Acepta bool o strings típicos si el JSON se editó a mano (p. ej. \"false\")."""
+    if key not in ("dry_run", "enabled"):
+        return v
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return bool(int(v))
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("false", "0", "no", "off", ""):
+            return False
+        if s in ("true", "1", "yes", "on"):
+            return True
+    return v
+
+
+def _normalize_bool_fields(cfg: dict[str, Any]) -> None:
+    for k in ("dry_run", "enabled"):
+        if k not in cfg:
+            continue
+        cfg[k] = _coerce_bool_key(k, cfg[k])
+
+
 def load_config() -> dict[str, Any]:
     """Lee JSON desde disco; si falta o falla, devuelve defaults."""
     with _CONFIG_LOCK:
@@ -124,7 +148,9 @@ def load_config() -> dict[str, Any]:
             raw = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 return dict(DEFAULT_SIXCYCLE_CONFIG)
-            return _merge_defaults(raw)
+            out = _merge_defaults(raw)
+            _normalize_bool_fields(out)
+            return out
         except (OSError, json.JSONDecodeError, TypeError) as e:
             log.warning("sixcycle_config load failed: %s", e)
             return dict(DEFAULT_SIXCYCLE_CONFIG)
@@ -349,7 +375,8 @@ def merge_and_validate(current: dict[str, Any], partial: dict[str, Any]) -> dict
         if k not in _CONFIG_KEYS:
             log.warning("sixcycle_config: clave desconocida ignorada: %s", k)
             continue
-        out[k] = v
+        out[k] = _coerce_bool_key(k, v)
+    _normalize_bool_fields(out)
     validate_config(out)
     return out
 
