@@ -73,6 +73,8 @@ MAX_STAKE_USDC = float(os.getenv("MAX_STAKE_USDC", "10.0"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 SCAN_INTERVAL_SECONDS = float(os.getenv("SCAN_INTERVAL_SECONDS", "30.0"))
 PREPARE_LAST_SECONDS = int(os.getenv("SIXCYCLE_PREPARE_LAST_SECONDS", "90"))
+# Evita intentar órdenes LIVE cuando el mercado está prácticamente cerrado.
+LIVE_MIN_TTE_SEC = float(os.getenv("SIXCYCLE_LIVE_MIN_TTE_SEC", "6.0"))
 GAMMA_API_URL = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com").rstrip("/")
 BINANCE_REST_URL = os.getenv("BINANCE_REST_URL", "https://api.binance.com").rstrip("/")
 
@@ -1415,6 +1417,21 @@ class SixCycleEngine:
                                 if px_no is not None:
                                     fill_price = float(px_no)
 
+                            tte_now = float(m.get("tte_sec") or 0.0)
+                            if not self._dry_run_effective and tte_now <= LIVE_MIN_TTE_SEC:
+                                log.warning(
+                                    "LIVE fill omitido por cierre inminente "
+                                    "market=%s dir=%s tte=%.2fs guard=%.2fs",
+                                    mid,
+                                    str(val.get("direction") or "YES"),
+                                    tte_now,
+                                    LIVE_MIN_TTE_SEC,
+                                )
+                                self._last_signal_line = (
+                                    f"LIVE omitido: cierre inminente (tte={tte_now:.2f}s <= {LIVE_MIN_TTE_SEC:.2f}s)"
+                                )
+                                continue
+
                             try:
                                 t_fill = time.perf_counter()
                                 fill_out = await self.cycle_fill(
@@ -1435,11 +1452,22 @@ class SixCycleEngine:
                                     fill_out.get("simulated", True),
                                 )
                             except Exception as e:  # noqa: BLE001
-                                log.warning("cycle_fill error", extra={"error": str(e)})
+                                log.exception(
+                                    "cycle_fill error market=%s dir=%s token=%s stake=%.4f price=%.4f tte=%.2fs",
+                                    mid,
+                                    str(val.get("direction") or "YES"),
+                                    str(token_fill)[:16],
+                                    float(stake),
+                                    float(fill_price),
+                                    float(tte_now),
+                                )
                                 if not self._dry_run_effective:
                                     log.critical(
-                                        "LIVE fill falló — no reintento automático",
-                                        extra={"error": str(e)},
+                                        "LIVE fill falló — no reintento automático "
+                                        "market=%s dir=%s tte=%.2fs",
+                                        mid,
+                                        str(val.get("direction") or "YES"),
+                                        float(tte_now),
                                     )
                                 continue
 
@@ -1887,6 +1915,21 @@ class SixCycleEngine:
             out = await asyncio.to_thread(_place)
             ok = bool(out.get("success"))
             oid = str(out.get("order_id") or "")
+            if not ok:
+                err = str(out.get("error") or "").strip()
+                raw = out.get("raw")
+                raw_s = ""
+                if raw is not None:
+                    raw_s = str(raw)[:300]
+                log.warning(
+                    "LIVE place_order rechazado market=%s dir=%s stake=%.4f price=%.4f error=%s raw=%s",
+                    str(market_id).strip(),
+                    dir_s,
+                    float(stake_usdc),
+                    float(fill_px),
+                    err or "-",
+                    raw_s or "-",
+                )
             return {
                 "filled": ok,
                 "price": float(out.get("price", fill_px)),
@@ -1894,7 +1937,13 @@ class SixCycleEngine:
                 "simulated": False,
             }
         except Exception as e:  # noqa: BLE001
-            log.critical("LIVE place_order falló", extra={"error": str(e)})
+            log.exception(
+                "LIVE place_order falló market=%s dir=%s stake=%.4f price=%.4f",
+                str(market_id).strip(),
+                dir_s,
+                float(stake_usdc),
+                float(fill_px),
+            )
             raise
 
     async def cycle_settle(self, settle_payload: dict[str, Any]) -> None:
