@@ -341,9 +341,12 @@ class PolymarketTradingClient:
         if self.effective_dry_run():
             return {"usdc_available": None, "raw": None, "simulated": True}
         try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-        except ImportError as e:
-            raise RuntimeError("py-clob-client no instalado") from e
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+        except ImportError:
+            try:
+                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore[assignment]
+            except ImportError as e:
+                raise RuntimeError("py-clob-client-v2 no instalado") from e
 
         client = _get_clob_client()
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, token_id=None, signature_type=-1)
@@ -355,10 +358,13 @@ class PolymarketTradingClient:
         """Órdenes abiertas CLOB como posiciones (mercado / lado / tamaño)."""
         if self.effective_dry_run():
             return []
-        from py_clob_client.clob_types import OpenOrderParams
+        try:
+            from py_clob_client_v2.clob_types import OpenOrderParams
+        except ImportError:
+            from py_clob_client.clob_types import OpenOrderParams  # type: ignore[assignment]
 
         client = _get_clob_client()
-        orders = client.get_orders(OpenOrderParams())
+        orders = _get_open_orders(client, OpenOrderParams())
         out: list[dict[str, Any]] = []
         for o in orders or []:
             if not isinstance(o, dict):
@@ -423,9 +429,12 @@ class PolymarketLiveAccount:
 
     def get_balance(self) -> dict[str, Any]:
         try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-        except ImportError as e:
-            raise RuntimeError("py-clob-client no instalado") from e
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+        except ImportError:
+            try:
+                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore[assignment]
+            except ImportError as e:
+                raise RuntimeError("py-clob-client-v2 no instalado") from e
 
         client = _get_clob_client()
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, token_id=None, signature_type=-1)
@@ -447,10 +456,13 @@ class PolymarketLiveAccount:
         }
 
     def get_positions(self) -> list[dict[str, Any]]:
-        from py_clob_client.clob_types import OpenOrderParams
+        try:
+            from py_clob_client_v2.clob_types import OpenOrderParams
+        except ImportError:
+            from py_clob_client.clob_types import OpenOrderParams  # type: ignore[assignment]
 
         client = _get_clob_client()
-        orders = client.get_orders(OpenOrderParams())
+        orders = _get_open_orders(client, OpenOrderParams())
         out: list[dict[str, Any]] = []
         for o in orders or []:
             if not isinstance(o, dict):
@@ -493,13 +505,28 @@ def _parse_balance(raw: Any) -> Optional[float]:
     return None
 
 
+def _get_open_orders(client: Any, params: Any) -> list:
+    """Compatibilidad v1/v2: v2 usa get_open_orders, v1 usa get_orders."""
+    if hasattr(client, "get_open_orders"):
+        result = client.get_open_orders(params)
+    else:
+        result = client.get_orders(params)  # type: ignore[attr-defined]
+    if isinstance(result, dict):
+        # v2 puede devolver {"data": [...], "next_cursor": "..."}
+        return result.get("data") or []
+    return result or []
+
+
 def _estimate_open_orders_notional(client: Any) -> float:
     """Suma aproximada USDC en libros (restante * precio) de órdenes abiertas."""
-    from py_clob_client.clob_types import OpenOrderParams
+    try:
+        from py_clob_client_v2.clob_types import OpenOrderParams
+    except ImportError:
+        from py_clob_client.clob_types import OpenOrderParams  # type: ignore[assignment]
 
     tot = 0.0
     try:
-        orders = client.get_orders(OpenOrderParams())
+        orders = _get_open_orders(client, OpenOrderParams())
     except Exception:
         return 0.0
     for o in orders or []:
