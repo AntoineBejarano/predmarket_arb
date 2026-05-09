@@ -45,7 +45,7 @@ import signal as sig_module
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 import aiohttp
 import numpy as np
@@ -146,6 +146,9 @@ SIXCYCLE_STATE: dict[str, Any] = {
     "clob_no_price": None,
     "clob_bar": "",
     "dry_run_stake_multiplier": 1.0,
+    "live_error": None,
+    "live_error_ts": None,
+    "live_error_reason": None,
 }
 
 
@@ -205,8 +208,19 @@ def reset_sixcycle_live_state() -> None:
                 "clob_no_price": None,
                 "clob_bar": "",
                 "dry_run_stake_multiplier": get_dry_run_stake_multiplier(),
+                "live_error": None,
+                "live_error_ts": None,
+                "live_error_reason": None,
             }
         )
+
+
+class LiveOrderFailure(RuntimeError):
+    """Fallo operativo en orden LIVE que debe disparar stop de estrategia."""
+
+    def __init__(self, message: str, *, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.detail = dict(detail or {})
 
 
 def _floor_5m_window_ts_utc(now: datetime) -> int:
@@ -510,7 +524,10 @@ def _scorer_confirms_extreme(signal: dict[str, Any], extreme: str) -> bool:
 class SixCycleEngine:
     """Loop principal 6 ciclos: Scan→Predict→Validate→Size→Fill→Settle."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_live_failure: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
         print(f"NEW ENGINE INSTANCE id={id(self)}")
         self.scorer = MarketScorer()
         self._scorer_token: str | None = None
@@ -544,6 +561,7 @@ class SixCycleEngine:
         self._dry_run_effective = bool(DRY_RUN)
         self._daily_pnl_usdc: float = 0.0
         self._daily_pnl_date_utc: datetime | None = None
+        self._on_live_failure = on_live_failure
         self.reload_config()
         self._ensure_csv_header()
 
@@ -808,6 +826,13 @@ class SixCycleEngine:
             direction = str(direction)
 
         wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
+        prev_live_error: Any = None
+        prev_live_error_ts: Any = None
+        prev_live_error_reason: Any = None
+        with SIXCYCLE_STATE_LOCK:
+            prev_live_error = SIXCYCLE_STATE.get("live_error")
+            prev_live_error_ts = SIXCYCLE_STATE.get("live_error_ts")
+            prev_live_error_reason = SIXCYCLE_STATE.get("live_error_reason")
 
         payload: dict[str, Any] = {
             "timestamp_utc": now.isoformat(),
@@ -836,6 +861,9 @@ class SixCycleEngine:
             "clob_extreme": clob_ex_s,
             "clob_no_price": clob_no,
             "clob_bar": clob_bar_s,
+            "live_error": prev_live_error,
+            "live_error_ts": prev_live_error_ts,
+            "live_error_reason": prev_live_error_reason,
         }
         with SIXCYCLE_STATE_LOCK:
             SIXCYCLE_STATE.clear()
@@ -854,6 +882,38 @@ class SixCycleEngine:
             SIXCYCLE_STATE["best_streak"] = int(self.best_streak)
             if DRY_RUN:
                 SIXCYCLE_STATE["dry_run_stake_multiplier"] = float(get_dry_run_stake_multiplier())
+
+    def _clear_live_error_state(self) -> None:
+        with SIXCYCLE_STATE_LOCK:
+            SIXCYCLE_STATE["live_error"] = None
+            SIXCYCLE_STATE["live_error_ts"] = None
+            SIXCYCLE_STATE["live_error_reason"] = None
+
+    async def _mark_live_failure_and_stop(
+        self,
+        *,
+        reason: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "reason": str(reason or "live_order_failed"),
+            "detail": dict(detail or {}),
+            "ts": now_iso,
+        }
+        with SIXCYCLE_STATE_LOCK:
+            SIXCYCLE_STATE["timestamp_utc"] = now_iso
+            SIXCYCLE_STATE["phase"] = "FAILED_STOPPED"
+            SIXCYCLE_STATE["signal"] = False
+            SIXCYCLE_STATE["live_error"] = payload["detail"]
+            SIXCYCLE_STATE["live_error_ts"] = now_iso
+            SIXCYCLE_STATE["live_error_reason"] = payload["reason"]
+        self._stop_run.set()
+        if self._on_live_failure is not None:
+            try:
+                await self._on_live_failure(payload)
+            except Exception:
+                log.exception("on_live_failure callback falló")
 
     async def shutdown(self) -> None:
         """Solicita salida del bucle principal; ``run()`` hace ``scorer.stop()`` en ``finally``."""
@@ -1172,6 +1232,7 @@ class SixCycleEngine:
             headers=_DEFAULT_HEADERS,
         ) as http:
             self._http_session = http
+            self._clear_live_error_state()
             async with PolyCLOBClient(
                 api_key=os.getenv("POLY_API_KEY", ""),
                 private_key=os.getenv("POLY_PRIVATE_KEY", ""),
@@ -1462,6 +1523,17 @@ class SixCycleEngine:
                                     float(tte_now),
                                 )
                                 if not self._dry_run_effective:
+                                    fail_detail: dict[str, Any] = {
+                                        "market_id": mid,
+                                        "direction": str(val.get("direction") or "YES"),
+                                        "token_id": str(token_fill),
+                                        "stake_usdc": float(stake),
+                                        "price": float(fill_price),
+                                        "tte_sec": float(tte_now),
+                                        "error": str(e),
+                                    }
+                                    if isinstance(e, LiveOrderFailure):
+                                        fail_detail.update(e.detail)
                                     log.critical(
                                         "LIVE fill falló — no reintento automático "
                                         "market=%s dir=%s tte=%.2fs",
@@ -1469,6 +1541,11 @@ class SixCycleEngine:
                                         str(val.get("direction") or "YES"),
                                         float(tte_now),
                                     )
+                                    await self._mark_live_failure_and_stop(
+                                        reason="live_order_failed",
+                                        detail=fail_detail,
+                                    )
+                                    return
                                 continue
 
                             fill_result = fill_out
@@ -1930,6 +2007,17 @@ class SixCycleEngine:
                     float(fill_px),
                     err or "-",
                     raw_s or "-",
+                )
+                raise LiveOrderFailure(
+                    f"LIVE place_order rechazado: {err or 'unknown_error'}",
+                    detail={
+                        "place_order_error": err or "unknown_error",
+                        "order_raw": raw_s or None,
+                        "market_id": str(market_id).strip(),
+                        "direction": dir_s,
+                        "stake_usdc": float(stake_usdc),
+                        "price": float(fill_px),
+                    },
                 )
             return {
                 "filled": ok,

@@ -127,5 +127,76 @@
     render();
   }
 
+  var _authBlocked = false;
+  var _authListeners = [];
+  var _authBannerId = "pm-auth-expired-banner";
+  var _authMsg =
+    "Sesion expirada o sin autenticar. Recarga la pagina y vuelve a iniciar sesion para reanudar polling/SSE.";
+
+  function authBanner() {
+    var el = document.getElementById(_authBannerId);
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = _authBannerId;
+    el.className =
+      "fixed bottom-3 right-3 z-[120] max-w-md rounded-lg border border-rose-700/80 bg-rose-950/95 px-3 py-2 text-xs text-rose-100 shadow-xl";
+    el.style.display = "none";
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function emitAuthState() {
+    _authListeners.forEach(function (fn) {
+      try {
+        fn(_authBlocked);
+      } catch (err) {}
+    });
+  }
+
+  function setAuthBlocked(blocked, message) {
+    if (blocked === _authBlocked && (!blocked || !message)) return;
+    _authBlocked = blocked;
+    var el = authBanner();
+    if (_authBlocked) {
+      el.textContent = String(message || _authMsg);
+      el.style.display = "block";
+    } else {
+      el.style.display = "none";
+    }
+    emitAuthState();
+  }
+
+  async function authFetch(input, init) {
+    var res = await window.fetch(input, init);
+    if (res.status === 401) {
+      setAuthBlocked(true, _authMsg);
+    } else if (res.ok && _authBlocked) {
+      setAuthBlocked(false);
+    }
+    return res;
+  }
+
+  window.PMAuth = {
+    fetch: authFetch,
+    isBlocked: function () {
+      return _authBlocked;
+    },
+    markUnauthorized: function (message) {
+      setAuthBlocked(true, message || _authMsg);
+    },
+    clear: function () {
+      setAuthBlocked(false);
+    },
+    onChange: function (fn) {
+      if (typeof fn !== "function") return function () {};
+      _authListeners.push(fn);
+      return function () {
+        _authListeners = _authListeners.filter(function (x) {
+          return x !== fn;
+        });
+      };
+    },
+  };
+
   window.PredMarketArbNav = { refresh: render };
 })();

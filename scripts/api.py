@@ -162,6 +162,26 @@ def _http_basic_challenge_response() -> JSONResponse:
     )
 
 
+def _request_is_secure(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    xfp = request.headers.get("x-forwarded-proto", "")
+    if xfp:
+        proto = xfp.split(",", 1)[0].strip().lower()
+        return proto == "https"
+    return False
+
+
+def _auth_cookie_samesite(secure: bool) -> str:
+    raw = os.getenv("API_AUTH_COOKIE_SAMESITE", "lax").strip().lower()
+    if raw not in {"lax", "strict", "none"}:
+        raw = "lax"
+    if raw == "none" and not secure:
+        # Compat local/http: SameSite=None exige cookie Secure.
+        return "lax"
+    return raw
+
+
 class _HttpBasicAuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, username: str, password: str, session_ttl_sec: int):
         super().__init__(app)
@@ -180,16 +200,15 @@ class _HttpBasicAuthMiddleware(BaseHTTPMiddleware):
         if _basic_credentials_ok(request, self._username, self._password):
             resp = await call_next(request)
             token = _sign_auth_session(self._username, self._password, self._session_ttl_sec)
-            secure = request.url.scheme == "https" or (
-                request.headers.get("x-forwarded-proto", "").lower() == "https"
-            )
+            secure = _request_is_secure(request)
+            same_site = _auth_cookie_samesite(secure)
             resp.set_cookie(
                 PM_AUTH_COOKIE_NAME,
                 token,
                 max_age=self._session_ttl_sec,
                 httponly=True,
                 secure=secure,
-                samesite="lax",
+                samesite=same_site,
                 path="/",
             )
             return resp
@@ -1130,6 +1149,48 @@ def _sixcycle_running() -> bool:
     return _sixcycle_task is not None and not _sixcycle_task.done()
 
 
+def _strategy_stop_fields(st: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "stopped_by_failure": bool(st.get("stopped_by_failure", False)),
+        "last_stop_reason": st.get("last_stop_reason"),
+        "last_stop_detail": st.get("last_stop_detail"),
+        "last_stop_ts": st.get("last_stop_ts"),
+    }
+
+
+async def _stop_strategy_due_failure(
+    slug: str,
+    *,
+    reason: str,
+    detail: dict[str, Any] | None = None,
+    stop_runtime: bool = True,
+) -> dict[str, Any]:
+    """
+    Parada genérica por fallo operativo (reutilizable por distintas estrategias).
+    - Marca ``enabled=false`` y registra motivo estructurado para UI.
+    - Opcionalmente para runtime local de sixcycle.
+    """
+    if slug not in STRATEGY_SLUGS:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy: {slug}")
+    if stop_runtime and slug == SIXCYCLE_SLUG and _sixcycle_running():
+        await _sixcycle_stop()
+    await _state_manager.disable_with_error(
+        slug,
+        reason=reason,
+        detail=detail,
+    )
+    return {"slug": slug, "enabled": False, "stopped_by_failure": True, "reason": reason}
+
+
+async def _on_sixcycle_live_failure(payload: dict[str, Any]) -> None:
+    await _stop_strategy_due_failure(
+        SIXCYCLE_SLUG,
+        reason=str(payload.get("reason") or "live_order_failed"),
+        detail=payload,
+        stop_runtime=False,  # El propio engine ya se auto-detiene.
+    )
+
+
 async def _sixcycle_start() -> tuple[bool, Optional[str]]:
     """Arranca ``SixCycleEngine.run()`` en segundo plano (independiente de arb_engine)."""
     global _sixcycle_task, _sixcycle_engine
@@ -1138,7 +1199,7 @@ async def _sixcycle_start() -> tuple[bool, Optional[str]]:
             return False, "already_running"
         from scripts import sixcycle_engine as six_mod
 
-        eng = six_mod.SixCycleEngine()
+        eng = six_mod.SixCycleEngine(on_live_failure=_on_sixcycle_live_failure)
         _sixcycle_engine = eng
         log.info("Sixcycle engine instancia id=%d", id(eng))
         _sixcycle_task = asyncio.create_task(eng.run(), name="sixcycle_engine")
@@ -1405,6 +1466,7 @@ def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
     """Borra CSV/logs auxiliares del motor Arb bajo DATA_DIR (no toca strategy_state.json)."""
     paths: list[Path] = []
     paths.extend(ARB_CSV_PATHS.values())
+    paths.append(SIXCYCLE_SIGNALS_CSV)
     paths.extend(
         [
             BUNDLE_ARB_SCAN_JSON,
@@ -1426,7 +1488,12 @@ def _arb_delete_data_files(include_validator: bool) -> dict[str, Any]:
                 removed.append(str(p))
         except OSError as e:
             errors.append(f"{p}: {e}")
-    out: dict[str, Any] = {"files_removed": removed, "file_errors": errors}
+    out: dict[str, Any] = {
+        "files_attempted": [str(p) for p in paths],
+        "files_removed": removed,
+        "file_errors": errors,
+        "files_missing": [str(p) for p in paths if str(p) not in set(removed) and not any(str(p) in err for err in errors)],
+    }
     try:
         from persistence.writes import clear_postgres_on_arb_data_reset
 
@@ -1461,6 +1528,7 @@ def _build_arb_strategy_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
             "fict_roi": round(roi, 6),
             "fict_last_stake_eur": st.get("fict_last_stake_eur"),
             "fict_last_pnl_est_eur": st.get("fict_last_pnl_est_eur"),
+            **_strategy_stop_fields(st),
             **stats,
         }
         if slug == "latency_arb_sports":
@@ -1675,6 +1743,12 @@ async def arb_reset_data(
             await _sixcycle_stop()
         except Exception as e:
             log.warning("POST /api/arb/reset-data: sixcycle_stop: %s", e)
+        try:
+            from scripts import sixcycle_engine as six_mod
+
+            six_mod.reset_sixcycle_live_state()
+        except Exception as e:
+            log.warning("POST /api/arb/reset-data: reset_sixcycle_live_state: %s", e)
         engine_stopped_here, _ = await asyncio.to_thread(_arb_engine_stop)
         file_result = await asyncio.to_thread(_arb_delete_data_files, include_validator)
         await _state_manager.reset_fictional_paper()
@@ -1732,6 +1806,15 @@ async def arb_strategy_disable(slug: str) -> dict[str, Any]:
         return {"slug": slug, "enabled": False}
     await _state_manager.disable(slug)
     return {"slug": slug, "enabled": False}
+
+
+@app.post("/api/arb/strategy/{slug}/fail-stop")
+async def arb_strategy_fail_stop(slug: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Parada explícita de una estrategia por fallo, con motivo estructurado para UI."""
+    reason = str(body.get("reason") or "strategy_failure").strip() or "strategy_failure"
+    detail_raw = body.get("detail")
+    detail = detail_raw if isinstance(detail_raw, dict) else {}
+    return await _stop_strategy_due_failure(slug, reason=reason, detail=detail, stop_runtime=True)
 
 
 @app.get("/api/arb/strategy/{slug}/log")
@@ -2009,6 +2092,9 @@ async def api_sixcycle_status() -> JSONResponse:
 
     with six_mod.SIXCYCLE_STATE_LOCK:
         payload = dict(six_mod.SIXCYCLE_STATE)
+    all_state = await _state_manager.get_all()
+    st = (all_state.get(SIXCYCLE_SLUG) or {}) if isinstance(all_state, dict) else {}
+    payload.update(_strategy_stop_fields(st))
     await asyncio.to_thread(_sixcycle_merge_csv_kpis_into_payload, payload)
     return JSONResponse(content=payload)
 
@@ -2102,6 +2188,7 @@ async def api_strategies_list() -> JSONResponse:
         row: dict[str, Any] = {
             "slug": slug,
             "enabled": enabled,
+            **_strategy_stop_fields(st),
         }
         if slug == SIXCYCLE_SLUG:
             row["dry_run"] = bool(sc_cfg.get("dry_run", True))

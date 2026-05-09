@@ -56,6 +56,10 @@ class StrategyStateManager:
                 "enabled": False,
                 "enabled_at": None,
                 "disabled_at": None,
+                "stopped_by_failure": False,
+                "last_stop_reason": None,
+                "last_stop_detail": None,
+                "last_stop_ts": None,
                 "fict_capital_eur": cap,
                 "fict_pnl_cumulative_eur": 0.0,
                 "fict_trades": 0,
@@ -126,6 +130,10 @@ class StrategyStateManager:
             if slug in self._state:
                 self._state[slug]["enabled"] = True
                 self._state[slug]["enabled_at"] = datetime.now(timezone.utc).isoformat()
+                self._state[slug]["stopped_by_failure"] = False
+                self._state[slug]["last_stop_reason"] = None
+                self._state[slug]["last_stop_detail"] = None
+                self._state[slug]["last_stop_ts"] = None
                 self._save()
 
     async def disable(self, slug: str) -> None:
@@ -135,6 +143,27 @@ class StrategyStateManager:
                 self._state[slug]["enabled"] = False
                 self._state[slug]["disabled_at"] = datetime.now(timezone.utc).isoformat()
                 self._save()
+
+    async def disable_with_error(
+        self,
+        slug: str,
+        *,
+        reason: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Apaga una estrategia y registra motivo estructurado para UI/API."""
+        async with self._lock:
+            self._reload_if_file()
+            if slug not in self._state:
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            self._state[slug]["enabled"] = False
+            self._state[slug]["disabled_at"] = now
+            self._state[slug]["stopped_by_failure"] = True
+            self._state[slug]["last_stop_reason"] = str(reason or "strategy_failure")
+            self._state[slug]["last_stop_detail"] = dict(detail or {})
+            self._state[slug]["last_stop_ts"] = now
+            self._save()
 
     async def disable_all_strategies(self) -> None:
         """Apaga el interruptor de todas las estrategias (un solo guardado en disco)."""
@@ -147,6 +176,10 @@ class StrategyStateManager:
                     self._state[slug] = defaults[slug]
                 self._state[slug]["enabled"] = False
                 self._state[slug]["disabled_at"] = now
+                self._state[slug]["stopped_by_failure"] = False
+                self._state[slug]["last_stop_reason"] = None
+                self._state[slug]["last_stop_detail"] = None
+                self._state[slug]["last_stop_ts"] = None
             self._save()
 
     async def get_all(self) -> dict:
@@ -166,6 +199,10 @@ class StrategyStateManager:
                 ent["fict_trades"] = 0
                 ent["fict_last_stake_eur"] = None
                 ent["fict_last_pnl_est_eur"] = None
+                ent["stopped_by_failure"] = False
+                ent["last_stop_reason"] = None
+                ent["last_stop_detail"] = None
+                ent["last_stop_ts"] = None
                 self._state[slug] = ent
             self._save()
 

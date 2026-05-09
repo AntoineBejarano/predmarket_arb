@@ -259,12 +259,14 @@
 
     async function loadSnapshots() {
       if (SLUG !== "latency_arb_sports") return;
+      if (authBlocked()) return;
       const tbody = document.getElementById("snapshots-body");
       const thead = document.getElementById("snapshots-head");
       if (!tbody || !thead) return;
       let rows = [];
       try {
-        const r = await fetch("/api/arb/strategy/latency_arb_sports/snapshots?limit=400");
+        const r = await apiFetch("/api/arb/strategy/latency_arb_sports/snapshots?limit=400");
+        if (r.status === 401) return;
         if (r.ok) rows = await r.json();
       } catch (e) {}
       if (!rows.length) {
@@ -361,6 +363,92 @@
     }
 
     let _enabled = false;
+    let _execNotifyCooldownUntil = 0;
+    const _execSeen = new Map();
+    const EXEC_NOTIFY_COOLDOWN_MS = 3500;
+
+    function apiFetch(url, init) {
+      if (window.PMAuth && typeof window.PMAuth.fetch === "function") {
+        return window.PMAuth.fetch(url, init);
+      }
+      return fetch(url, init);
+    }
+
+    function authBlocked() {
+      return !!(window.PMAuth && typeof window.PMAuth.isBlocked === "function" && window.PMAuth.isBlocked());
+    }
+
+    function cleanupExecSeen(nowMs) {
+      for (const [k, ts] of _execSeen.entries()) {
+        if (nowMs - ts > 120000) _execSeen.delete(k);
+      }
+    }
+
+    function execKey(payload) {
+      const sid = String(payload.signal_id || "").trim();
+      const oid = String(payload.order_id || "").trim();
+      if (sid) return "signal:" + sid;
+      if (oid) return "order:" + oid;
+      return [payload.ts || "", payload.market_id || "", payload.action || ""].join("|");
+    }
+
+    function shouldNotifyExecuted(payload) {
+      const action = String(payload.action || "");
+      if (!action.startsWith("EXECUTED")) return false;
+      const now = Date.now();
+      cleanupExecSeen(now);
+      const k = execKey(payload);
+      if (_execSeen.has(k)) return false;
+      if (now < _execNotifyCooldownUntil) return false;
+      _execSeen.set(k, now);
+      _execNotifyCooldownUntil = now + EXEC_NOTIFY_COOLDOWN_MS;
+      return true;
+    }
+
+    function playExecBeep() {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        if (!window.__pmAudioCtx) window.__pmAudioCtx = new Ctx();
+        const ctx = window.__pmAudioCtx;
+        const now = ctx.currentTime;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(900, now);
+        osc.frequency.exponentialRampToValueAtTime(550, now + 0.12);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.16);
+      } catch (e) {}
+    }
+
+    function showExecToast(payload) {
+      let host = document.getElementById("pm-exec-toast-host");
+      if (!host) {
+        host = document.createElement("div");
+        host.id = "pm-exec-toast-host";
+        host.className = "fixed right-3 bottom-3 z-[110] flex flex-col gap-2";
+        document.body.appendChild(host);
+      }
+      const el = document.createElement("div");
+      const edge =
+        payload.edge != null && payload.edge !== ""
+          ? " edge " + (Number(payload.edge) * 100).toFixed(2) + "%"
+          : "";
+      el.className =
+        "rounded-lg border border-emerald-500/60 bg-emerald-950/95 px-3 py-2 text-xs font-mono text-emerald-100 shadow-lg";
+      el.textContent = "EXECUTED " + SLUG + edge;
+      host.appendChild(el);
+      playExecBeep();
+      window.setTimeout(() => {
+        if (el.parentNode) el.parentNode.removeChild(el);
+      }, 3200);
+    }
 
     function broadcastArbControlPlaneChanged() {
       try {
@@ -401,9 +489,14 @@
     }
 
     async function refreshStatus() {
+      if (authBlocked()) return;
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
-        const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        const r = await apiFetch("/api/arb/status", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (r.status === 401) return;
         if (r.ok) data = await r.json();
       } catch (e) {}
       const s = (data.strategies || []).find((x) => x.slug === SLUG) || {};
@@ -452,7 +545,11 @@
       if (elSm) elSm.textContent = s.skip_below_min_edge_today != null ? String(s.skip_below_min_edge_today) : "—";
       const elEr = document.getElementById("k-err");
       if (elEr) elEr.textContent = s.errors_today != null ? String(s.errors_today) : "—";
-      document.getElementById("k-last-a").textContent = s.last_action || "—";
+      var lastAction = s.last_action || "—";
+      if (s.stopped_by_failure) {
+        lastAction = "STOP(" + String(s.last_stop_reason || "strategy_failure") + ")";
+      }
+      document.getElementById("k-last-a").textContent = lastAction;
       document.getElementById("k-last-t").textContent = s.last_ts ? formatDateTimeEs(s.last_ts) : "—";
 
       const btn = document.getElementById("btn-toggle");
@@ -467,18 +564,21 @@
 
     async function toggleEnabled() {
       const path = _enabled ? "disable" : "enable";
-      await fetch("/api/arb/strategy/" + SLUG + "/" + path, { method: "POST" });
+      const r = await apiFetch("/api/arb/strategy/" + SLUG + "/" + path, { method: "POST" });
+      if (r.status === 401) return;
       await refreshStatus();
       broadcastArbControlPlaneChanged();
     }
 
     async function arbStart() {
-      await fetch("/api/arb/start", { method: "POST" });
+      const r = await apiFetch("/api/arb/start", { method: "POST" });
+      if (r.status === 401) return;
       await refreshStatus();
       broadcastArbControlPlaneChanged();
     }
     async function arbStop() {
-      await fetch("/api/arb/stop", { method: "POST" });
+      const r = await apiFetch("/api/arb/stop", { method: "POST" });
+      if (r.status === 401) return;
       await refreshStatus();
       broadcastArbControlPlaneChanged();
     }
@@ -506,11 +606,12 @@
       let res;
       try {
         const q = includeVal ? "?include_validator=true" : "";
-        res = await fetch("/api/arb/reset-data" + q, {
+        res = await apiFetch("/api/arb/reset-data" + q, {
           method: "POST",
           cache: "no-store",
           headers: { Accept: "application/json" },
         });
+        if (res.status === 401) return;
       } catch (e) {
         alert("Error de red al reiniciar datos.");
         return;
@@ -532,14 +633,23 @@
       const errs = body.file_errors || [];
       const pgErrs = body.postgres_errors || [];
       const pgOk = body.postgres_engine_logs_cleared === true;
+      const removed = Array.isArray(body.files_removed) ? body.files_removed.length : 0;
+      const missing = Array.isArray(body.files_missing) ? body.files_missing.length : 0;
       if (errs.length || pgErrs.length) {
         let msg = "Datos reiniciados con avisos:\n";
+        msg += "\nBorrados: " + removed + " · ya vacíos/no existentes: " + missing;
         if (errs.length) msg += "\nArchivos:\n" + errs.join("\n");
         if (pgErrs.length) msg += "\nPostgres:\n" + pgErrs.join("\n");
         else if (pgOk) msg += "\n(Postgres: tablas de logs vaciadas.)";
         alert(msg);
       } else {
-        alert(pgOk ? "Datos reiniciados (CSV y tablas Postgres de logs)." : "Datos reiniciados.");
+        let okMsg =
+          "Datos reiniciados. Borrados: " +
+          removed +
+          " · ya vacíos/no existentes: " +
+          missing;
+        if (pgOk) okMsg += " · Postgres: tablas de logs vaciadas.";
+        alert(okMsg);
       }
       await refreshStatus();
       broadcastArbControlPlaneChanged();
@@ -559,6 +669,7 @@
       p.innerHTML = '<span class="text-slate-500">' + formatTimeEs(payload.ts) + '</span> <span class="' + actionClass(a) + '">' + a + "</span> <span class=\"text-slate-500\">" + String(payload.reason || "").slice(0, 120) + "</span>";
       feed.prepend(p);
       while (feed.children.length > 80) feed.removeChild(feed.lastChild);
+      if (shouldNotifyExecuted(payload)) showExecToast(payload);
     }
 
     function startLive() {
@@ -569,19 +680,32 @@
           pushLiveLine(d);
         } catch (err) {}
       };
-      es.onerror = () => es.close();
+      es.onerror = () => {
+        if (authBlocked()) {
+          es.close();
+          return;
+        }
+        es.close();
+      };
+      if (window.PMAuth && typeof window.PMAuth.onChange === "function") {
+        window.PMAuth.onChange((blocked) => {
+          if (blocked) es.close();
+        });
+      }
     }
 
     const PREFERRED_ORDER = ["ts", "action", "reason", "edge", "edge_gross", "size_usdc", "fict_stake_eur", "fict_pnl_est_eur", "fict_pnl_cum_eur", "fict_roi", "market_id", "n_outcomes", "sum_ask", "execution_buffer_est", "fees_est", "order_ids", "mid_dev_max", "dry_run"];
 
     async function loadBundleScan() {
       if (SLUG !== "bundle_arb") return;
+      if (authBlocked()) return;
       const st = document.getElementById("bundle-scan-status");
       const body = document.getElementById("bundle-scan-body");
       if (!st || !body) return;
       let j = {};
       try {
-        const r = await fetch("/api/arb/strategy/bundle_arb/scan");
+        const r = await apiFetch("/api/arb/strategy/bundle_arb/scan");
+        if (r.status === 401) return;
         if (r.ok) j = await r.json();
       } catch (e) {
         st.textContent = "Error de red al leer diagnóstico.";
@@ -691,12 +815,14 @@
     }
 
     async function loadLog() {
+      if (authBlocked()) return;
       const tbody = document.getElementById("log-body");
       const thead = document.getElementById("log-head");
       if (!tbody || !thead) return;
       let rows = [];
       try {
-        const r = await fetch("/api/arb/strategy/" + SLUG + "/log?limit=400");
+        const r = await apiFetch("/api/arb/strategy/" + SLUG + "/log?limit=400");
+        if (r.status === 401) return;
         if (r.ok) rows = await r.json();
       } catch (e) {}
       if (!rows.length) {

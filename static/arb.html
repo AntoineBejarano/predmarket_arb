@@ -224,6 +224,10 @@
         <span class="font-mono text-slate-200">${s.fict_roi != null ? (Number(s.fict_roi) * 100).toFixed(2) + "%" : "—"}</span>
         <span class="text-slate-500">Ops paper</span>
         <span class="font-mono text-slate-200">${s.fict_trades != null ? s.fict_trades : "—"}</span>
+        <span class="text-slate-500">Último stop</span>
+        <span class="font-mono ${s.stopped_by_failure ? "text-rose-300" : "text-slate-400"}">
+          ${s.stopped_by_failure ? String(s.last_stop_reason || "strategy_failure") : "—"}
+        </span>
       </div>
       <div class="text-xs border-t border-slate-700 pt-2 mb-3 truncate">
         <span class="${lastActionColor} font-mono">${s.last_action ?? "—"}</span>
@@ -280,13 +284,15 @@
     }
 
     async function loadLog(slug) {
+      if (authBlocked()) return;
       if (!_logVisible[slug]) return;
       const sel = document.getElementById("filter-" + slug);
       const filter = sel ? sel.value : "";
       const url = "/api/arb/strategy/" + slug + "/log?limit=100&action=" + encodeURIComponent(filter);
       let rows = [];
       try {
-        const r = await fetch(url);
+        const r = await apiFetch(url);
+        if (r.status === 401) return;
         if (r.ok) rows = await r.json();
       } catch (e) {}
       const tbody = document.getElementById("log-body-" + slug);
@@ -350,20 +356,34 @@
       });
     }
 
+    function apiFetch(url, init) {
+      if (window.PMAuth && typeof window.PMAuth.fetch === "function") {
+        return window.PMAuth.fetch(url, init);
+      }
+      return fetch(url, init);
+    }
+
+    function authBlocked() {
+      return !!(window.PMAuth && typeof window.PMAuth.isBlocked === "function" && window.PMAuth.isBlocked());
+    }
+
     async function toggleStrategy(slug, currentlyEnabled) {
       const path = currentlyEnabled ? "disable" : "enable";
-      await fetch("/api/arb/strategy/" + slug + "/" + path, { method: "POST" });
+      const r = await apiFetch("/api/arb/strategy/" + slug + "/" + path, { method: "POST" });
+      if (r.status === 401) return;
       await refreshArbStatus();
       broadcastArbControlPlaneChanged();
     }
 
     async function arbStart() {
-      await fetch("/api/arb/start", { method: "POST" });
+      const r = await apiFetch("/api/arb/start", { method: "POST" });
+      if (r.status === 401) return;
       await refreshArbStatus();
       broadcastArbControlPlaneChanged();
     }
     async function arbStop() {
-      await fetch("/api/arb/stop", { method: "POST" });
+      const r = await apiFetch("/api/arb/stop", { method: "POST" });
+      if (r.status === 401) return;
       await refreshArbStatus();
       broadcastArbControlPlaneChanged();
     }
@@ -391,11 +411,12 @@
       let res;
       try {
         const q = includeVal ? "?include_validator=true" : "";
-        res = await fetch("/api/arb/reset-data" + q, {
+        res = await apiFetch("/api/arb/reset-data" + q, {
           method: "POST",
           cache: "no-store",
           headers: { Accept: "application/json" },
         });
+        if (res.status === 401) return;
       } catch (e) {
         alert("Error de red al reiniciar datos.");
         return;
@@ -417,23 +438,34 @@
       const errs = body.file_errors || [];
       const pgErrs = body.postgres_errors || [];
       const pgOk = body.postgres_engine_logs_cleared === true;
+      const removed = Array.isArray(body.files_removed) ? body.files_removed.length : 0;
+      const missing = Array.isArray(body.files_missing) ? body.files_missing.length : 0;
       if (errs.length || pgErrs.length) {
         let msg = "Datos reiniciados con avisos:\n";
+        msg += "\nBorrados: " + removed + " · ya vacíos/no existentes: " + missing;
         if (errs.length) msg += "\nArchivos:\n" + errs.join("\n");
         if (pgErrs.length) msg += "\nPostgres:\n" + pgErrs.join("\n");
         else if (pgOk) msg += "\n(Postgres: tablas de logs vaciadas.)";
         alert(msg);
       } else {
-        alert(pgOk ? "Datos reiniciados (CSV y tablas Postgres de logs)." : "Datos reiniciados.");
+        let okMsg =
+          "Datos reiniciados. Borrados: " +
+          removed +
+          " · ya vacíos/no existentes: " +
+          missing;
+        if (pgOk) okMsg += " · Postgres: tablas de logs vaciadas.";
+        alert(okMsg);
       }
       await refreshArbStatus();
       broadcastArbControlPlaneChanged();
     }
 
     async function refreshArbStatus() {
+      if (authBlocked()) return;
       let data = { strategies: [], dry_run: true, engine_running: false };
       try {
-        const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        const r = await apiFetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        if (r.status === 401) return;
         if (r.ok) data = await r.json();
       } catch (e) {}
       if (!Array.isArray(data.strategies)) data.strategies = [];
@@ -489,11 +521,20 @@
         while (feed.children.length > 60) feed.removeChild(feed.lastChild);
       };
       es.onerror = () => {
+        if (authBlocked()) {
+          es.close();
+          return;
+        }
         const p = document.createElement("p");
         p.className = "text-red-400 font-mono text-xs";
         p.textContent = "SSE arb desconectado — reintentando…";
         feed.prepend(p);
       };
+      if (window.PMAuth && typeof window.PMAuth.onChange === "function") {
+        window.PMAuth.onChange((blocked) => {
+          if (blocked) es.close();
+        });
+      }
     }
 
     document.addEventListener("DOMContentLoaded", () => {

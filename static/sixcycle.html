@@ -108,6 +108,8 @@
           <span class="text-lg" aria-hidden="true">💰</span>
           <h2 class="text-sm font-semibold text-white tracking-tight">Cuenta</h2>
           <span id="acc-mode-badge" class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-900/50 text-amber-200 border-amber-700/50">SIMULADO</span>
+          <span id="acc-live-status" class="text-[10px] font-mono px-2 py-0.5 rounded border border-slate-600 text-slate-300">LIVE: sin comprobar</span>
+          <span id="acc-live-last-ok" class="text-[10px] font-mono text-slate-500">Último OK: —</span>
         </div>
         <div class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-slate-400">DRY</span>
@@ -307,6 +309,7 @@
           <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wide mb-3">Scorer</h2>
           <span id="lv-phase-badge" class="inline-block text-xs font-bold px-2 py-0.5 rounded-md bg-slate-700 text-slate-300 mb-2">OFFLINE</span>
           <p class="text-xs font-mono text-slate-400 break-all" id="lv-next-slug">—</p>
+          <p class="text-[10px] font-mono text-rose-300 mt-1 min-h-[1rem]" id="lv-stop-reason"></p>
           <p class="text-xs text-slate-500 mt-1">Abre en <strong class="text-slate-200" id="lv-countdown">—</strong>s</p>
           <p class="text-4xl font-black font-mono mt-2 text-slate-400" id="lv-big-score">0</p>
           <p class="text-2xl font-bold mt-1 text-slate-500" id="lv-big-dir">—</p>
@@ -399,6 +402,122 @@
   <script src="/static/nav.js"></script>
   <script>
     const SLUG = "crypto_5m_sixcycle";
+    let _accLastBalanceOkTs = null;
+    let _execNotifyCooldownUntil = 0;
+    const _execSeen = new Map();
+    const EXEC_NOTIFY_COOLDOWN_MS = 3500;
+
+    function apiFetch(url, init) {
+      if (window.PMAuth && typeof window.PMAuth.fetch === "function") {
+        return window.PMAuth.fetch(url, init);
+      }
+      return window.fetch(url, init);
+    }
+
+    function authBlocked() {
+      return !!(window.PMAuth && typeof window.PMAuth.isBlocked === "function" && window.PMAuth.isBlocked());
+    }
+
+    function setLiveStatusBadge(kind, text) {
+      var el = document.getElementById("acc-live-status");
+      if (!el) return;
+      el.textContent = text;
+      if (kind === "ok") {
+        el.className =
+          "text-[10px] font-mono px-2 py-0.5 rounded border border-emerald-600/70 bg-emerald-950/40 text-emerald-200";
+      } else if (kind === "warn") {
+        el.className =
+          "text-[10px] font-mono px-2 py-0.5 rounded border border-amber-600/70 bg-amber-950/40 text-amber-200";
+      } else {
+        el.className =
+          "text-[10px] font-mono px-2 py-0.5 rounded border border-rose-600/70 bg-rose-950/40 text-rose-200";
+      }
+    }
+
+    function updateLastBalanceOkLabel() {
+      var el = document.getElementById("acc-live-last-ok");
+      if (!el) return;
+      if (!_accLastBalanceOkTs) {
+        el.textContent = "Último OK: —";
+        return;
+      }
+      var d = new Date(_accLastBalanceOkTs);
+      el.textContent = "Último OK: " + d.toLocaleTimeString("es-ES", { hour12: false });
+    }
+
+    function cleanupExecSeen(nowMs) {
+      for (const [k, ts] of _execSeen.entries()) {
+        if (nowMs - ts > 120000) _execSeen.delete(k);
+      }
+    }
+
+    function execKey(payload) {
+      const sid = String(payload.signal_id || "").trim();
+      const oid = String(payload.order_id || "").trim();
+      if (sid) return "signal:" + sid;
+      if (oid) return "order:" + oid;
+      return [payload.timestamp_utc || payload.timestamp || payload.ts || "", payload.market_id || "", payload.phase || "", payload.filled || ""].join("|");
+    }
+
+    function shouldNotifyExecuted(payload) {
+      const now = Date.now();
+      cleanupExecSeen(now);
+      const k = execKey(payload);
+      if (_execSeen.has(k)) return false;
+      if (now < _execNotifyCooldownUntil) return false;
+      const action = String(payload.action || "").toUpperCase();
+      const phase = String(payload.phase || "").toUpperCase();
+      const filled = String(payload.filled || "").toLowerCase() === "true";
+      if (!(action.startsWith("EXECUTED") || phase === "EXECUTED" || filled)) return false;
+      _execSeen.set(k, now);
+      _execNotifyCooldownUntil = now + EXEC_NOTIFY_COOLDOWN_MS;
+      return true;
+    }
+
+    function playExecBeep() {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        if (!window.__pmAudioCtx) window.__pmAudioCtx = new Ctx();
+        const ctx = window.__pmAudioCtx;
+        const now = ctx.currentTime;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(900, now);
+        osc.frequency.exponentialRampToValueAtTime(540, now + 0.14);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.17);
+      } catch (e) {}
+    }
+
+    function showExecToast(payload) {
+      let host = document.getElementById("pm-exec-toast-host");
+      if (!host) {
+        host = document.createElement("div");
+        host.id = "pm-exec-toast-host";
+        host.className = "fixed right-3 bottom-3 z-[110] flex flex-col gap-2";
+        document.body.appendChild(host);
+      }
+      const el = document.createElement("div");
+      const edge =
+        payload.edge != null && payload.edge !== ""
+          ? " edge " + (Number(payload.edge) * 100).toFixed(2) + "%"
+          : "";
+      el.className =
+        "rounded-lg border border-emerald-500/60 bg-emerald-950/95 px-3 py-2 text-xs font-mono text-emerald-100 shadow-lg";
+      el.textContent = "EXECUTED sixcycle" + edge;
+      host.appendChild(el);
+      playExecBeep();
+      window.setTimeout(function () {
+        if (el.parentNode) el.parentNode.removeChild(el);
+      }, 3200);
+    }
 
     function accShortId(s, n) {
       s = String(s || "");
@@ -414,14 +533,16 @@
     }
 
     async function refreshAccountPanel() {
+      if (authBlocked()) return;
       var msg = document.getElementById("acc-panel-msg");
       try {
-        var bR = fetch("/api/account/balance", { cache: "no-store", headers: { Accept: "application/json" } });
-        var pR = fetch("/api/account/pnl", { cache: "no-store", headers: { Accept: "application/json" } });
-        var cR = fetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
-        var posR = fetch("/api/account/positions", { cache: "no-store", headers: { Accept: "application/json" } });
-        var stR = fetch("/api/strategies", { cache: "no-store", headers: { Accept: "application/json" } });
+        var bR = apiFetch("/api/account/balance", { cache: "no-store", headers: { Accept: "application/json" } });
+        var pR = apiFetch("/api/account/pnl", { cache: "no-store", headers: { Accept: "application/json" } });
+        var cR = apiFetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
+        var posR = apiFetch("/api/account/positions", { cache: "no-store", headers: { Accept: "application/json" } });
+        var stR = apiFetch("/api/strategies", { cache: "no-store", headers: { Accept: "application/json" } });
         var results = await Promise.all([bR, pR, cR, posR, stR]);
+        if (results.some(function (r) { return r.status === 401; })) return;
         var b = results[0].ok ? await results[0].json() : {};
         var p = results[1].ok ? await results[1].json() : {};
         var pack = results[2].ok ? await results[2].json() : {};
@@ -536,6 +657,13 @@
             var wrn = Number(s0.win_rate_hoy);
             if (Number.isFinite(wrn)) wrStr = String(Math.round(wrn * 100)) + "%";
           }
+          var failTag = "";
+          if (s0.stopped_by_failure) {
+            var rs = String(s0.last_stop_reason || "strategy_failure");
+            var det = s0.last_stop_detail || {};
+            var detMsg = det.error || det.place_order_error || "";
+            failTag = " · STOP por fallo(" + rs + (detMsg ? ": " + detMsg : "") + ")";
+          }
           snap.textContent =
             "Sixcycle (CSV hoy): PnL " +
             (Number(ph) >= 0 ? "+" : "") +
@@ -545,7 +673,8 @@
             " trades · wr " +
             wrStr +
             " · motor " +
-            (s0.enabled ? "EN MARCHA" : "PARADO");
+            (s0.enabled ? "EN MARCHA" : "PARADO") +
+            failTag;
         }
         var knob = document.getElementById("acc-dry-run-knob");
         var wrap = document.getElementById("acc-dry-run-toggle");
@@ -563,16 +692,27 @@
           if (b.error) {
             msg.textContent = "Balance: " + b.error;
             msg.className = "text-[10px] font-mono min-h-[1rem] text-amber-400";
+            setLiveStatusBadge("err", "LIVE con error");
           } else if (envDry) {
             msg.textContent = "Proceso en DRY_RUN global: órdenes reales bloqueadas.";
             msg.className = "text-[10px] font-mono min-h-[1rem] text-slate-500";
+            setLiveStatusBadge("warn", "LIVE desactivado por DRY_RUN");
+          } else {
+            setLiveStatusBadge("ok", "LIVE conectado");
+            msg.textContent = "Conexión LIVE operativa.";
+            msg.className = "text-[10px] font-mono min-h-[1rem] text-emerald-400/90";
           }
         }
+        if (!b.error && !envDry) {
+          _accLastBalanceOkTs = Date.now();
+        }
+        updateLastBalanceOkLabel();
       } catch (err) {
         if (msg) {
           msg.textContent = String(err);
           msg.className = "text-[10px] font-mono text-rose-400 min-h-[1rem]";
         }
+        setLiveStatusBadge("err", "LIVE con error");
       }
     }
 
@@ -607,7 +747,7 @@
       accDryToggle.addEventListener("click", async function () {
         var msg = document.getElementById("acc-panel-msg");
         try {
-          var cR = await fetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
+          var cR = await apiFetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
           if (!cR.ok) {
             var cj = await cR.json().catch(function () {
               return {};
@@ -633,7 +773,7 @@
               return;
             body.confirm_live = true;
           }
-          var r = await fetch("/api/sixcycle/config", {
+          var r = await apiFetch("/api/sixcycle/config", {
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
             body: JSON.stringify(body),
@@ -682,7 +822,7 @@
           return;
         }
         try {
-          var r = await fetch("/api/sixcycle/config", {
+          var r = await apiFetch("/api/sixcycle/config", {
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
             body: JSON.stringify({ max_daily_loss_usdc: loss, max_concurrent_trades: conc }),
@@ -715,7 +855,7 @@
           return;
         }
         try {
-          var r = await fetch("/api/sixcycle/config", {
+          var r = await apiFetch("/api/sixcycle/config", {
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
             body: JSON.stringify({ stake_usdc: v }),
@@ -766,8 +906,10 @@
     }
 
     async function pollSixcycleEnabled() {
+      if (authBlocked()) return;
       try {
-        const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        const r = await apiFetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        if (r.status === 401) return;
         if (!r.ok) return;
         const st = await r.json();
         const s = (st.strategies || []).find(function (x) {
@@ -808,8 +950,10 @@
     }
 
     async function refreshDryStakeFromApi() {
+      if (authBlocked()) return;
       try {
-        const r = await fetch("/api/sixcycle/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        const r = await apiFetch("/api/sixcycle/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        if (r.status === 401) return;
         if (!r.ok) return;
         syncDryStakeUx(await r.json());
       } catch (err) {
@@ -831,7 +975,7 @@
       fb.textContent = "Guardando…";
       fb.className = "text-[11px] mt-2 min-h-[1.15rem] font-mono text-slate-400";
       try {
-        const r = await fetch("/api/sixcycle/dry-stake-multiplier", {
+        const r = await apiFetch("/api/sixcycle/dry-stake-multiplier", {
           method: "POST",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
           body: JSON.stringify({ multiplier: v }),
@@ -978,7 +1122,7 @@
       if (!tb) return;
       tb.innerHTML = "<tr><td colspan='5' class='px-2 py-2 text-slate-500'>Cargando…</td></tr>";
       try {
-        var r = await fetch("/api/sixcycle/config/versions?limit=40&csv_rows=12000", {
+        var r = await apiFetch("/api/sixcycle/config/versions?limit=40&csv_rows=12000", {
           cache: "no-store",
           headers: { Accept: "application/json" },
         });
@@ -1024,11 +1168,11 @@
 
     async function loadSixcycleConfigUi() {
       try {
-        var sR = await fetch("/api/sixcycle/config/schema", {
+        var sR = await apiFetch("/api/sixcycle/config/schema", {
           cache: "no-store",
           headers: { Accept: "application/json" },
         });
-        var cR = await fetch("/api/sixcycle/config", {
+        var cR = await apiFetch("/api/sixcycle/config", {
           cache: "no-store",
           headers: { Accept: "application/json" },
         });
@@ -1056,7 +1200,7 @@
         }
         try {
           var body = collectSixcycleConfigPayload();
-          var r = await fetch("/api/sixcycle/config", {
+          var r = await apiFetch("/api/sixcycle/config", {
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
             body: JSON.stringify(body),
@@ -1102,7 +1246,7 @@
         if (!confirm("¿Restaurar todos los parámetros a los valores por defecto del repositorio?")) return;
         var fb = document.getElementById("sixcycle-config-feedback");
         try {
-          var r = await fetch("/api/sixcycle/config", {
+          var r = await apiFetch("/api/sixcycle/config", {
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
             body: JSON.stringify({ reset_defaults: true }),
@@ -1135,15 +1279,19 @@
 
     /* ——— Control tab (CSV / enable) ——— */
     async function fetchStatus() {
-      const r = await fetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+      if (authBlocked()) throw new Error("401");
+      const r = await apiFetch("/api/arb/status", { cache: "no-store", headers: { Accept: "application/json" } });
+      if (r.status === 401) throw new Error("401");
       if (!r.ok) throw new Error("status " + r.status);
       return r.json();
     }
     async function fetchLog() {
-      const r = await fetch("/api/arb/strategy/" + SLUG + "/log?limit=500", {
+      if (authBlocked()) throw new Error("401");
+      const r = await apiFetch("/api/arb/strategy/" + SLUG + "/log?limit=500", {
         cache: "no-store",
         headers: { Accept: "application/json" },
       });
+      if (r.status === 401) throw new Error("401");
       if (!r.ok) throw new Error("log " + r.status);
       return r.json();
     }
@@ -1327,6 +1475,7 @@
       });
     }
     async function refresh() {
+      if (authBlocked()) return;
       try {
         const st = await fetchStatus();
         renderSummary(st.strategies);
@@ -1335,6 +1484,7 @@
         await refreshDryStakeFromApi();
         await loadSixcycleConfigUi();
       } catch (e) {
+        if (String(e) === "Error: 401" || String(e) === "401") return;
         document.getElementById("tbl-msg").textContent = "Error: " + e;
       }
     }
@@ -1345,7 +1495,8 @@
       if (en) en.disabled = true;
       if (dis) dis.disabled = true;
       try {
-        const r = await fetch("/api/arb/strategy/" + SLUG + "/enable", { method: "POST" });
+        const r = await apiFetch("/api/arb/strategy/" + SLUG + "/enable", { method: "POST" });
+        if (r.status === 401) return;
         if (!r.ok && r.status !== 409) {
           const t = await r.text().catch(function () {
             return "";
@@ -1365,7 +1516,8 @@
       if (en) en.disabled = true;
       if (dis) dis.disabled = true;
       try {
-        const r = await fetch("/api/arb/strategy/" + SLUG + "/disable", { method: "POST" });
+        const r = await apiFetch("/api/arb/strategy/" + SLUG + "/disable", { method: "POST" });
+        if (r.status === 401) return;
         if (!r.ok) {
           alert("Parar falló (HTTP " + r.status + ")");
           return;
@@ -1391,7 +1543,8 @@
       if (en) en.disabled = true;
       if (dis) dis.disabled = true;
       try {
-        const r = await fetch("/api/sixcycle/reset-data", { method: "POST" });
+        const r = await apiFetch("/api/sixcycle/reset-data", { method: "POST" });
+        if (r.status === 401) return;
         const body = await r.json().catch(function () {
           return {};
         });
@@ -1399,6 +1552,15 @@
           alert("Borrar datos falló (HTTP " + r.status + "): " + (body.detail || JSON.stringify(body)));
           return;
         }
+        var removed = Array.isArray(body.files_removed) ? body.files_removed.length : 0;
+        var missing = Array.isArray(body.files_missing) ? body.files_missing.length : 0;
+        var msgReset =
+          "Datos sixcycle reiniciados. Borrados: " +
+          removed +
+          " archivo(s)" +
+          (missing ? " · ya vacíos/no existentes: " + missing : "");
+        if (body.postgres_sixcycle_cleared === true) msgReset += " · Postgres limpiado.";
+        alert(msgReset);
         await refresh();
         if (window.liveUi && typeof window.liveUi.reloadHistory === "function") {
           await window.liveUi.reloadHistory();
@@ -1421,7 +1583,9 @@
       let secsUntilOpen = 0;
       let eqChart = null;
       let sse = null;
+      let arbSse = null;
       let started = false;
+      let historyPrimed = false;
 
       function fmtNum(n, d) {
         if (n == null || n === "") return "—";
@@ -1507,6 +1671,17 @@
         const pb = document.getElementById("lv-phase-badge");
         pb.textContent = ph;
         pb.className = "inline-block text-xs font-bold px-2 py-0.5 rounded-md mb-2 " + phaseBadgeClass(ph);
+        const stopEl = document.getElementById("lv-stop-reason");
+        if (stopEl) {
+          const rs = state.live_error_reason || state.last_stop_reason || "";
+          const det = state.live_error || state.last_stop_detail || {};
+          const em = det && (det.error || det.place_order_error || "");
+          if (rs) {
+            stopEl.textContent = "STOP por fallo LIVE (" + rs + ")" + (em ? ": " + em : "");
+          } else {
+            stopEl.textContent = "";
+          }
+        }
 
         document.getElementById("lv-next-slug").textContent = state.next_slug || "—";
         secsUntilOpen = typeof state.secs_until_open === "number" ? state.secs_until_open : 0;
@@ -1769,12 +1944,31 @@
       }
 
       async function loadHistory() {
+        if (authBlocked()) return;
         try {
-          const r = await fetch("/api/sixcycle/history?limit=600");
+          const r = await apiFetch("/api/sixcycle/history?limit=600");
+          if (r.status === 401) return;
+          if (!r.ok) return;
           const rows = await r.json();
           if (!Array.isArray(rows)) return;
           var merged =
             typeof sixcycleBuildMergedDisplayRows === "function" ? sixcycleBuildMergedDisplayRows(rows) : rows;
+          if (!historyPrimed) {
+            var nowPrime = Date.now();
+            merged.forEach(function (row) {
+              var action = String(row.action || "").toUpperCase();
+              var phase = String(row.phase || "").toUpperCase();
+              var filled = String(row.filled || "").toLowerCase() === "true";
+              if (action.startsWith("EXECUTED") || phase === "EXECUTED" || filled) {
+                _execSeen.set(execKey(row), nowPrime);
+              }
+            });
+            historyPrimed = true;
+          } else {
+            merged.slice(-12).forEach(function (row) {
+              if (shouldNotifyExecuted(row)) showExecToast(row);
+            });
+          }
           fillTradesTable(merged);
           fillLogTable(merged);
           buildEquityChart(rows);
@@ -1795,9 +1989,31 @@
           }
         };
         sse.onerror = function () {
+          if (authBlocked()) {
+            sse.close();
+            return;
+          }
           const dot = document.getElementById("lv-sse-dot");
           if (dot) dot.className = "inline-block w-2.5 h-2.5 rounded-full bg-red-500 ring-2 ring-red-500/30";
         };
+        arbSse = new EventSource("/api/arb/signals/live");
+        arbSse.onmessage = function (e) {
+          try {
+            var p = JSON.parse(e.data);
+            if (String(p.strategy || "") !== SLUG) return;
+            if (shouldNotifyExecuted(p)) showExecToast(p);
+          } catch (err) {}
+        };
+        arbSse.onerror = function () {
+          if (authBlocked() && arbSse) arbSse.close();
+        };
+        if (window.PMAuth && typeof window.PMAuth.onChange === "function") {
+          window.PMAuth.onChange(function (blocked) {
+            if (!blocked) return;
+            if (sse) sse.close();
+            if (arbSse) arbSse.close();
+          });
+        }
         setInterval(tickUtc, 1000);
         tickUtc();
         setInterval(tickCountdown, 1000);
