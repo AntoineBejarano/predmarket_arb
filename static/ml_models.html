@@ -17,11 +17,11 @@
   </script>
 </head>
 <body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
-  <div class="max-w-6xl mx-auto px-4 py-6 space-y-8">
+  <div id="main-content" class="max-w-6xl mx-auto px-4 py-6 space-y-8">
     <header class="flex flex-col gap-4 border-b border-slate-700 pb-6">
       <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
         <div class="flex items-start gap-4">
-          <img src="/static/logo.png" alt="" width="48" height="48"
+          <img src="/static/logo.png" alt="PredMarket Arb" width="48" height="48"
             class="rounded-xl ring-1 ring-slate-600 shrink-0 mt-0.5 bg-slate-800/50" />
           <div>
             <h1 class="text-2xl font-bold text-white tracking-tight">PredMarket Arb</h1>
@@ -33,74 +33,159 @@
           </div>
         </div>
       </div>
-      <nav class="flex flex-wrap gap-2 items-center text-sm">
-        <span class="text-slate-500">Ir a:</span>
-        <a href="/" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Inicio</a>
-        <span class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Catálogo ML</span>
-        <a href="/ml/model/crypto_5m_lgbm" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Monitor ML (5m)</a>
-        <a href="/arb" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Motor Arb (CLOB)</a>
-      </nav>
+      <div id="global-site-nav" class="space-y-1"></div>
     </header>
+
+    <p id="models-meta" class="text-xs text-slate-500 hidden" aria-live="polite"></p>
+    <p id="models-error" class="hidden rounded-lg border border-red-800/50 bg-red-950/30 px-3 py-2 text-sm text-red-200"></p>
+    <div id="models-actions" class="hidden flex flex-wrap items-center gap-2">
+      <button type="button" id="models-retry" class="text-xs px-3 py-1.5 rounded-lg border border-slate-600 text-slate-200 hover:bg-slate-800">
+        Reintentar
+      </button>
+    </div>
 
     <section>
       <div id="model-grid" class="grid grid-cols-1 sm:grid-cols-2 gap-4"></div>
     </section>
   </div>
 
+  <script src="/static/nav.js"></script>
   <script>
+    var modelsPollMs = 12000;
+    var toggleBusy = false;
+
+    function setModelsError(msg) {
+      var e = document.getElementById("models-error");
+      var a = document.getElementById("models-actions");
+      if (!e) return;
+      if (msg) {
+        e.textContent = msg;
+        e.classList.remove("hidden");
+        if (a) a.classList.remove("hidden");
+      } else {
+        e.classList.add("hidden");
+        if (a) a.classList.add("hidden");
+      }
+    }
+
+    function setLastUpdated() {
+      var m = document.getElementById("models-meta");
+      if (!m) return;
+      var t = new Date().toLocaleString("es-ES", {
+        dateStyle: "short",
+        timeStyle: "medium",
+      });
+      m.textContent = "Última actualización del catálogo: " + t;
+      m.classList.remove("hidden");
+    }
+
     async function fetchModels() {
-      const r = await fetch("/api/ml/models");
-      if (!r.ok) return { models: [] };
+      var r = await fetch("/api/ml/models");
+      if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     }
 
     async function toggleModel(slug, currentlyEnabled) {
-      const path = currentlyEnabled ? "disable" : "enable";
-      await fetch("/api/ml/models/" + slug + "/" + path, { method: "POST" });
-      await refresh();
+      if (toggleBusy) return;
+      toggleBusy = true;
+      var path = currentlyEnabled ? "disable" : "enable";
+      try {
+        var r = await fetch("/api/ml/models/" + encodeURIComponent(slug) + "/" + path, { method: "POST" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        await refresh();
+      } catch (err) {
+        setModelsError("No se pudo guardar el estado de «" + slug + "»: " + (err && err.message ? err.message : err));
+        await refresh();
+      } finally {
+        toggleBusy = false;
+      }
+    }
+
+    function wireGrid() {
+      var grid = document.getElementById("model-grid");
+      if (!grid) return;
+      grid.querySelectorAll("[data-model-toggle]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var slug = btn.getAttribute("data-slug");
+          var en = btn.getAttribute("aria-checked") === "true";
+          toggleModel(slug, en);
+        });
+        btn.addEventListener("keydown", function (ev) {
+          if (ev.key !== "Enter" && ev.key !== " ") return;
+          ev.preventDefault();
+          btn.click();
+        });
+      });
     }
 
     function render(models) {
-      const grid = document.getElementById("model-grid");
+      var grid = document.getElementById("model-grid");
       if (!grid) return;
-      grid.innerHTML = (models || []).map((m) => {
-        const enabled = !!m.enabled;
-        const impl = !!m.implemented;
-        const exp = !!m.experimental;
-        const detailHref = "/ml/model/" + encodeURIComponent(m.slug);
-        return `
-    <div class="border border-slate-700 rounded-xl p-4 bg-slate-800/40 flex flex-col gap-3">
-      <div class="flex items-start justify-between gap-3">
-        <div class="min-w-0">
-          <p class="text-sm font-medium text-white">${m.label || m.slug}</p>
-          <p class="text-xs text-slate-500 mt-1">${m.description || ""}</p>
-          <p class="text-[10px] text-slate-600 mt-1 font-mono">${m.slug}</p>
-          ${exp ? '<span class="text-[10px] text-amber-600/90 mt-1 inline-block">experimental</span>' : ""}
-          ${!impl ? '<span class="text-[10px] text-slate-500 mt-1 block">Sin pipeline en validate_edge aún</span>' : ""}
-        </div>
-        <button type="button"
-          onclick="toggleModel('${m.slug}', ${enabled})"
-          class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${enabled ? "bg-emerald-600" : "bg-slate-600"}"
-          title="${enabled ? "Desactivar en registro" : "Activar en registro"}">
-          <span class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${enabled ? "translate-x-4" : "translate-x-0"}"></span>
-        </button>
-      </div>
-      <div class="flex flex-wrap gap-2 pt-1 border-t border-slate-700/80">
-        <a href="${detailHref}" class="text-xs text-indigo-400 hover:underline">Ver detalle →</a>
-        ${impl ? '<span class="text-[10px] text-emerald-600/80">implementado</span>' : '<span class="text-[10px] text-slate-500">stub</span>'}
-      </div>
-    </div>`;
+      grid.innerHTML = (models || []).map(function (m) {
+        var enabled = !!m.enabled;
+        var impl = !!m.implemented;
+        var exp = !!m.experimental;
+        var detailHref = "/ml/model/" + encodeURIComponent(m.slug);
+        var labelOn = enabled ? "Desactivar modelo en el registro" : "Activar modelo en el registro";
+        var knob = enabled ? "translate-x-4" : "translate-x-0";
+        var bg = enabled ? "bg-emerald-600" : "bg-slate-600";
+        return (
+          '<div class="border border-slate-700 rounded-xl p-4 bg-slate-800/40 flex flex-col gap-3">' +
+          '<div class="flex items-start justify-between gap-3">' +
+          '<div class="min-w-0">' +
+          '<p class="text-sm font-medium text-white">' + (m.label || m.slug) + "</p>" +
+          '<p class="text-xs text-slate-500 mt-1">' + (m.description || "") + "</p>" +
+          '<p class="text-[10px] text-slate-600 mt-1 font-mono">' + m.slug + "</p>" +
+          (exp ? '<span class="text-[10px] text-amber-600/90 mt-1 inline-block">experimental</span>' : "") +
+          (!impl ? '<span class="text-[10px] text-slate-500 mt-1 block">Sin pipeline en validate_edge aún</span>' : "") +
+          "</div>" +
+          '<button type="button" role="switch" aria-checked="' + (enabled ? "true" : "false") + '" aria-label="' +
+          labelOn.replace(/"/g, "&quot;") +
+          '" data-model-toggle data-slug="' +
+          m.slug.replace(/"/g, "&quot;") +
+          '" class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ' +
+          bg +
+          ' focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400">' +
+          '<span data-knob class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ' +
+          knob +
+          '"></span></button></div>' +
+          '<div class="flex flex-wrap gap-2 pt-1 border-t border-slate-700/80">' +
+          '<a href="' +
+          detailHref +
+          '" class="text-xs text-indigo-400 hover:underline">Ver detalle →</a>' +
+          (impl ? '<span class="text-[10px] text-emerald-600/80">implementado</span>' : '<span class="text-[10px] text-slate-500">stub</span>') +
+          "</div></div>"
+        );
       }).join("");
+      wireGrid();
     }
 
     async function refresh() {
-      const data = await fetchModels();
-      render(data.models || []);
+      try {
+        var data = await fetchModels();
+        setModelsError("");
+        var list = data.models || [];
+        if (!list.length) {
+          var grid = document.getElementById("model-grid");
+          if (grid) {
+            grid.innerHTML =
+              '<p class="text-slate-500 text-sm sm:col-span-2 text-center py-10 border border-dashed border-slate-700 rounded-xl">No hay modelos en el catálogo (respuesta vacía).</p>';
+          }
+        } else {
+          render(list);
+        }
+        setLastUpdated();
+      } catch (err) {
+        render([]);
+        setModelsError("No se pudo cargar el catálogo: " + (err && err.message ? err.message : err));
+      }
     }
 
-    document.addEventListener("DOMContentLoaded", () => {
+    document.addEventListener("DOMContentLoaded", function () {
+      var retry = document.getElementById("models-retry");
+      if (retry) retry.addEventListener("click", function () { refresh(); });
       refresh();
-      setInterval(refresh, 12000);
+      setInterval(refresh, modelsPollMs);
     });
   </script>
 </body>

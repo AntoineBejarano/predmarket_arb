@@ -17,11 +17,11 @@
   </script>
 </head>
 <body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
-  <div class="max-w-6xl mx-auto px-4 py-6 space-y-8">
+  <div id="main-content" class="max-w-6xl mx-auto px-4 py-6 space-y-8">
     <header class="flex flex-col gap-4 border-b border-slate-700 pb-6">
       <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
         <div class="flex items-start gap-4">
-          <img src="/static/logo.png" alt="" width="48" height="48"
+          <img src="/static/logo.png" alt="PredMarket Arb" width="48" height="48"
             class="rounded-xl ring-1 ring-slate-600 shrink-0 mt-0.5 bg-slate-800/50" />
           <div>
             <h1 class="text-2xl font-bold text-white tracking-tight">PredMarket Arb</h1>
@@ -30,13 +30,7 @@
           </div>
         </div>
       </div>
-      <nav class="flex flex-wrap gap-2 items-center text-sm">
-        <span class="text-slate-500">Ir a:</span>
-        <a href="/" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Inicio</a>
-        <a href="/ml" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Catálogo ML</a>
-        <a href="/ml/model/crypto_5m_lgbm" class="px-3 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">Monitor ML (5m)</a>
-        <span class="px-3 py-1.5 rounded-lg bg-indigo-900/50 text-indigo-200 ring-1 ring-indigo-700/50">Motor Arb (CLOB)</span>
-      </nav>
+      <div id="global-site-nav" class="space-y-1"></div>
     </header>
 
     <section id="arb-control-plane" class="pb-8">
@@ -100,6 +94,7 @@
     </section>
   </div>
 
+  <script src="/static/nav.js"></script>
   <script>
     const STRATEGIES = [
       { slug: "bundle_arb", label: "NegRisk Maker Bundle", experimental: false, detailHref: "/arb/strategy/bundle_arb" },

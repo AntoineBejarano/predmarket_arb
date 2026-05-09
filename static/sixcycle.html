@@ -6,7 +6,7 @@
   <title>BTC 5m Sixcycle — PredMarket Arb</title>
   <link rel="icon" type="image/png" href="/static/logo.png" />
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script>
     tailwind.config = {
       theme: { extend: { fontFamily: { mono: ["ui-monospace", "Menlo", "monospace"] } } },
@@ -14,7 +14,93 @@
   </script>
 </head>
 <body class="bg-slate-900 text-slate-200 min-h-screen font-sans">
-  <div class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+  <div id="main-content" class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+    <header class="border-b border-slate-700 pb-5">
+      <div class="flex items-start gap-4 mb-4">
+        <img src="/static/logo.png" alt="PredMarket Arb" width="44" height="44" class="rounded-xl ring-1 ring-slate-600 shrink-0 bg-slate-800/50 mt-0.5" />
+        <div class="min-w-0 flex-1">
+          <div id="global-site-nav" class="mb-3 w-full"></div>
+          <h1 class="text-2xl font-bold text-white tracking-tight">BTC 5m Sixcycle</h1>
+          <p class="text-sm text-slate-400 mt-1 max-w-3xl">
+            Estrategia <strong class="text-slate-300">sin modelo ML</strong>: confluencia en vivo con
+            <code class="text-slate-500">MarketScorer</code> (WS Binance 1m + libro CLOB Polymarket), paper y CSV.
+            El <a href="/ml/model/crypto_5m_lgbm" class="text-indigo-400 hover:underline">monitor ML 5m</a> y el catálogo ML son el pipeline
+            <strong class="text-slate-400">LightGBM</strong> sobre el mismo tipo de mercado 5m — concepto distinto en el lab.
+          </p>
+        </div>
+      </div>
+
+      <div class="rounded-lg border border-amber-800/60 bg-amber-950/25 px-4 py-3 text-sm text-amber-100/95 space-y-2">
+        <p class="font-medium text-amber-200">Mismo criterio que en Motor Arb</p>
+        <p class="text-xs text-slate-300">
+          <strong class="text-white">Encender / Parar</strong> (arriba) controlan solo Sixcycle en este API — no son el Start/Stop del <code class="text-slate-500">arb_engine</code> de <a href="/arb" class="text-indigo-400 hover:underline">/arb</a>.
+          El estado <strong class="text-white">EN MARCHA / PARADO</strong> es el que importa.
+        </p>
+        <p class="text-xs text-slate-500">
+          CSV engine: <code class="text-slate-400">logs/crypto_5m_sixcycle.csv</code> · señales:
+          <code class="text-slate-400">sixcycle_signals.csv</code> — el botón <strong class="text-slate-300">Borrar datos</strong> vacía ambos y reinicia KPIs en memoria.
+        </p>
+      </div>
+
+      <!-- Único bloque Encender / Parar + datos (sin duplicar abajo en el panel SSE) -->
+      <div id="sixcycle-motor-strip" class="mt-4 rounded-xl border border-slate-600 bg-slate-800/60 px-4 py-4 flex flex-col gap-3">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 w-full">
+          <div class="flex flex-col sm:flex-row sm:items-center gap-3 min-w-0">
+            <span id="run-badge" class="shrink-0 inline-flex items-center gap-2 text-sm font-bold px-4 py-2.5 rounded-lg border bg-slate-700/80 text-slate-300 border-slate-600">
+              <span id="run-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+              <span id="run-label">PARADO</span>
+            </span>
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button" id="btn-enable"
+                class="text-sm px-4 py-2 rounded-lg border border-emerald-600 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-900/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
+                Encender
+              </button>
+              <button type="button" id="btn-disable"
+                class="text-sm px-4 py-2 rounded-lg border border-red-800 bg-red-950/20 text-red-300 hover:bg-red-950/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
+                Parar
+              </button>
+              <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
+                class="text-sm px-4 py-2 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 inline-block"
+                download>CSV</a>
+              <button type="button" id="btn-clear-sixcycle-data"
+                class="text-sm px-4 py-2 rounded-lg border border-rose-700 bg-rose-950/25 text-rose-200 hover:bg-rose-950/45 font-medium disabled:opacity-40 disabled:pointer-events-none"
+                title="Borra CSV del engine y sixcycle_signals.csv; para el motor Sixcycle">
+                Borrar datos
+              </button>
+            </div>
+          </div>
+          <a href="/arb" class="text-sm text-indigo-400 hover:underline shrink-0">← Motor Arb</a>
+        </div>
+        <div id="sixcycle-dry-stake-panel" class="hidden rounded-lg border border-indigo-500/35 bg-gradient-to-r from-indigo-950/50 to-slate-900/40 px-3 py-3 sm:px-4">
+          <div class="flex flex-col lg:flex-row lg:items-stretch gap-3 lg:justify-between lg:gap-4">
+            <div class="min-w-0 flex-1 space-y-1">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-[11px] font-semibold text-indigo-100">Stake simulado</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-100 border border-amber-700/40">DRY_RUN</span>
+              </div>
+              <p class="text-[10px] text-slate-400 leading-relaxed max-w-2xl">
+                Multiplica el stake Kelly de cada fill en paper: PnL y columnas del CSV escalan igual (útil para ver sensibilidad).
+                Las filas ya escritas conservan el factor vigente al ejecutarse; <strong class="text-slate-300">Borrar datos</strong> limpia CSV y KPI si quieres una serie uniforme con un nuevo ×.
+              </p>
+            </div>
+            <div class="flex flex-wrap items-end gap-2 shrink-0 border-t border-indigo-500/20 pt-3 lg:border-t-0 lg:pt-0 lg:border-l lg:pl-4 lg:ml-1">
+              <label for="dry-stake-mult-input" class="flex flex-col gap-0.5">
+                <span class="text-[10px] uppercase tracking-wide text-slate-500">× Kelly</span>
+                <input type="number" id="dry-stake-mult-input" min="0.01" max="50000" step="any" value="1" inputmode="decimal"
+                  class="w-[7.5rem] rounded-lg border border-slate-600 bg-slate-950 px-2.5 py-2 text-sm font-mono text-white shadow-inner focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/30 outline-none transition" />
+              </label>
+              <button type="button" id="dry-stake-apply"
+                class="text-sm px-4 py-2 rounded-lg border border-indigo-400/70 bg-indigo-600/35 text-indigo-50 hover:bg-indigo-600/50 font-medium shadow-sm transition">
+                Aplicar
+              </button>
+            </div>
+          </div>
+          <p id="dry-stake-feedback" class="text-[11px] mt-2 min-h-[1.15rem] font-mono text-slate-500 empty:hidden" aria-live="polite"></p>
+        </div>
+      </div>
+
+    </header>
+
     <!-- Cuenta Polymarket (balance real + PnL desde CSV) -->
     <section id="sixcycle-account-panel" class="rounded-xl border border-slate-600 bg-slate-800/70 px-4 py-4 space-y-3 shadow-lg">
       <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -100,99 +186,7 @@
       <p id="acc-panel-msg" class="text-[10px] text-slate-500 font-mono min-h-[1rem]"></p>
     </section>
 
-    <header class="border-b border-slate-700 pb-5">
-      <div class="flex items-start gap-4 mb-4">
-        <img src="/static/logo.png" alt="" width="44" height="44" class="rounded-xl ring-1 ring-slate-600 shrink-0 bg-slate-800/50 mt-0.5" />
-        <div class="min-w-0 flex-1">
-          <nav class="flex flex-wrap gap-2 text-sm mb-3">
-            <a href="/" class="text-slate-400 hover:text-white">Inicio</a>
-            <span class="text-slate-600">/</span>
-            <a href="/ml" class="text-slate-400 hover:text-white">Catálogo ML</a>
-            <span class="text-slate-600">/</span>
-            <a href="/ml/model/crypto_5m_lgbm" class="text-slate-400 hover:text-white">Monitor ML (5m)</a>
-            <span class="text-slate-600">/</span>
-            <a href="/arb" class="text-indigo-400 hover:underline">Motor Arb (CLOB)</a>
-            <span class="text-slate-600">/</span>
-            <span class="text-white font-medium">Sixcycle BTC 5m</span>
-          </nav>
-          <h1 class="text-2xl font-bold text-white tracking-tight">BTC 5m Sixcycle</h1>
-          <p class="text-sm text-slate-400 mt-1 max-w-3xl">
-            Estrategia <strong class="text-slate-300">sin modelo ML</strong>: confluencia en vivo con
-            <code class="text-slate-500">MarketScorer</code> (WS Binance 1m + libro CLOB Polymarket), paper y CSV.
-            El <a href="/ml/model/crypto_5m_lgbm" class="text-indigo-400 hover:underline">monitor ML 5m</a> y el catálogo ML son el pipeline
-            <strong class="text-slate-400">LightGBM</strong> sobre el mismo tipo de mercado 5m — concepto distinto en el lab.
-          </p>
-        </div>
-      </div>
 
-      <div class="rounded-lg border border-amber-800/60 bg-amber-950/25 px-4 py-3 text-sm text-amber-100/95 space-y-2">
-        <p class="font-medium text-amber-200">Mismo criterio que en Motor Arb</p>
-        <p class="text-xs text-slate-300">
-          <strong class="text-white">Encender / Parar</strong> (arriba) controlan solo Sixcycle en este API — no son el Start/Stop del <code class="text-slate-500">arb_engine</code> de <a href="/arb" class="text-indigo-400 hover:underline">/arb</a>.
-          El estado <strong class="text-white">EN MARCHA / PARADO</strong> es el que importa.
-        </p>
-        <p class="text-xs text-slate-500">
-          CSV engine: <code class="text-slate-400">logs/crypto_5m_sixcycle.csv</code> · señales:
-          <code class="text-slate-400">sixcycle_signals.csv</code> — el botón <strong class="text-slate-300">Borrar datos</strong> vacía ambos y reinicia KPIs en memoria.
-        </p>
-      </div>
-
-      <!-- Único bloque Encender / Parar + datos (sin duplicar abajo en el panel SSE) -->
-      <div id="sixcycle-motor-strip" class="mt-4 rounded-xl border border-slate-600 bg-slate-800/60 px-4 py-4 flex flex-col gap-3">
-        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 w-full">
-          <div class="flex flex-col sm:flex-row sm:items-center gap-3 min-w-0">
-            <span id="run-badge" class="shrink-0 inline-flex items-center gap-2 text-sm font-bold px-4 py-2.5 rounded-lg border bg-slate-700/80 text-slate-300 border-slate-600">
-              <span id="run-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
-              <span id="run-label">PARADO</span>
-            </span>
-            <div class="flex flex-wrap items-center gap-2">
-              <button type="button" id="btn-enable"
-                class="text-sm px-4 py-2 rounded-lg border border-emerald-600 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-900/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
-                Encender
-              </button>
-              <button type="button" id="btn-disable"
-                class="text-sm px-4 py-2 rounded-lg border border-red-800 bg-red-950/20 text-red-300 hover:bg-red-950/40 font-medium disabled:opacity-40 disabled:pointer-events-none">
-                Parar
-              </button>
-              <a id="csv-dl" href="/api/arb/strategy/crypto_5m_sixcycle/csv-download"
-                class="text-sm px-4 py-2 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 inline-block"
-                download>CSV</a>
-              <button type="button" id="btn-clear-sixcycle-data"
-                class="text-sm px-4 py-2 rounded-lg border border-rose-700 bg-rose-950/25 text-rose-200 hover:bg-rose-950/45 font-medium disabled:opacity-40 disabled:pointer-events-none"
-                title="Borra CSV del engine y sixcycle_signals.csv; para el motor Sixcycle">
-                Borrar datos
-              </button>
-            </div>
-          </div>
-          <a href="/arb" class="text-sm text-indigo-400 hover:underline shrink-0">← Motor Arb</a>
-        </div>
-        <div id="sixcycle-dry-stake-panel" class="hidden rounded-lg border border-indigo-500/35 bg-gradient-to-r from-indigo-950/50 to-slate-900/40 px-3 py-3 sm:px-4">
-          <div class="flex flex-col lg:flex-row lg:items-stretch gap-3 lg:justify-between lg:gap-4">
-            <div class="min-w-0 flex-1 space-y-1">
-              <div class="flex items-center gap-2 flex-wrap">
-                <span class="text-[11px] font-semibold text-indigo-100">Stake simulado</span>
-                <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-100 border border-amber-700/40">DRY_RUN</span>
-              </div>
-              <p class="text-[10px] text-slate-400 leading-relaxed max-w-2xl">
-                Multiplica el stake Kelly de cada fill en paper: PnL y columnas del CSV escalan igual (útil para ver sensibilidad).
-                Las filas ya escritas conservan el factor vigente al ejecutarse; <strong class="text-slate-300">Borrar datos</strong> limpia CSV y KPI si quieres una serie uniforme con un nuevo ×.
-              </p>
-            </div>
-            <div class="flex flex-wrap items-end gap-2 shrink-0 border-t border-indigo-500/20 pt-3 lg:border-t-0 lg:pt-0 lg:border-l lg:pl-4 lg:ml-1">
-              <label for="dry-stake-mult-input" class="flex flex-col gap-0.5">
-                <span class="text-[10px] uppercase tracking-wide text-slate-500">× Kelly</span>
-                <input type="number" id="dry-stake-mult-input" min="0.01" max="50000" step="any" value="1" inputmode="decimal"
-                  class="w-[7.5rem] rounded-lg border border-slate-600 bg-slate-950 px-2.5 py-2 text-sm font-mono text-white shadow-inner focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/30 outline-none transition" />
-              </label>
-              <button type="button" id="dry-stake-apply"
-                class="text-sm px-4 py-2 rounded-lg border border-indigo-400/70 bg-indigo-600/35 text-indigo-50 hover:bg-indigo-600/50 font-medium shadow-sm transition">
-                Aplicar
-              </button>
-            </div>
-          </div>
-          <p id="dry-stake-feedback" class="text-[11px] mt-2 min-h-[1.15rem] font-mono text-slate-500 empty:hidden" aria-live="polite"></p>
-        </div>
-      </div>
 
     </header>
 
@@ -402,6 +396,7 @@
     </div>
   </div>
 
+  <script src="/static/nav.js"></script>
   <script>
     const SLUG = "crypto_5m_sixcycle";
 
