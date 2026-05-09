@@ -192,6 +192,57 @@
 
     </header>
 
+    <script>
+      (function sixcycleResetFallbackInit() {
+        function bind() {
+          var btn = document.getElementById("btn-clear-sixcycle-data");
+          if (!btn || btn.__fallbackBound) return;
+          btn.__fallbackBound = true;
+          window.__sixcycleResetFallback = async function (ev) {
+            if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+            if (ev && typeof ev.stopImmediatePropagation === "function") ev.stopImmediatePropagation();
+            if (
+              !confirm(
+                "Se borrarán los CSV de Sixcycle (engine + señales), se parará el motor Sixcycle en este API y los KPI del panel volverán a 0. ¿Seguir?"
+              )
+            ) {
+              return false;
+            }
+            try {
+              btn.disabled = true;
+              var r = await window.fetch("/api/sixcycle/reset-data", { method: "POST" });
+              if (r.status === 401) {
+                alert("Sesión expirada. Recarga la página y vuelve a autenticar.");
+                return false;
+              }
+              var body = await r.json().catch(function () {
+                return {};
+              });
+              if (!r.ok) {
+                alert("Borrar datos falló (HTTP " + r.status + "): " + (body.detail || JSON.stringify(body)));
+                return false;
+              }
+              var removed = Array.isArray(body.files_removed) ? body.files_removed.length : 0;
+              alert("Datos sixcycle reiniciados (fallback). Archivos borrados: " + removed + ".");
+              window.location.reload();
+              return false;
+            } catch (err) {
+              alert("Borrar datos (fallback): " + err);
+              return false;
+            } finally {
+              btn.disabled = false;
+            }
+          };
+          btn.addEventListener("click", window.__sixcycleResetFallback, { capture: true });
+        }
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", bind);
+        } else {
+          bind();
+        }
+      })();
+    </script>
+
     <!-- Control + resumen + tabla API log -->
     <div id="tab-control" class="space-y-6">
       <section id="summary" class="grid sm:grid-cols-2 gap-3 text-sm"></section>
