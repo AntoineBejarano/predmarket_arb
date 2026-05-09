@@ -75,6 +75,33 @@ def _clob_credential_bundle() -> dict[str, str]:
     }
 
 
+def live_account_fingerprint() -> dict[str, Any]:
+    """
+    Huella no sensible de la cuenta CLOB para depuración en UI.
+    Nunca expone secretos completos.
+    """
+    creds = _clob_credential_bundle()
+    api_key = creds.get("api_key") or ""
+    private_key = creds.get("private_key") or ""
+    api_suffix = api_key[-8:] if len(api_key) >= 8 else api_key
+    pk_suffix = private_key[-8:] if len(private_key) >= 8 else private_key
+    out: dict[str, Any] = {
+        "api_key_suffix": api_suffix or None,
+        "private_key_suffix": pk_suffix or None,
+        "funder": (os.getenv("POLY_FUNDER", "").strip() or None),
+    }
+    if private_key:
+        try:
+            from eth_account import Account
+
+            out["signer_address"] = str(Account.from_key(private_key).address)
+        except Exception:
+            out["signer_address"] = None
+    else:
+        out["signer_address"] = None
+    return out
+
+
 def _load_account_file() -> dict[str, Any]:
     global _LOADED
     with _LOCK:

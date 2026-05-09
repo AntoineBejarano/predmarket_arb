@@ -16,6 +16,7 @@ import logging
 import secrets
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -57,6 +58,67 @@ if not log.handlers:
     logging.Formatter.converter = time.gmtime
     log.addHandler(_h)
 log.propagate = False
+
+
+class _SuppressNoisyUnauthorizedFilter(logging.Filter):
+    """
+    Reduce spam de 401 en access logs para endpoints de polling.
+    Mantiene el primer 401 por origen+ruta y luego deja pasar uno por ventana.
+    """
+
+    _RX = re.compile(r'"([A-Z]+)\s+(\S+)\s+HTTP/[0-9.]+"\s+401\b')
+
+    def __init__(self, window_sec: float = 60.0) -> None:
+        super().__init__()
+        self._window_sec = max(1.0, float(window_sec))
+        self._last_seen: dict[tuple[str, str, str], float] = {}
+        self._path_prefixes = (
+            "/api/arb/status",
+            "/api/sixcycle/history",
+            "/api/sixcycle/live",
+            "/api/arb/signals/live",
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        m = self._RX.search(msg or "")
+        if not m:
+            return True
+        method, path = m.group(1), m.group(2)
+        if not any(path.startswith(p) for p in self._path_prefixes):
+            return True
+        src = (msg or "").split(" - ", 1)[0].strip()
+        key = (src, method, path)
+        now = time.time()
+        prev = self._last_seen.get(key)
+        if prev is not None and (now - prev) < self._window_sec:
+            return False
+        self._last_seen[key] = now
+        # Limpieza defensiva para evitar crecimiento ilimitado.
+        if len(self._last_seen) > 4096:
+            cutoff = now - max(self._window_sec * 5.0, 300.0)
+            self._last_seen = {k: ts for k, ts in self._last_seen.items() if ts >= cutoff}
+        return True
+
+
+def _install_access_401_throttle() -> None:
+    if os.getenv("API_ACCESS_LOG_401_THROTTLE", "true").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    logger = logging.getLogger("uvicorn.access")
+    if any(isinstance(f, _SuppressNoisyUnauthorizedFilter) for f in logger.filters):
+        return
+    window_raw = os.getenv("API_ACCESS_LOG_401_WINDOW_SEC", "60").strip()
+    try:
+        window = max(1.0, float(window_raw))
+    except ValueError:
+        window = 60.0
+    logger.addFilter(_SuppressNoisyUnauthorizedFilter(window_sec=window))
+
+
+_install_access_401_throttle()
 
 DATA_DIR = data_dir()
 # Entrada fija (sin .env): mismo comportamiento en local y en deploy.
@@ -2124,6 +2186,7 @@ async def api_account_balance() -> JSONResponse:
             bal = pc.get_live_account_client().get_balance()
             bal["source"] = "live"
             bal["dry_run_env"] = _env_dry_run_global()
+            bal["account_fingerprint"] = pc.live_account_fingerprint()
             return bal
         except Exception as e:
             log.warning("GET /api/account/balance: %s", e)
@@ -2135,6 +2198,7 @@ async def api_account_balance() -> JSONResponse:
                 "error": str(e),
                 "credentials_path": str(pc.account_json_path()),
                 "dry_run_env": _env_dry_run_global(),
+                "account_fingerprint": pc.live_account_fingerprint(),
             }
 
     return JSONResponse(content=await asyncio.to_thread(_run))

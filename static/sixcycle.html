@@ -143,7 +143,7 @@
           class="rounded border border-slate-500 bg-slate-700/50 px-3 py-1.5 text-slate-100 hover:bg-slate-600/60 shrink-0">Guardar riesgo</button>
         <p id="acc-strategy-snapshot" class="text-[10px] text-slate-500 sm:ml-auto max-w-md leading-relaxed"></p>
       </div>
-      <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+      <div class="grid sm:grid-cols-2 lg:grid-cols-5 gap-3 text-xs font-mono">
         <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
           <p class="text-[10px] uppercase text-slate-500">USDC disponible</p>
           <p id="acc-usdc-avail" class="text-base font-bold text-emerald-200 mt-0.5">—</p>
@@ -153,13 +153,18 @@
           <p id="acc-usdc-pos" class="text-base font-bold text-sky-200 mt-0.5">—</p>
         </div>
         <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
+          <p class="text-[10px] uppercase text-slate-500">Total CLOB</p>
+          <p id="acc-usdc-total" class="text-base font-bold text-violet-200 mt-0.5">—</p>
+        </div>
+        <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
           <p class="text-[10px] uppercase text-slate-500">PnL hoy</p>
           <p id="acc-pnl-today" class="text-base font-bold text-white mt-0.5">—</p>
           <p id="acc-pnl-today-meta" class="text-[10px] text-slate-500 mt-0.5"></p>
         </div>
         <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
-          <p class="text-[10px] uppercase text-slate-500">PnL total (CSV)</p>
+          <p class="text-[10px] uppercase text-slate-500">PnL total histórico (solo Sixcycle)</p>
           <p id="acc-pnl-total" class="text-base font-bold text-white mt-0.5">—</p>
+          <p id="acc-pnl-total-meta" class="text-[10px] text-slate-500 mt-0.5"></p>
         </div>
       </div>
       <details class="rounded-lg border border-slate-700/60 bg-slate-900/30 mt-1 group">
@@ -185,6 +190,7 @@
           <p id="acc-positions-empty" class="text-[10px] text-slate-500 px-2 py-2 hidden">Sin órdenes abiertas o credenciales no disponibles.</p>
         </div>
       </details>
+      <p id="acc-balance-hint" class="text-[10px] text-slate-500 font-mono min-h-[1rem]"></p>
       <p id="acc-panel-msg" class="text-[10px] text-slate-500 font-mono min-h-[1rem]"></p>
     </section>
 
@@ -592,13 +598,15 @@
         var cR = apiFetch("/api/sixcycle/config", { cache: "no-store", headers: { Accept: "application/json" } });
         var posR = apiFetch("/api/account/positions", { cache: "no-store", headers: { Accept: "application/json" } });
         var stR = apiFetch("/api/strategies", { cache: "no-store", headers: { Accept: "application/json" } });
-        var results = await Promise.all([bR, pR, cR, posR, stR]);
+        var sstR = apiFetch("/api/sixcycle/status", { cache: "no-store", headers: { Accept: "application/json" } });
+        var results = await Promise.all([bR, pR, cR, posR, stR, sstR]);
         if (results.some(function (r) { return r.status === 401; })) return;
         var b = results[0].ok ? await results[0].json() : {};
         var p = results[1].ok ? await results[1].json() : {};
         var pack = results[2].ok ? await results[2].json() : {};
         var positions = results[3].ok ? await results[3].json() : [];
         var stratPack = results[4].ok ? await results[4].json() : {};
+        var sst = results[5].ok ? await results[5].json() : {};
         var cfg = pack.config || {};
         function fmtMoney(x) {
           if (x == null || !Number.isFinite(Number(x))) return "—";
@@ -607,11 +615,14 @@
         }
         var ea = document.getElementById("acc-usdc-avail");
         var ep = document.getElementById("acc-usdc-pos");
+        var et = document.getElementById("acc-usdc-total");
         if (ea) ea.textContent = fmtMoney(b.usdc_available);
         if (ep) ep.textContent = fmtMoney(b.usdc_in_positions);
+        if (et) et.textContent = fmtMoney(b.total);
         var pToday = document.getElementById("acc-pnl-today");
         var pTot = document.getElementById("acc-pnl-total");
         var pMeta = document.getElementById("acc-pnl-today-meta");
+        var pTotMeta = document.getElementById("acc-pnl-total-meta");
         var pt = Number(p.pnl_today || 0);
         if (pToday) {
           pToday.textContent = (pt >= 0 ? "+" : "") + "$" + Math.abs(pt).toFixed(2);
@@ -623,11 +634,19 @@
           var wrPct = Math.round(Number(p.win_rate_today || 0) * 100);
           pMeta.textContent = "(" + tr + " trades, " + wrPct + "% wr hoy)";
         }
-        var totp = Number(p.pnl_total || 0);
+        var sixTotal = Number(sst.pnl_usdc || 0);
+        var globalTotal = Number(p.pnl_total || 0);
         if (pTot) {
-          pTot.textContent = (totp >= 0 ? "+" : "") + "$" + Math.abs(totp).toFixed(2);
+          pTot.textContent = (sixTotal >= 0 ? "+" : "") + "$" + Math.abs(sixTotal).toFixed(2);
           pTot.className =
-            "text-base font-bold mt-0.5 " + (totp >= 0 ? "text-emerald-300" : "text-rose-300");
+            "text-base font-bold mt-0.5 " + (sixTotal >= 0 ? "text-emerald-300" : "text-rose-300");
+        }
+        if (pTotMeta) {
+          pTotMeta.textContent =
+            "Global todas estrategias: " +
+            (globalTotal >= 0 ? "+" : "-") +
+            "$" +
+            Math.abs(globalTotal).toFixed(2);
         }
         var envDry = !!pack.dry_run_process_env;
         var stratDry = isConfigDryRun(cfg.dry_run);
@@ -752,6 +771,33 @@
             setLiveStatusBadge("ok", "LIVE conectado");
             msg.textContent = "Conexión LIVE operativa.";
             msg.className = "text-[10px] font-mono min-h-[1rem] text-emerald-400/90";
+          }
+        }
+        var hint = document.getElementById("acc-balance-hint");
+        if (hint) {
+          var fp = b.account_fingerprint || {};
+          var signer = fp.signer_address || fp.funder || "—";
+          var apiSfx = fp.api_key_suffix ? "…" + String(fp.api_key_suffix) : "—";
+          var signerShort = signer && signer !== "—" ? accShortId(signer, 18) : "—";
+          var head =
+            "Cuenta CLOB: " +
+            signerShort +
+            " · API key: " +
+            apiSfx +
+            " · fuente: " +
+            String(b.source || "live");
+          if (!b.error && !envDry && Number.isFinite(Number(b.total)) && Number(b.total) <= 0) {
+            hint.textContent =
+              head +
+              " · balance en 0.00 (si esperabas fondos, revisa que sea esta misma cuenta/funder y que haya collateral en CLOB).";
+            hint.className = "text-[10px] text-amber-300 font-mono min-h-[1rem]";
+          } else if (b.error) {
+            var credPath = b.credentials_path ? " · creds: " + String(b.credentials_path) : "";
+            hint.textContent = head + credPath;
+            hint.className = "text-[10px] text-slate-400 font-mono min-h-[1rem]";
+          } else {
+            hint.textContent = head;
+            hint.className = "text-[10px] text-slate-500 font-mono min-h-[1rem]";
           }
         }
         if (!b.error && !envDry) {
@@ -1593,6 +1639,11 @@
       if (btn) btn.disabled = true;
       if (en) en.disabled = true;
       if (dis) dis.disabled = true;
+      var panelMsg = document.getElementById("acc-panel-msg");
+      if (panelMsg) {
+        panelMsg.textContent = "Reiniciando datos de Sixcycle…";
+        panelMsg.className = "text-[10px] font-mono min-h-[1rem] text-indigo-300";
+      }
       try {
         const r = await apiFetch("/api/sixcycle/reset-data", { method: "POST" });
         if (r.status === 401) return;
@@ -1613,16 +1664,26 @@
         if (body.postgres_sixcycle_cleared === true) msgReset += " · Postgres limpiado.";
         if (body.paper_reset === true) msgReset += " · Estado paper reiniciado.";
         alert(msgReset);
+        await refreshAccountPanel();
         await refresh();
         if (window.liveUi && typeof window.liveUi.reloadHistory === "function") {
           await window.liveUi.reloadHistory();
         }
         await pollSixcycleEnabled();
+        if (panelMsg) {
+          panelMsg.textContent = "Reset completado: KPIs de Sixcycle actualizados.";
+          panelMsg.className = "text-[10px] font-mono min-h-[1rem] text-emerald-400";
+        }
       } catch (err) {
         alert("Borrar datos: " + err);
+        if (panelMsg) {
+          panelMsg.textContent = "Reset fallido: " + String(err);
+          panelMsg.className = "text-[10px] font-mono min-h-[1rem] text-rose-400";
+        }
       } finally {
         if (btn) btn.disabled = false;
         await pollSixcycleEnabled();
+        await refreshAccountPanel();
         await refresh();
       }
     });

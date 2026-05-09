@@ -70,8 +70,8 @@
     "fict_last_pnl_est_eur": null
   },
   "crypto_5m_sixcycle": {
-    "enabled": false,
-    "enabled_at": null,
+    "enabled": true,
+    "enabled_at": "2026-05-09T18:48:15.609114+00:00",
     "disabled_at": null,
     "fict_capital_eur": 1000.0,
     "fict_pnl_cumulative_eur": 0.0,
