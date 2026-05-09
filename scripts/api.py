@@ -2416,13 +2416,15 @@ async def api_sixcycle_reset_data() -> JSONResponse:
         from scripts import sixcycle_engine as six_mod
 
         six_mod.reset_sixcycle_live_state()
+        paper_reset_ok = await _state_manager.reset_fictional_for_slug(SIXCYCLE_SLUG)
         log.info(
-            "POST /api/sixcycle/reset-data removed=%s errors=%s",
+            "POST /api/sixcycle/reset-data removed=%s errors=%s paper_reset=%s",
             len(file_result.get("files_removed") or []),
             len(file_result.get("file_errors") or []),
+            paper_reset_ok,
         )
         return JSONResponse(
-            content={"ok": True, **file_result},
+            content={"ok": True, "paper_reset": bool(paper_reset_ok), **file_result},
         )
     except Exception as e:
         log.exception("POST /api/sixcycle/reset-data failed: %s", e)

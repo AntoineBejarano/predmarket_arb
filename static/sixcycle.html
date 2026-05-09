@@ -1560,6 +1560,7 @@
           " archivo(s)" +
           (missing ? " · ya vacíos/no existentes: " + missing : "");
         if (body.postgres_sixcycle_cleared === true) msgReset += " · Postgres limpiado.";
+        if (body.paper_reset === true) msgReset += " · Estado paper reiniciado.";
         alert(msgReset);
         await refresh();
         if (window.liveUi && typeof window.liveUi.reloadHistory === "function") {

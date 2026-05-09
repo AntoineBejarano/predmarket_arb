@@ -206,6 +206,27 @@ class StrategyStateManager:
                 self._state[slug] = ent
             self._save()
 
+    async def reset_fictional_for_slug(self, slug: str) -> bool:
+        """Pone a cero PnL/ops paper de una sola estrategia; devuelve False si no existe."""
+        async with self._lock:
+            self._reload_if_file()
+            if slug not in self._state:
+                return False
+            ent = self._merge_entry(slug, self._state.get(slug, {}))
+            cap = float(ent.get("fict_capital_eur") or _default_fictional_capital())
+            ent["fict_capital_eur"] = cap
+            ent["fict_pnl_cumulative_eur"] = 0.0
+            ent["fict_trades"] = 0
+            ent["fict_last_stake_eur"] = None
+            ent["fict_last_pnl_est_eur"] = None
+            ent["stopped_by_failure"] = False
+            ent["last_stop_reason"] = None
+            ent["last_stop_detail"] = None
+            ent["last_stop_ts"] = None
+            self._state[slug] = ent
+            self._save()
+            return True
+
     async def enrich_row_with_fictional(self, slug: str, row: dict[str, Any]) -> dict[str, Any]:
         """
         Para SIGNAL / EXECUTED con size_usdc:
