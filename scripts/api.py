@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -1741,6 +1741,118 @@ async def api_sixcycle_status() -> JSONResponse:
         payload = dict(six_mod.SIXCYCLE_STATE)
     await asyncio.to_thread(_sixcycle_merge_csv_kpis_into_payload, payload)
     return JSONResponse(content=payload)
+
+
+async def _sixcycle_config_api_bundle() -> dict[str, Any]:
+    """Payload enriquecido para GET /api/sixcycle/config (agentes / UI)."""
+    from scripts import sixcycle_config_store as scs
+    from scripts import sixcycle_engine as six_mod
+
+    cfg_disk = scs.load_config()
+    enabled_live = await _state_manager.is_enabled(SIXCYCLE_SLUG)
+    cfg = dict(cfg_disk)
+    cfg["enabled"] = enabled_live
+    rows = _read_arb_csv_tail(ARB_CSV_PATHS[SIXCYCLE_SLUG], n=300)
+    stats = scs.stats_last_n_from_csv_rows(rows, 100)
+    return {
+        "config": cfg,
+        "enabled": enabled_live,
+        "stats_last_100": stats,
+        "active_filters": scs.build_active_filters(cfg_disk),
+        "last_updated": scs.get_last_updated_iso(),
+        "dry_run_process_env": bool(six_mod.DRY_RUN),
+    }
+
+
+@app.get("/api/sixcycle/config")
+async def api_sixcycle_get_config() -> JSONResponse:
+    return JSONResponse(content=await _sixcycle_config_api_bundle())
+
+
+@app.get("/api/sixcycle/config/schema")
+async def api_sixcycle_config_schema() -> JSONResponse:
+    from scripts import sixcycle_config_store as scs
+
+    return JSONResponse(content=dict(scs.SCHEMA))
+
+
+@app.post("/api/sixcycle/config/suggest")
+async def api_sixcycle_config_suggest(body: dict[str, Any] = Body(...)) -> JSONResponse:
+    from scripts import sixcycle_config_store as scs
+
+    objective = str(body.get("objective") or "").strip()
+    cfg = scs.load_config()
+    rows = _read_arb_csv_tail(ARB_CSV_PATHS[SIXCYCLE_SLUG], n=300)
+    stats = scs.stats_last_n_from_csv_rows(rows, 100)
+    try:
+        sug = scs.suggest_from_stats(objective, stats, cfg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return JSONResponse(
+        content={
+            "objective": objective,
+            "stats_last_100": stats,
+            **sug,
+        }
+    )
+
+
+@app.post("/api/sixcycle/config")
+async def api_sixcycle_post_config(body: dict[str, Any] = Body(...)) -> JSONResponse:
+    from scripts import sixcycle_config_store as scs
+    from scripts import sixcycle_engine as six_mod
+
+    reset_defaults = bool(body.get("reset_defaults"))
+    confirm_live = bool(body.get("confirm_live"))
+    control_keys = frozenset({"reset_defaults", "confirm_live"})
+    partial = {k: v for k, v in body.items() if k not in control_keys}
+
+    if reset_defaults:
+        merged = dict(scs.DEFAULT_SIXCYCLE_CONFIG)
+    else:
+        cur = scs.load_config()
+        merged = scs.merge_and_validate(cur, partial)
+
+    if "dry_run" in partial and partial["dry_run"] is False and bool(six_mod.DRY_RUN):
+        if not confirm_live:
+            raise HTTPException(
+                status_code=400,
+                detail="El proceso arrancó con DRY_RUN=true: para persistir dry_run=false "
+                "envía confirm_live=true y deja el motor Sixcycle parado (sin órdenes reales hasta reinicio acorde).",
+            )
+        if _sixcycle_running():
+            raise HTTPException(
+                status_code=400,
+                detail="Parar Sixcycle (POST disable / Parar en UI) antes de dry_run=false con DRY_RUN en el proceso.",
+            )
+
+    if "enabled" in partial:
+        if bool(partial["enabled"]):
+            started, err = await _sixcycle_start()
+            if not started and err != "already_running":
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"No se pudo encender Sixcycle: {err or 'start_failed'}",
+                )
+            await _state_manager.enable(SIXCYCLE_SLUG)
+        else:
+            await _sixcycle_stop()
+            await _state_manager.disable(SIXCYCLE_SLUG)
+    merged["enabled"] = await _state_manager.is_enabled(SIXCYCLE_SLUG)
+
+    def _save() -> None:
+        scs.save_config(merged)
+
+    try:
+        await asyncio.to_thread(_save)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    eng = _sixcycle_engine
+    if eng is not None:
+        await asyncio.to_thread(eng.reload_config)
+
+    return JSONResponse(content=await _sixcycle_config_api_bundle())
 
 
 @app.post("/api/sixcycle/dry-stake-multiplier")

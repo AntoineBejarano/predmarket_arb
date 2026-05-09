@@ -1,0 +1,20 @@
+{
+  "clob_extreme_high": 0.7,
+  "clob_extreme_low": 0.3,
+  "clob_threshold_high": 0.65,
+  "clob_threshold_low": 0.35,
+  "dry_run": true,
+  "enabled": true,
+  "fill_dead_zone_high": 0.24,
+  "fill_dead_zone_low": 0.18,
+  "fill_max": 0.4,
+  "fill_min": 0.12,
+  "kelly_fraction": 0.25,
+  "liquidity_max": 1500.0,
+  "max_stake_usdc": 5.0,
+  "min_edge": 0.05,
+  "score_min_abs": 3,
+  "timing_dead_zone_high": 3.0,
+  "timing_dead_zone_low": 2.5,
+  "timing_max_minutes": 3.0
+}

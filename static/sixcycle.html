@@ -113,28 +113,37 @@
     <div id="tab-control" class="space-y-6">
       <section id="summary" class="grid sm:grid-cols-2 gap-3 text-sm"></section>
 
-      <section>
-        <h2 class="text-sm font-medium text-slate-300 mb-2">Últimas filas del CSV (engine)</h2>
-        <p class="text-[11px] text-slate-500 mb-2 max-w-4xl">
-          En la tabla, <strong class="text-slate-300">un trade = una fila</strong>: se fusionan la entrada (fill) y el cierre (settle) del mismo <code class="text-slate-400">market_id</code>;
-          la columna <code class="text-slate-400">timestamp_utc</code> muestra <span class="text-emerald-300/90">entrada → cierre</span>. Los snapshots repetidos entre medias no se listan.
-          <span class="inline-flex items-center gap-1 rounded border border-amber-700/50 bg-amber-950/30 px-1.5 py-0.5 font-mono text-amber-200 ml-1">SOLO ENTRADA</span>
-          = hay fill en este recorte pero no aparece el settle en las mismas filas cargadas (suele ser por el límite de líneas: el cierre puede estar más arriba en el CSV).
-        </p>
-        <div class="overflow-x-auto rounded-lg border border-slate-700">
-          <table class="min-w-full text-xs font-mono">
-            <thead class="bg-slate-800 text-slate-400 text-left">
-              <tr id="thead-row"></tr>
-            </thead>
-            <tbody id="tbody" class="divide-y divide-slate-800"></tbody>
-          </table>
+      <details id="sixcycle-config-details" class="group rounded-xl border border-slate-600 bg-slate-800/50 open:ring-1 open:ring-indigo-500/30">
+        <summary
+          class="cursor-pointer list-none flex items-center justify-between gap-2 px-4 py-3 text-sm font-medium text-slate-200 hover:bg-slate-800/80 rounded-xl marker:hidden [&::-webkit-details-marker]:hidden">
+          <span class="flex items-center gap-2"><span aria-hidden="true">⚙️</span> Configuración de filtros</span>
+          <span class="text-indigo-300 text-xs font-normal group-open:hidden">Abrir</span>
+          <span class="text-indigo-300 text-xs font-normal hidden group-open:inline">Cerrar</span>
+        </summary>
+        <div class="px-4 pb-4 pt-0 border-t border-slate-700/80 space-y-4">
+          <p id="sixcycle-config-active-filters" class="text-[11px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap"></p>
+          <div id="sixcycle-config-fields" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[min(70vh,32rem)] overflow-y-auto pr-1"></div>
+          <div class="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-700/60">
+            <button type="button" id="sixcycle-config-apply"
+              class="text-sm px-4 py-2 rounded-lg border border-indigo-500/60 bg-indigo-600/30 text-indigo-50 hover:bg-indigo-600/45 font-medium">
+              Aplicar cambios
+            </button>
+            <button type="button" id="sixcycle-config-reset"
+              class="text-sm px-4 py-2 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800">
+              Reset defaults
+            </button>
+            <span id="sixcycle-config-feedback" class="text-xs font-mono text-slate-500 min-w-[8rem]"></span>
+          </div>
         </div>
-        <p id="tbl-msg" class="text-xs text-slate-500 mt-2"></p>
-      </section>
+      </details>
 
-      <h2 class="text-sm font-medium text-slate-300 pt-8 mt-2 border-t border-slate-700">
+      <div id="panel-live" class="pt-6 border-t border-slate-700">
+      <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2 mb-2">
+      <h2 class="text-sm font-medium text-slate-300">
         Panel en vivo (SSE + historial sixcycle)
       </h2>
+      <a href="#sixcycle-csv-engine-section" class="text-xs text-indigo-400 hover:underline shrink-0">↓ Tabla CSV (scroll)</a>
+      </div>
       <p class="text-xs text-slate-500 -mt-1 mb-2">
         Mismo CSV: abajo solo <strong class="text-slate-400">trades cerrados</strong> (SETTLED win/loss). El log incluye también filas de scan (EJECUTANDO).
       </p>
@@ -248,6 +257,26 @@
           </table>
         </div>
       </div>
+
+      <section id="sixcycle-csv-engine-section" class="pt-8 mt-6 border-t border-slate-700">
+        <h2 class="text-sm font-medium text-slate-300 mb-2">Últimas filas del CSV (engine)</h2>
+        <p class="text-[11px] text-slate-500 mb-2 max-w-4xl">
+          En la tabla, <strong class="text-slate-300">un trade = una fila</strong>: se fusionan la entrada (fill) y el cierre (settle) del mismo <code class="text-slate-400">market_id</code>;
+          la columna <code class="text-slate-400">timestamp_utc</code> muestra <span class="text-emerald-300/90">entrada → cierre</span>. Los snapshots repetidos entre medias no se listan.
+          <span class="inline-flex items-center gap-1 rounded border border-amber-700/50 bg-amber-950/30 px-1.5 py-0.5 font-mono text-amber-200 ml-1">SOLO ENTRADA</span>
+          = hay fill en este recorte pero no aparece el settle en las mismas filas cargadas (suele ser por el límite de líneas: el cierre puede estar más arriba en el CSV).
+        </p>
+        <div class="overflow-x-auto rounded-lg border border-slate-700 max-h-[min(50vh,28rem)] overflow-y-auto overscroll-contain shadow-inner">
+          <table class="min-w-full text-xs font-mono relative">
+            <thead class="bg-slate-800 text-slate-400 text-left sticky top-0 z-20 shadow-sm">
+              <tr id="thead-row"></tr>
+            </thead>
+            <tbody id="tbody" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+        <p id="tbl-msg" class="text-xs text-slate-500 mt-2"></p>
+      </section>
+      </div>
     </div>
   </div>
 
@@ -298,8 +327,12 @@
     }
     document.getElementById("lv-go-control").addEventListener("click", function (e) {
       e.preventDefault();
-      var strip = document.getElementById("sixcycle-motor-strip");
-      if (strip) strip.scrollIntoView({ behavior: "smooth", block: "start" });
+      var live = document.getElementById("panel-live");
+      if (live) live.scrollIntoView({ behavior: "smooth", block: "start" });
+      else {
+        var strip = document.getElementById("sixcycle-motor-strip");
+        if (strip) strip.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
     });
     pollSixcycleEnabled();
     setInterval(pollSixcycleEnabled, 4000);
@@ -370,6 +403,165 @@
         fb.className = "text-[11px] mt-2 min-h-[1.15rem] font-mono text-rose-400";
       }
     });
+
+    function renderSixcycleConfigFields(schema, config) {
+      var box = document.getElementById("sixcycle-config-fields");
+      if (!box || !schema) return;
+      box.innerHTML = "";
+      Object.keys(schema)
+        .sort()
+        .forEach(function (key) {
+          var meta = schema[key] || {};
+          var val = config[key];
+          var wrap = document.createElement("label");
+          wrap.className = "flex flex-col gap-1 rounded-lg border border-slate-700/80 bg-slate-900/40 p-2";
+          var lab = document.createElement("span");
+          lab.className = "text-[10px] text-slate-500 leading-snug";
+          lab.textContent = key + (meta.description ? " — " + meta.description : "");
+          var input;
+          if (meta.type === "bool") {
+            input = document.createElement("input");
+            input.type = "checkbox";
+            input.checked = !!val;
+            input.className = "h-4 w-4 rounded border-slate-600 text-indigo-500 shrink-0";
+          } else {
+            input = document.createElement("input");
+            input.type = "number";
+            input.step = meta.type === "int" ? "1" : "any";
+            input.value = val != null ? String(val) : "";
+            input.className =
+              "text-sm font-mono border border-slate-600 rounded px-2 py-1 bg-slate-950 text-slate-100 w-full min-w-0";
+            if (meta.min != null) input.min = String(meta.min);
+            if (meta.max != null) input.max = String(meta.max);
+          }
+          input.dataset.cfgKey = key;
+          input.dataset.cfgType = meta.type || "float";
+          wrap.appendChild(lab);
+          wrap.appendChild(input);
+          box.appendChild(wrap);
+        });
+    }
+
+    function collectSixcycleConfigPayload() {
+      var box = document.getElementById("sixcycle-config-fields");
+      if (!box) return {};
+      var out = {};
+      box.querySelectorAll("[data-cfg-key]").forEach(function (inp) {
+        var k = inp.dataset.cfgKey;
+        var t = inp.dataset.cfgType || "float";
+        if (t === "bool") {
+          out[k] = !!inp.checked;
+          return;
+        }
+        var raw = String(inp.value || "").replace(",", ".").trim();
+        if (raw === "") return;
+        var v = parseFloat(raw);
+        if (!Number.isFinite(v)) return;
+        if (t === "int") out[k] = Math.round(v);
+        else out[k] = v;
+      });
+      return out;
+    }
+
+    async function loadSixcycleConfigUi() {
+      try {
+        var sR = await fetch("/api/sixcycle/config/schema", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        var cR = await fetch("/api/sixcycle/config", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (!sR.ok || !cR.ok) return;
+        var schema = await sR.json();
+        var pack = await cR.json();
+        var cfg = pack.config || {};
+        var af = document.getElementById("sixcycle-config-active-filters");
+        if (af && pack.active_filters) af.textContent = (pack.active_filters || []).join("\n");
+        renderSixcycleConfigFields(schema, cfg);
+      } catch (err) {
+        console.warn("sixcycle config ui", err);
+      }
+    }
+
+    var sixcycleApply = document.getElementById("sixcycle-config-apply");
+    if (sixcycleApply) {
+      sixcycleApply.addEventListener("click", async function (e) {
+        e.preventDefault();
+        var fb = document.getElementById("sixcycle-config-feedback");
+        if (fb) {
+          fb.textContent = "Enviando…";
+          fb.className = "text-xs font-mono text-slate-400";
+        }
+        try {
+          var body = collectSixcycleConfigPayload();
+          var r = await fetch("/api/sixcycle/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify(body),
+          });
+          var j = await r.json().catch(function () {
+            return {};
+          });
+          if (!r.ok) {
+            if (fb) {
+              fb.textContent = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
+              fb.className = "text-xs font-mono text-rose-400";
+            }
+            return;
+          }
+          if (fb) {
+            fb.textContent = "OK";
+            fb.className = "text-xs font-mono text-emerald-400";
+          }
+          await loadSixcycleConfigUi();
+          await pollSixcycleEnabled();
+          await refresh();
+        } catch (err) {
+          if (fb) {
+            fb.textContent = String(err);
+            fb.className = "text-xs font-mono text-rose-400";
+          }
+        }
+      });
+    }
+    var sixcycleReset = document.getElementById("sixcycle-config-reset");
+    if (sixcycleReset) {
+      sixcycleReset.addEventListener("click", async function (e) {
+        e.preventDefault();
+        if (!confirm("¿Restaurar todos los parámetros a los valores por defecto del repositorio?")) return;
+        var fb = document.getElementById("sixcycle-config-feedback");
+        try {
+          var r = await fetch("/api/sixcycle/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ reset_defaults: true }),
+          });
+          var j = await r.json().catch(function () {
+            return {};
+          });
+          if (!r.ok) {
+            if (fb) {
+              fb.textContent = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
+              fb.className = "text-xs font-mono text-rose-400";
+            }
+            return;
+          }
+          if (fb) {
+            fb.textContent = "Defaults restaurados";
+            fb.className = "text-xs font-mono text-emerald-400";
+          }
+          await loadSixcycleConfigUi();
+          await refresh();
+        } catch (err) {
+          if (fb) {
+            fb.textContent = String(err);
+            fb.className = "text-xs font-mono text-rose-400";
+          }
+        }
+      });
+    }
 
     /* ——— Control tab (CSV / enable) ——— */
     async function fetchStatus() {
@@ -571,6 +763,7 @@
         const rows = await fetchLog();
         renderTable(rows);
         await refreshDryStakeFromApi();
+        await loadSixcycleConfigUi();
       } catch (e) {
         document.getElementById("tbl-msg").textContent = "Error: " + e;
       }
@@ -811,9 +1004,9 @@
           const y = +yes;
           const pct = Math.min(100, Math.max(0, y * 100));
           ybar.style.width = "100%";
-          if (ex === "UP" || y < 0.35) {
+          if (ex === "UP") {
             ybar.className = "h-full rounded transition-all duration-200 bg-emerald-500 shadow-[0_0_12px_rgba(52,211,153,0.45)]";
-          } else if (ex === "DOWN" || y > 0.65) {
+          } else if (ex === "DOWN") {
             ybar.className = "h-full rounded transition-all duration-200 bg-red-500 shadow-[0_0_12px_rgba(248,113,113,0.4)]";
           } else {
             ybar.className = "h-full rounded transition-all duration-200 bg-slate-500";

@@ -60,6 +60,7 @@ from clients.poly_parse import api_bool_true, extract_yes_token_id, parse_json_m
 from lab.market_scorer import MarketScorer  # noqa: E402
 from lab.paths import data_dir  # noqa: E402
 from scripts.clob_signal_filter import CLOBSignalFilter  # noqa: E402
+from scripts import sixcycle_config_store as _sixcycle_cfg  # noqa: E402
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
 # En DRY_RUN: factor sobre el stake Kelly (p. ej. 100 → apuestas y PnL ×100 en paper). No aplica en LIVE.
@@ -438,7 +439,10 @@ def _model_prob_from_signal(signal: dict[str, Any]) -> float:
     return 0.5
 
 
-def _clob_extreme(clob_yes: float | None) -> Literal["UP", "DOWN", "NEUTRAL"]:
+def clob_extreme_from_levels(
+    clob_yes: float | None, elow: float, ehigh: float
+) -> Literal["UP", "DOWN", "NEUTRAL"]:
+    """YES extremo UP si precio bajo ``elow``, DOWN si por encima de ``ehigh``."""
     if clob_yes is None:
         return "NEUTRAL"
     try:
@@ -447,30 +451,11 @@ def _clob_extreme(clob_yes: float | None) -> Literal["UP", "DOWN", "NEUTRAL"]:
         return "NEUTRAL"
     if y != y:
         return "NEUTRAL"
-    if y < 0.35:
+    if y < float(elow):
         return "UP"
-    if y > 0.65:
+    if y > float(ehigh):
         return "DOWN"
     return "NEUTRAL"
-
-
-def _clob_bar_plain(clob_yes: float | None) -> str:
-    """Barra texto para panel/SSE (sin markup Rich)."""
-    ex = _clob_extreme(clob_yes)
-    if ex == "UP":
-        return "CLOB " + "█" * 12 + " UP   (YES<0.35)"
-    if ex == "DOWN":
-        return "CLOB " + "█" * 12 + " DOWN (YES>0.65)"
-    return "CLOB " + "░" * 12 + " neutro"
-
-
-def _clob_bar_rich(clob_yes: float | None) -> Text:
-    ex = _clob_extreme(clob_yes)
-    if ex == "UP":
-        return Text.from_markup("[bold green]CLOB ████████████[/] [green]UP[/] [dim](YES<0.35)[/]")
-    if ex == "DOWN":
-        return Text.from_markup("[bold red]CLOB ████████████[/] [red]DOWN[/] [dim](YES>0.65)[/]")
-    return Text.from_markup("[dim]CLOB ░░░░░░░░░░░░ neutro[/]")
 
 
 def _minutes_elapsed_from_tte(tte_sec: float | None) -> str:
@@ -550,7 +535,49 @@ class SixCycleEngine:
         self._current_market_filled: bool = False
         self._filled_market_ids: set[str] = set()
         self._last_scan_focus_market_id: str | None = None
+        self._config: dict[str, Any] = dict(_sixcycle_cfg.DEFAULT_SIXCYCLE_CONFIG)
+        self._dry_run_effective = bool(DRY_RUN)
+        self.reload_config()
         self._ensure_csv_header()
+
+    def reload_config(self) -> None:
+        """Recarga ``sixcycle_config.json`` (llamar desde API tras POST o al inicio de cada ciclo)."""
+        self._config = _sixcycle_cfg.load_config()
+        if DRY_RUN:
+            self._dry_run_effective = True
+        else:
+            self._dry_run_effective = bool(self._config.get("dry_run", False))
+
+    def _extreme_yes(self, clob_yes: float | None) -> Literal["UP", "DOWN", "NEUTRAL"]:
+        return clob_extreme_from_levels(
+            clob_yes,
+            float(self._config["clob_extreme_low"]),
+            float(self._config["clob_extreme_high"]),
+        )
+
+    def _clob_bar_plain(self, clob_yes: float | None) -> str:
+        ex = self._extreme_yes(clob_yes)
+        el = float(self._config["clob_extreme_low"])
+        eh = float(self._config["clob_extreme_high"])
+        if ex == "UP":
+            return "CLOB " + "█" * 12 + f" UP   (YES<{el})"
+        if ex == "DOWN":
+            return "CLOB " + "█" * 12 + f" DOWN (YES>{eh})"
+        return "CLOB " + "░" * 12 + " neutro"
+
+    def _clob_bar_rich(self, clob_yes: float | None) -> Text:
+        ex = self._extreme_yes(clob_yes)
+        el = float(self._config["clob_extreme_low"])
+        eh = float(self._config["clob_extreme_high"])
+        if ex == "UP":
+            return Text.from_markup(
+                f"[bold green]CLOB ████████████[/] [green]UP[/] [dim](YES<{el})[/]"
+            )
+        if ex == "DOWN":
+            return Text.from_markup(
+                f"[bold red]CLOB ████████████[/] [red]DOWN[/] [dim](YES>{eh})[/]"
+            )
+        return Text.from_markup("[dim]CLOB ░░░░░░░░░░░░ neutro[/]")
 
     def _validate_with_clob_extreme_override(
         self,
@@ -569,8 +596,11 @@ class SixCycleEngine:
         if liquidity < MIN_LIQUIDITY_USDC:
             return val
         eps = 1e-5
-        if clob_yes > 0.65:
-            m_try = min(0.5, float(clob_yes) - MIN_EDGE - eps)
+        c_hi = float(self._config["clob_threshold_high"])
+        c_lo = float(self._config["clob_threshold_low"])
+        meff = float(self._config["min_edge"])
+        if clob_yes > c_hi:
+            m_try = min(0.5, float(clob_yes) - meff - eps)
             m_try = max(0.01, m_try)
             direction = "NO"
             edge = float(clob_yes) - m_try
@@ -583,17 +613,17 @@ class SixCycleEngine:
             v2 = self._filter.evaluate(
                 m_try,
                 float(clob_yes),
-                min_edge=MIN_EDGE,
+                min_edge=meff,
                 min_liquidity_usdc=MIN_LIQUIDITY_USDC,
                 liquidity=float(liquidity),
             )
             if v2.get("signal") and str(v2.get("direction")) == "NO":
                 r = dict(v2)
-                r["reason"] = str(r.get("reason", "")) + " [clob_extreme>0.65]"
+                r["reason"] = str(r.get("reason", "")) + f" [clob_extreme>{c_hi}]"
                 return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity, market)
-        elif clob_yes < 0.35:
+        elif clob_yes < c_lo:
             # Debe quedar estrictamente > 0.5 para rama YES del filtro.
-            m_try = max(0.5 + 2e-4, float(clob_yes) + MIN_EDGE + eps)
+            m_try = max(0.5 + 2e-4, float(clob_yes) + meff + eps)
             m_try = min(0.99, m_try)
             direction = "YES"
             edge = m_try - float(clob_yes)
@@ -606,13 +636,13 @@ class SixCycleEngine:
             v2 = self._filter.evaluate(
                 m_try,
                 float(clob_yes),
-                min_edge=MIN_EDGE,
+                min_edge=meff,
                 min_liquidity_usdc=MIN_LIQUIDITY_USDC,
                 liquidity=float(liquidity),
             )
             if v2.get("signal") and str(v2.get("direction")) == "YES":
                 r = dict(v2)
-                r["reason"] = str(r.get("reason", "")) + " [clob_extreme<0.35]"
+                r["reason"] = str(r.get("reason", "")) + f" [clob_extreme<{c_lo}]"
                 return self._apply_empirical_post_filters(r, signal, clob_yes, liquidity, market)
         return val
 
@@ -708,8 +738,8 @@ class SixCycleEngine:
                 clob_no = max(0.0, min(1.0, 1.0 - float(clob_yes)))
             except (TypeError, ValueError):
                 clob_no = None
-        clob_ex_s = _clob_extreme(clob_yes)
-        clob_bar_s = _clob_bar_plain(clob_yes)
+        clob_ex_s = self._extreme_yes(clob_yes)
+        clob_bar_s = self._clob_bar_plain(clob_yes)
 
         liq: float | None = None
         if sig.get("liquidity_usdc") is not None:
@@ -772,7 +802,7 @@ class SixCycleEngine:
             "pnl_usdc": round(float(self.pnl_usdc), 6),
             "win_streak": int(self.win_streak),
             "best_streak": int(self.best_streak),
-            "dry_run": bool(DRY_RUN),
+            "dry_run": bool(self._dry_run_effective),
             "dry_run_stake_multiplier": float(get_dry_run_stake_multiplier()) if DRY_RUN else 1.0,
             "clob_extreme": clob_ex_s,
             "clob_no_price": clob_no,
@@ -917,9 +947,11 @@ class SixCycleEngine:
         prev_line = "Mercado anterior: —"
         if prev is not None:
             prev_line = f"Mercado anterior: {prev * 100:.0f}% UP"
-            if prev < 0.35:
+            cel = float(self._config["clob_extreme_low"])
+            ceh = float(self._config["clob_extreme_high"])
+            if prev < cel:
                 prev_line += " (sesgo DOWN)"
-            elif prev > 0.65:
+            elif prev > ceh:
                 prev_line += " (sesgo UP)"
         wr = (100.0 * self.wins / self.trades) if self.trades else 0.0
         body = (
@@ -997,7 +1029,7 @@ class SixCycleEngine:
         except (TypeError, ValueError):
             yes_f = None
         no_f = max(0.0, min(1.0, 1.0 - yes_f)) if yes_f is not None else None
-        extreme = _clob_extreme(yes_f)
+        extreme = self._extreme_yes(yes_f)
         try:
             liq_f = float(liq) if liq is not None else 0.0
         except (TypeError, ValueError):
@@ -1042,7 +1074,7 @@ class SixCycleEngine:
             "win_rate_pct": f"{wr:.2f}",
             "pnl_cumulative_usdc": f"{self.pnl_usdc:.6f}",
             "reason": reason_v,
-            "dry_run": self._csv_bool(DRY_RUN),
+            "dry_run": self._csv_bool(self._dry_run_effective),
         }
 
     async def run(self) -> None:
@@ -1057,7 +1089,7 @@ class SixCycleEngine:
             self._running = False
 
     async def _run_main_loop(self) -> None:
-        mode = "[DRY_RUN]" if DRY_RUN else "[LIVE]"
+        mode = "[DRY_RUN]" if self._dry_run_effective else "[LIVE]"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             headers=_DEFAULT_HEADERS,
@@ -1072,6 +1104,8 @@ class SixCycleEngine:
                     asyncio.create_task(self.scorer.start(token_id=None))
                     await asyncio.sleep(5.0)
                     while not self._stop_run.is_set():
+                        self.reload_config()
+                        mode = "[DRY_RUN]" if self._dry_run_effective else "[LIVE]"
                         now = datetime.now(timezone.utc)
                         tsec = int(now.timestamp())
                         win = (tsec // 300) * 300
@@ -1302,7 +1336,7 @@ class SixCycleEngine:
                                 )
                             except Exception as e:  # noqa: BLE001
                                 log.warning("cycle_fill error", extra={"error": str(e)})
-                                if not DRY_RUN:
+                                if not self._dry_run_effective:
                                     log.critical(
                                         "LIVE fill falló — no reintento automático",
                                         extra={"error": str(e)},
@@ -1409,9 +1443,9 @@ class SixCycleEngine:
                         )
                         if markets:
                             try:
-                                self._console.print(_clob_bar_rich(float(markets[0]["clob_yes_price"])))
+                                self._console.print(self._clob_bar_rich(float(markets[0]["clob_yes_price"])))
                             except (KeyError, TypeError, ValueError):
-                                self._console.print(_clob_bar_rich(None))
+                                self._console.print(self._clob_bar_rich(None))
                         self._render_dashboard(
                             mode,
                             cycle_scan_ms,
@@ -1611,8 +1645,19 @@ class SixCycleEngine:
         if not val.get("signal"):
             return val
         minutes_elapsed = _minutes_elapsed_float_for_filter(val, market)
-        if minutes_elapsed is not None and minutes_elapsed > 3.0:
-            reason_tm = f"timing: minuto {minutes_elapsed:.1f} >3.0 (WR 0% empírico)"
+        cfg = self._config
+        t_dlo = float(cfg["timing_dead_zone_low"])
+        t_dhi = float(cfg["timing_dead_zone_high"])
+        t_max = float(cfg["timing_max_minutes"])
+        if minutes_elapsed is not None and t_dlo <= minutes_elapsed <= t_dhi:
+            reason_tm = (
+                f"timing: minuto {minutes_elapsed:.1f} en zona muerta "
+                f"{t_dlo:.1f}-{t_dhi:.1f} (WR 0% empírico)"
+            )
+            log.info("Señal rechazada (filtro empírico): %s", reason_tm)
+            return {**val, "signal": False, "reason": reason_tm}
+        if minutes_elapsed is not None and minutes_elapsed > t_max:
+            reason_tm = f"timing: minuto {minutes_elapsed:.1f} >{t_max:.1f} (WR 0% empírico)"
             log.info("Señal rechazada (filtro empírico): %s", reason_tm)
             return {**val, "signal": False, "reason": reason_tm}
         direction = str(val.get("direction") or "YES").upper()
@@ -1627,17 +1672,26 @@ class SixCycleEngine:
         except (TypeError, ValueError):
             score = 0
 
+        f_min = float(cfg["fill_min"])
+        f_dlo = float(cfg["fill_dead_zone_low"])
+        f_dhi = float(cfg["fill_dead_zone_high"])
+        f_max = float(cfg["fill_max"])
+        liq_max = float(cfg["liquidity_max"])
+        sc_min = int(cfg["score_min_abs"])
+
         reason_rej = ""
-        if fill < 0.12:
-            reason_rej = f"fill {fill:.2f} <0.12: CLOB demasiado extremo, mercado tiene info"
-        elif 0.18 <= fill < 0.24:
-            reason_rej = f"fill {fill:.2f} en zona muerta 0.18-0.24 (WR 8% empírico)"
-        elif fill > 0.40:
-            reason_rej = f"fill {fill:.2f} >0.40: CLOB no suficientemente extremo"
-        elif liq > 1500.0:
-            reason_rej = f"liquidez {liq:.0f} >1500: mercado demasiado eficiente"
-        elif abs(score) < 3:
-            reason_rej = f"score {score} demasiado neutral (WR 13% empírico cuando |score|<3)"
+        if fill < f_min:
+            reason_rej = f"fill {fill:.2f} <{f_min:.2f}: CLOB demasiado extremo, mercado tiene info"
+        elif f_dlo <= fill < f_dhi:
+            reason_rej = f"fill {fill:.2f} en zona muerta {f_dlo:.2f}-{f_dhi:.2f} (WR 8% empírico)"
+        elif fill > f_max:
+            reason_rej = f"fill {fill:.2f} >{f_max:.2f}: CLOB no suficientemente extremo"
+        elif liq > liq_max:
+            reason_rej = f"liquidez {liq:.0f} >{liq_max:.0f}: mercado demasiado eficiente"
+        elif abs(score) < sc_min:
+            reason_rej = (
+                f"score {score} demasiado neutral (WR 13% empírico cuando |score|<{sc_min})"
+            )
 
         if reason_rej:
             log.info("Señal rechazada (filtro empírico): %s", reason_rej)
@@ -1665,10 +1719,11 @@ class SixCycleEngine:
                 "reason": "scorer sin dirección o datos insuficientes (buffer/CLOB)",
             }
         model_prob = _model_prob_from_signal(signal)
+        meff = float(self._config["min_edge"])
         val = self._filter.evaluate(
             model_prob=model_prob,
             clob_yes_price=clob_yes_price,
-            min_edge=MIN_EDGE,
+            min_edge=meff,
             min_liquidity_usdc=MIN_LIQUIDITY_USDC,
             liquidity=liquidity,
         )
@@ -1678,12 +1733,13 @@ class SixCycleEngine:
 
     def cycle_size(self, edge: float) -> float:
         """
-        Kelly fraccionario: stake = KELLY_FRACTION * edge * capital_disponible.
-        Capital = MAX_STAKE_USDC. Clamp [1.0, MAX_STAKE_USDC].
+        Kelly fraccionario: stake = kelly_fraction * edge * capital_disponible.
+        Capital = max_stake_usdc desde config. Clamp [1.0, cap].
         """
-        cap = MAX_STAKE_USDC
-        stake = KELLY_FRACTION * float(edge) * cap
-        stake = max(1.0, min(float(MAX_STAKE_USDC), stake))
+        cap = float(self._config["max_stake_usdc"])
+        kf = float(self._config["kelly_fraction"])
+        stake = kf * float(edge) * cap
+        stake = max(1.0, min(cap, stake))
         return float(stake)
 
     async def cycle_fill(
@@ -1700,7 +1756,7 @@ class SixCycleEngine:
         """
         _ = market_id
         _ = direction
-        if DRY_RUN:
+        if self._dry_run_effective:
             log.info(
                 "[DRY_RUN] fill simulado",
                 extra={"token": token_id[:16], "stake": stake_usdc, "price": clob_yes_price},
@@ -1896,7 +1952,7 @@ class SixCycleEngine:
         except (TypeError, ValueError):
             cy_f = 0.0
         no_f = max(0.0, min(1.0, 1.0 - cy_f)) if cy_f else 0.0
-        extreme = _clob_extreme(cy_f if cy_f else None)
+        extreme = self._extreme_yes(cy_f if cy_f else None)
         sig_snap = payload.get("signal_snapshot") or {}
         val_snap = payload.get("val_snapshot") or {}
         try:
@@ -1953,7 +2009,7 @@ class SixCycleEngine:
             "win_rate_pct": f"{wr:.2f}",
             "pnl_cumulative_usdc": f"{self.pnl_usdc:.6f}",
             "reason": "settle",
-            "dry_run": self._csv_bool(DRY_RUN),
+            "dry_run": self._csv_bool(self._dry_run_effective),
         }
         try:
             log.info(
