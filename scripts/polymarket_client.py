@@ -413,6 +413,7 @@ class PolymarketLiveAccount:
         proxy_managed = sig_type in (1, 2) and total == 0.0
         return {
             "usdc_available": avail,
+            # Notional en órdenes abiertas CLOB (≈restante×precio); no = «Positions» del portfolio web.
             "usdc_in_positions": in_pos,
             "total": total,
             "raw_collateral": raw,
@@ -496,7 +497,7 @@ def _get_open_orders(client: Any, params: Any) -> list:
 
 
 def _estimate_open_orders_notional(client: Any) -> float:
-    """Suma aproximada USDC en libros (restante * precio) de órdenes abiertas."""
+    """Suma ~USDC comprometido en órdenes límite abiertas (restante × precio), no valor de tokens en cartera."""
     try:
         from py_clob_client_v2.clob_types import OpenOrderParams
     except ImportError:

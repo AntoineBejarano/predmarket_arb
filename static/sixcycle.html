@@ -148,11 +148,15 @@
           <p class="text-[10px] uppercase text-slate-500">USDC disponible</p>
           <p id="acc-usdc-avail" class="text-base font-bold text-emerald-200 mt-0.5">—</p>
         </div>
-        <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
-          <p class="text-[10px] uppercase text-slate-500">En posiciones</p>
+        <div
+          class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2"
+          title="Suma aproximada (restante × precio) de órdenes límite abiertas en el CLOB. En polymarket.com suele verse en Open orders; no es el importe «Positions» de tokens en cartera.">
+          <p class="text-[10px] uppercase text-slate-500">Comprometido (órdenes)</p>
           <p id="acc-usdc-pos" class="text-base font-bold text-sky-200 mt-0.5">—</p>
         </div>
-        <div class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2">
+        <div
+          class="rounded-lg border border-slate-700/80 bg-slate-900/40 px-3 py-2"
+          title="USDC disponible + comprometido en órdenes abiertas (aprox.).">
           <p class="text-[10px] uppercase text-slate-500">Total CLOB</p>
           <p id="acc-usdc-total" class="text-base font-bold text-violet-200 mt-0.5">—</p>
         </div>
@@ -799,7 +803,15 @@
             hint.textContent = head + credPath;
             hint.className = "text-[10px] text-slate-400 font-mono min-h-[1rem]";
           } else {
-            hint.textContent = head;
+            var ordHint = "";
+            if (
+              Number.isFinite(Number(b.usdc_in_positions)) &&
+              Number(b.usdc_in_positions) > 0.001
+            ) {
+              ordHint =
+                " · «Comprometido»: USDC en órdenes límite abiertas (CLOB); en la web mira Open orders, no «Positions value».";
+            }
+            hint.textContent = head + ordHint;
             hint.className = "text-[10px] text-slate-500 font-mono min-h-[1rem]";
           }
         }
