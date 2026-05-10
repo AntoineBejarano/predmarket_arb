@@ -1,14 +1,14 @@
 """
 Cliente singleton de cuenta Polymarket (CLOB) vía ``py-clob-client``.
 
-Credenciales L2 (mismo significado que en el resto del repo):
+Credenciales L2 **solo** desde variables de entorno:
 
-- Archivo ``<DATA_DIR>/polymarket_account.json`` con claves
-  ``api_key``, ``api_secret``, ``api_passphrase``, ``private_key``, o
-- Variables de entorno ``POLY_API_KEY``, ``POLY_API_SECRET``,
-  ``POLY_PASSPHRASE``, ``POLY_PRIVATE_KEY`` (p. ej. ``.env`` / Railway).
+- ``POLY_API_KEY``, ``POLY_API_SECRET``, ``POLY_PASSPHRASE``, ``POLY_PRIVATE_KEY``
 
-Por cada campo se usa el JSON si viene relleno; si no, el valor del env.
+(p. ej. ``.env`` / Railway). ``<DATA_DIR>/polymarket_account.json`` **no se lee**;
+para derivar el trio L2 usa ``scripts/derive_polymarket_clob_api_key.py`` y
+copia los valores al entorno.
+
 Nunca loguear ``api_secret`` ni ``private_key``.
 """
 
@@ -27,10 +27,10 @@ from lab.paths import data_dir
 
 log = logging.getLogger("polymarket_client")
 
+# Ruta legada (API/UI); el cliente no lee este archivo.
 _ACCOUNT_PATH = data_dir() / "polymarket_account.json"
 
 _LOCK = threading.RLock()
-_LOADED: dict[str, Any] | None = None
 _CLOB_CLIENT: Any = None  # ClobClient instance
 
 # Trading proxies keyed por dry_run de la estrategia (solo dos ramas).
@@ -55,23 +55,14 @@ def _normalize_hex_key(key: str) -> str:
     return s
 
 
-def _pick_cred(acc: dict[str, Any], json_key: str, env_key: str) -> str:
-    """Valor del JSON si no está vacío; si no, del entorno."""
-    raw = acc.get(json_key)
-    if raw is not None and str(raw).strip():
-        return str(raw).strip()
-    return os.getenv(env_key, "").strip()
-
-
 def _clob_credential_bundle() -> dict[str, str]:
-    """api_key / api_secret / api_passphrase / private_key (hex normalizado)."""
-    acc = _load_account_file()
-    pk_raw = _pick_cred(acc, "private_key", "POLY_PRIVATE_KEY")
+    """api_key / api_secret / api_passphrase / private_key solo desde POLY_* (env)."""
+    pk_raw = os.getenv("POLY_PRIVATE_KEY", "").strip()
     return {
         "private_key": _normalize_hex_key(pk_raw),
-        "api_key": _pick_cred(acc, "api_key", "POLY_API_KEY"),
-        "api_secret": _pick_cred(acc, "api_secret", "POLY_API_SECRET"),
-        "api_passphrase": _pick_cred(acc, "api_passphrase", "POLY_PASSPHRASE"),
+        "api_key": os.getenv("POLY_API_KEY", "").strip(),
+        "api_secret": os.getenv("POLY_API_SECRET", "").strip(),
+        "api_passphrase": os.getenv("POLY_PASSPHRASE", "").strip(),
     }
 
 
@@ -102,26 +93,8 @@ def live_account_fingerprint() -> dict[str, Any]:
     return out
 
 
-def _load_account_file() -> dict[str, Any]:
-    global _LOADED
-    with _LOCK:
-        if _LOADED is not None:
-            return _LOADED
-        p = _ACCOUNT_PATH
-        if not p.is_file():
-            _LOADED = {}
-            return _LOADED
-        try:
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            _LOADED = raw if isinstance(raw, dict) else {}
-        except (OSError, json.JSONDecodeError, TypeError) as e:
-            log.warning("polymarket_account.json no legible: %s", e)
-            _LOADED = {}
-        return _LOADED
-
-
 def _get_clob_client() -> Any:
-    """ClobClient L2 (singleton). Requiere JSON completo + deps instaladas."""
+    """ClobClient L2 (singleton). Requiere POLY_* en env + deps instaladas."""
     global _CLOB_CLIENT
     with _LOCK:
         if _CLOB_CLIENT is not None:
@@ -133,19 +106,11 @@ def _get_clob_client() -> Any:
         api_pass = creds["api_passphrase"]
         if not pk or not api_key or not api_secret or not api_pass:
             raise RuntimeError(
-                "Faltan credenciales CLOB L2: rellena "
-                f"{_ACCOUNT_PATH} (api_key, api_secret, api_passphrase, private_key) "
-                "o las variables de entorno POLY_API_KEY, POLY_API_SECRET, "
-                "POLY_PASSPHRASE y POLY_PRIVATE_KEY (p. ej. en .env)."
+                "Faltan credenciales CLOB L2: define POLY_API_KEY, POLY_API_SECRET, "
+                "POLY_PASSPHRASE y POLY_PRIVATE_KEY en el entorno (.env / Railway). "
+                "El archivo polymarket_account.json no se usa."
             )
-        acc_file = _load_account_file()
-        keys_j = ("private_key", "api_key", "api_secret", "api_passphrase")
-        file_complete = all(str(acc_file.get(k) or "").strip() for k in keys_j)
-        if not file_complete and pk and api_key and api_secret and api_pass:
-            log.info(
-                "Credenciales CLOB para py-clob-client: POLY_* del entorno completan o sustituyen %s.",
-                _ACCOUNT_PATH,
-            )
+        log.info("Credenciales CLOB desde variables POLY_* (env).")
         try:
             from py_clob_client_v2.client import ClobClient
             from py_clob_client_v2.clob_types import ApiCreds
@@ -544,4 +509,5 @@ def _estimate_open_orders_notional(client: Any) -> float:
 
 
 def account_json_path() -> Path:
+    """Ruta legada bajo DATA_DIR; el cliente CLOB no lee este archivo."""
     return _ACCOUNT_PATH

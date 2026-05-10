@@ -4,24 +4,33 @@ Crea o deriva credenciales L2 del CLOB Polymarket (apiKey / secret / passphrase)
 
 Documentación: https://docs.polymarket.com/api-reference/authentication
 
-Requisito: **private key de la wallet Ethereum** que usa Polymarket (hex con ``0x``,
-64+ caracteres). *No* es el UUID tipo ``apiKey`` que ves en el dashboard.
+Qué hace esto (versión tonta): tú solo pones la **private key** de la wallet.
+El script llama a Polymarket con una firma hecha con esa key; el servidor te
+devuelve (o reutiliza) el trio api_key / secret / passphrase **ligado a esa
+wallet**. No son tres números que “salen” de tu clave en local como si fuera
+un hash: las genera o recupera el CLOB en remoto.
 
-Este repo usa ``py-clob-client`` (import ``py_clob_client``). Si usas un paquete
-``py_clob_client_v2``, la llamada es análoga: ``ClobClient(host, chain_id, key)``
-y luego crear/derivar credenciales según esa versión.
+Si en el .env mezclas una private key de la wallet A con un api_key copiado
+a mano del panel que en realidad era de la wallet B (o de un par viejo
+revocado), Polymarket responde con el error del signer distinto al de la API key.
 
-Uso::
+Requisito: **private key** (hex con ``0x``, 64 hex de cuerpo). *No* es el UUID
+del api_key del dashboard.
 
-    export PRIVATE_KEY='0x...'   # o pásala solo en esta sesión
+Uso (elige una)::
+
+    python scripts/derive_polymarket_clob_api_key.py --private-key '0xabc...'
+
+    export PRIVATE_KEY='0x...'   # o POLY_PRIVATE_KEY
     python scripts/derive_polymarket_clob_api_key.py
 
-Por defecto imprime en **stdout** los valores etiquetados y debajo el JSON
-indentado (para verlo en terminal o redirigir solo el bloque JSON).
+Por defecto imprime la **dirección del firmante** (compruébala con la del
+perfil Polymarket), luego los cuatro valores y un bloque JSON de referencia.
 
-    python scripts/derive_polymarket_clob_api_key.py --json-only > data/polymarket_account.json
-
-No subas ``data/polymarket_account.json`` a git.
+``scripts/polymarket_client.py`` solo lee ``POLY_API_KEY``, ``POLY_API_SECRET``,
+``POLY_PASSPHRASE`` y ``POLY_PRIVATE_KEY`` del entorno; copia ahí los valores
+(p. ej. Railway / ``.env``). ``--json-only`` sirve para pegar en un gestor de
+secretos o documentación local; no subas credenciales a git.
 """
 
 from __future__ import annotations
@@ -32,19 +41,41 @@ import os
 import sys
 
 
+def _clob_client_class():
+    try:
+        from py_clob_client_v2.client import ClobClient
+
+        return ClobClient, "py_clob_client_v2"
+    except ImportError:
+        try:
+            from py_clob_client.client import ClobClient  # type: ignore[no-redef]
+
+            return ClobClient, "py_clob_client"
+        except ImportError:
+            return None, ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Deriva credenciales L2 CLOB Polymarket")
     ap.add_argument(
+        "--private-key",
+        "-k",
+        default="",
+        help="Clave privada hex (0x...). Si no se pasa, usa PRIVATE_KEY o POLY_PRIVATE_KEY del entorno.",
+    )
+    ap.add_argument(
         "--json-only",
         action="store_true",
-        help="Solo imprime JSON (sin bloque etiquetado); útil para redirección a archivo",
+        help="Solo imprime JSON (sin bloque etiquetado); referencia / secret manager",
     )
     args = ap.parse_args()
 
-    key = (os.getenv("PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY") or "").strip()
+    key = (args.private_key or os.getenv("PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY") or "").strip()
     if not key:
         print(
-            "Falta PRIVATE_KEY o POLY_PRIVATE_KEY en el entorno (clave de wallet, no UUID de API).",
+            "Pon la clave de wallet, por ejemplo:\n"
+            "  python scripts/derive_polymarket_clob_api_key.py --private-key '0x....'\n"
+            "o export PRIVATE_KEY / POLY_PRIVATE_KEY (no es el UUID api_key del panel).",
             file=sys.stderr,
         )
         return 1
@@ -54,14 +85,25 @@ def main() -> int:
     host = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
     chain_id = int(os.getenv("POLYGON_CHAIN_ID", "137"))
 
+    signer_address = ""
     try:
-        from py_clob_client.client import ClobClient
-    except ImportError:
-        print("Instala dependencias: py-clob-client (pyproject / requirements)", file=sys.stderr)
+        from eth_account import Account
+
+        signer_address = str(Account.from_key(key).address)
+    except Exception as e:
+        print(f"Private key no válida como clave Ethereum: {e}", file=sys.stderr)
+        return 1
+
+    ClobClient, pkg = _clob_client_class()
+    if ClobClient is None:
+        print("Instala: py-clob-client-v2 o py-clob-client (pyproject.toml)", file=sys.stderr)
         return 1
 
     client = ClobClient(host, chain_id, key)
-    creds = client.create_or_derive_api_creds()
+    if hasattr(client, "create_or_derive_api_creds"):
+        creds = client.create_or_derive_api_creds()
+    else:
+        creds = client.create_or_derive_api_key()
     if creds is None:
         print("No se pudieron crear/derivar credenciales (revisa la private key y red).", file=sys.stderr)
         return 1
@@ -76,15 +118,18 @@ def main() -> int:
         print(json.dumps(out, indent=2), flush=True)
         return 0
 
+    print("=== Comprueba esta dirección en Polymarket (debe ser la de tu perfil / API) ===\n", flush=True)
+    print(f"signer_address: {signer_address}", flush=True)
+    print(f"(cliente CLOB: {pkg})\n", flush=True)
     print("=== Credenciales L2 (CLOB Polymarket) ===\n", flush=True)
     print(f"api_key:        {out['api_key']}", flush=True)
     print(f"api_secret:     {out['api_secret']}", flush=True)
     print(f"api_passphrase: {out['api_passphrase']}", flush=True)
     print(f"private_key:    {out['private_key']}", flush=True)
-    print("\n=== JSON (copiar a data/polymarket_account.json) ===\n", flush=True)
+    print("\n=== JSON (referencia; el runtime usa solo POLY_* en env) ===\n", flush=True)
     print(json.dumps(out, indent=2), flush=True)
     print(
-        "\n# Copia el bloque JSON a data/polymarket_account.json (o $DATA_DIR/polymarket_account.json).",
+        "\n# Define POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE, POLY_PRIVATE_KEY en .env o Railway.",
         file=sys.stderr,
     )
     return 0
