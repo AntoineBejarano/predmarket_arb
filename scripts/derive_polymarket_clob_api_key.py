@@ -14,6 +14,16 @@ Si en el .env mezclas una private key de la wallet A con un api_key copiado
 a mano del panel que en realidad era de la wallet B (o de un par viejo
 revocado), Polymarket responde con el error del signer distinto al de la API key.
 
+Cuentas **Magic / email / Google** (Polymarket): la PK exportada es un **EOA**;
+L2 y ``POLY_ADDRESS`` van con esa dirección. El **funder** debe ser la **wallet
+proxy** que muestra la UI (p. ej. «Address API use only»), con
+``POLY_SIGNATURE_TYPE=1`` (POLY_PROXY). No uses ``signature_type=3`` (POLY_1271)
+con esa PK salvo flujo deposit relayer explícito: el CLOB puede responder que
+el firmante de la orden no coincide con la API key.
+
+Flujo **deposit wallet** puro (``POLY_SIGNATURE_TYPE=3``): relayer + ERC-1271;
+este script no sustituye ese onboarding.
+
 Requisito: **private key** (hex con ``0x``, 64 hex de cuerpo). *No* es el UUID
 del api_key del dashboard.
 
@@ -23,6 +33,10 @@ Uso (elige una)::
 
     export PRIVATE_KEY='0x...'   # o POLY_PRIVATE_KEY
     python scripts/derive_polymarket_clob_api_key.py
+
+Para **Magic/email**, pon ``POLY_SIGNATURE_TYPE=1`` y ``POLY_FUNDER=<proxy UI>``
+en el entorno **antes** de derivar. Para **deposit** relayer, ``3`` + funder
+deposit (ver docs Polymarket).
 
 Por defecto imprime la **dirección del firmante** (compruébala con la del
 perfil Polymarket), luego los cuatro valores y un bloque JSON de referencia.
@@ -99,7 +113,29 @@ def main() -> int:
         print("Instala: py-clob-client-v2 o py-clob-client (pyproject.toml)", file=sys.stderr)
         return 1
 
-    client = ClobClient(host, chain_id, key)
+    # Deposit-wallet / proxy: Polymarket expects L1 derive with the same
+    # signature_type + funder as order placement, or POST /order may reject
+    # ("order signer address has to be the address of the API KEY").
+    funder = os.getenv("POLY_FUNDER", "").strip() or None
+    st_raw = os.getenv("POLY_SIGNATURE_TYPE", "").strip()
+    if st_raw == "" and funder is not None:
+        # Magic/Google: proxy + POLY_PROXY (1). Deposit relayer: set explicit 3.
+        signature_type: int | None = 1
+    elif st_raw == "":
+        signature_type = None
+    else:
+        signature_type = int(st_raw)
+
+    if signature_type is not None or funder is not None:
+        client = ClobClient(host, chain_id, key, None, signature_type, funder)
+        print(
+            f"[derive] ClobClient(signature_type={signature_type!r}, funder={funder!r}) "
+            f"antes de create_or_derive_api_key (lee POLY_* del entorno / .env).",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        client = ClobClient(host, chain_id, key)
     if hasattr(client, "create_or_derive_api_creds"):
         creds = client.create_or_derive_api_creds()
     else:
