@@ -254,7 +254,8 @@ class PolymarketTradingClient:
         token_id: str = "",
     ) -> dict[str, Any]:
         """
-        Coloca BUY en outcome YES/NO. ``amount_usdc`` = notional aproximado (como Kelly previo).
+        Coloca BUY en outcome YES o NO (comprar el token correspondiente).
+        ``side`` explícito ``SELL`` = vender ese ``token_id`` (cierre); ``amount_usdc`` = notional aprox.
         """
         px = float(price)
         if px <= 0 or px >= 1.0:
@@ -288,21 +289,58 @@ class PolymarketTradingClient:
         token_id_eff = str(token_id or "").strip()
         if not token_id_eff:
             token_id_eff = _resolve_token_id_for_side(market_id, side)
-        if str(side).upper() in ("YES", "BUY"):
+        side_u = str(side or "").upper().strip()
+        # YES/NO/BUY = comprar shares del token (BUY). SELL explícito = vender shares ya poseídas.
+        if side_u in ("YES", "BUY", "NO"):
             share_size = _buy_share_size_meets_min_notional(float(amount_usdc), px)
         else:
             share_size = float(amount_usdc) / max(px, 1e-9)
         if share_size <= 0 or not math.isfinite(share_size):
             return {"success": False, "price": px, "order_id": None, "error": "invalid_size"}
 
-        _side_const = BUY if str(side).upper() in ("YES", "BUY") else _SELL
+        _side_const = BUY if side_u in ("YES", "BUY", "NO") else _SELL
         client = _get_clob_client()
         order_args = OrderArgs(token_id=str(token_id_eff), price=float(px), size=float(share_size), side=_side_const)
-        if _v2:
-            opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-            resp = client.create_and_post_order(order_args, options=opts, order_type=OrderType.GTC)
-        else:
-            resp = client.create_and_post_order(order_args, options=None)
+        poly_api_exc_types: tuple[type[BaseException], ...] = ()
+        try:
+            if _v2:
+                from py_clob_client_v2.exceptions import PolyApiException  # type: ignore[import-not-found]
+
+                poly_api_exc_types = (PolyApiException,)
+            else:
+                from py_clob_client.exceptions import PolyApiException  # type: ignore[import-not-found]
+
+                poly_api_exc_types = (PolyApiException,)
+        except ImportError:
+            pass
+
+        try:
+            if _v2:
+                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+                resp = client.create_and_post_order(order_args, options=opts, order_type=OrderType.GTC)
+            else:
+                resp = client.create_and_post_order(order_args, options=None)
+        except BaseException as e:
+            if poly_api_exc_types and isinstance(e, poly_api_exc_types):
+                err_body = getattr(e, "error_message", None) or str(e)
+                log.warning(
+                    "place_order API error market_id=%s side=%s token=%s… price=%.4f size=%.6f: %s",
+                    str(market_id)[:20],
+                    side,
+                    str(token_id_eff)[:10],
+                    px,
+                    share_size,
+                    err_body,
+                )
+                return {
+                    "success": False,
+                    "price": px,
+                    "order_id": None,
+                    "error": str(err_body),
+                    "simulated": False,
+                    "raw": err_body if isinstance(err_body, dict) else {"error": err_body},
+                }
+            raise
         oid = None
         if isinstance(resp, dict):
             oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
