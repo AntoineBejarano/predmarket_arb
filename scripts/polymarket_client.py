@@ -217,16 +217,21 @@ def _parse_outcomes_list(outcomes: Any) -> tuple[list[str], str]:
 
 # BUY marketable: Polymarket exige notional >= $1; el SDK/redondeo a tick de
 # shares puede dejar size*price < 1 (p. ej. 2.94 * 0.34 = 0.9996).
+# El CLOB además rechaza órdenes con size en shares por debajo de 5 (400:
+# "Size (x) lower than the minimum: 5").
 _MIN_MARKETABLE_BUY_NOTIONAL_USDC = 1.0
+_MIN_ORDER_SIZE_SHARES_CLOB = 5.0
 _TICK_SIZE_SHARES = 0.01
 
 
 def _buy_share_size_meets_min_notional(amount_usdc: float, px: float) -> float:
-    """Número de shares (múltiplo de ``_TICK_SIZE_SHARES``) con ``size * px >=`` mínimo $1."""
+    """Shares en tick 0.01, con ``size >= 5``, ``size * px >= 1`` USDC."""
     raw = float(amount_usdc) / max(float(px), 1e-12)
     if raw <= 0 or not math.isfinite(raw):
         return 0.0
     ticks = max(1, math.ceil(raw / _TICK_SIZE_SHARES - 1e-9))
+    min_ticks_shares = math.ceil(_MIN_ORDER_SIZE_SHARES_CLOB / _TICK_SIZE_SHARES - 1e-9)
+    ticks = max(ticks, min_ticks_shares)
     s = ticks * _TICK_SIZE_SHARES
     while s * float(px) + 1e-12 < _MIN_MARKETABLE_BUY_NOTIONAL_USDC:
         ticks += 1
