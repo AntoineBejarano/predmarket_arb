@@ -215,6 +215,25 @@ def _parse_outcomes_list(outcomes: Any) -> tuple[list[str], str]:
     return [str(x).strip() for x in lst], ""
 
 
+# BUY marketable: Polymarket exige notional >= $1; el SDK/redondeo a tick de
+# shares puede dejar size*price < 1 (p. ej. 2.94 * 0.34 = 0.9996).
+_MIN_MARKETABLE_BUY_NOTIONAL_USDC = 1.0
+_TICK_SIZE_SHARES = 0.01
+
+
+def _buy_share_size_meets_min_notional(amount_usdc: float, px: float) -> float:
+    """Número de shares (múltiplo de ``_TICK_SIZE_SHARES``) con ``size * px >=`` mínimo $1."""
+    raw = float(amount_usdc) / max(float(px), 1e-12)
+    if raw <= 0 or not math.isfinite(raw):
+        return 0.0
+    ticks = max(1, math.ceil(raw / _TICK_SIZE_SHARES - 1e-9))
+    s = ticks * _TICK_SIZE_SHARES
+    while s * float(px) + 1e-12 < _MIN_MARKETABLE_BUY_NOTIONAL_USDC:
+        ticks += 1
+        s = ticks * _TICK_SIZE_SHARES
+    return float(s)
+
+
 class PolymarketTradingClient:
     """
     Envío de órdenes con flag dry_run por estrategia + anulación global ``DRY_RUN`` env.
@@ -269,7 +288,10 @@ class PolymarketTradingClient:
         token_id_eff = str(token_id or "").strip()
         if not token_id_eff:
             token_id_eff = _resolve_token_id_for_side(market_id, side)
-        share_size = float(amount_usdc) / max(px, 1e-9)
+        if str(side).upper() in ("YES", "BUY"):
+            share_size = _buy_share_size_meets_min_notional(float(amount_usdc), px)
+        else:
+            share_size = float(amount_usdc) / max(px, 1e-9)
         if share_size <= 0 or not math.isfinite(share_size):
             return {"success": False, "price": px, "order_id": None, "error": "invalid_size"}
 
@@ -285,13 +307,15 @@ class PolymarketTradingClient:
         if isinstance(resp, dict):
             oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
         success = bool(oid) or (isinstance(resp, dict) and str(resp.get("success", "")).lower() in ("true", "1"))
+        notion_est = float(share_size) * px
         log.info(
-            "place_order LIVE market_id=%s side=%s token=%s… price=%.4f size_shares=%.6f",
+            "place_order LIVE market_id=%s side=%s token=%s… price=%.4f size_shares=%.6f notion_est=%.4f",
             str(market_id)[:20],
             side,
             str(token_id_eff)[:10],
             px,
             share_size,
+            notion_est,
         )
         return {
             "success": success,
