@@ -457,6 +457,19 @@ class PolymarketLiveAccount:
         return out
 
 
+def _collateral_raw_to_usdc(x: float) -> float:
+    """
+    El CLOB suele devolver colateral USDC en unidades mínimas (6 decimales, p. ej. 27.04 USDC → 27040000).
+    Si el valor ya viene en USDC humano (p. ej. < 1e6), no escalar.
+    """
+    f = float(x)
+    if not math.isfinite(f) or f == 0.0:
+        return f
+    if abs(f) >= 1_000_000.0:
+        return f / 1_000_000.0
+    return f
+
+
 def _parse_balance(raw: Any) -> Optional[float]:
     if not isinstance(raw, dict):
         return None
@@ -464,7 +477,7 @@ def _parse_balance(raw: Any) -> Optional[float]:
         v = raw.get(k)
         if v is not None:
             try:
-                return float(v)
+                return round(_collateral_raw_to_usdc(float(v)), 6)
             except (TypeError, ValueError):
                 continue
     return None
